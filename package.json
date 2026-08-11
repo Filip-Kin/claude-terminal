@@ -1,0 +1,12 @@
+{
+  "name": "claude-terminal",
+  "version": "0.1.0",
+  "description": "A browser tab bar for Claude Code web terminals (ttyd), plus self-hosted, SQLite-backed usage tracking with a live dashboard.",
+  "type": "module",
+  "scripts": {
+    "server": "bun run server.ts",
+    "collect": "bun run collector.ts",
+    "migrate": "bun run migrate-state.ts"
+  },
+  "license": "MIT"
+}

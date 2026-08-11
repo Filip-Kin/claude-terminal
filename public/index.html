@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude usage leaderboard</title>
+<script src="apexcharts.min.js"></script>
+<style>
+  :root {
+    --bg:#f4f5f7; --card:#ffffff; --ink:#14161b; --muted:#697086;
+    --line:#e7e9ee; --track:#edeef2; --shadow:0 1px 3px rgba(20,22,27,.06),0 8px 24px rgba(20,22,27,.05);
+    --grad-a:#6366f1; --grad-b:#8b5cf6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0c0e13; --card:#151821; --ink:#eceef3; --muted:#8b93a7;
+      --line:#232734; --track:#1e222c; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+      --grad-a:#818cf8; --grad-b:#a78bfa;
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:940px; margin:0 auto; padding:34px 20px 70px; }
+  header { display:flex; align-items:flex-end; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+  h1 {
+    font-size:26px; margin:0; letter-spacing:-.02em; font-weight:750;
+    background:linear-gradient(92deg,var(--grad-a),var(--grad-b));
+    -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+  }
+  .sub { color:var(--muted); font-size:13px; margin:8px 0 0; max-width:64ch; }
+  .updated { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .live-tag { display:inline-flex; align-items:center; gap:6px; }
+  .pulse { width:7px; height:7px; border-radius:50%; background:#22c55e; animation:pulse 1.8s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(34,197,94,.55);} 70%{box-shadow:0 0 0 7px transparent;} 100%{box-shadow:0 0 0 0 transparent;} }
+
+  .cards { margin-top:24px; display:grid; gap:14px; }
+  .card {
+    background:var(--card); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow);
+    padding:16px 18px; display:grid; grid-template-columns:44px 1fr 130px; grid-template-rows:auto auto;
+    align-items:center; gap:6px 16px;
+  }
+  @keyframes rise { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+  @media (prefers-reduced-motion: no-preference) {
+    .card { animation:rise .55s cubic-bezier(.2,.7,.2,1) both; }
+  }
+  .rank { grid-row:1/3; font-size:26px; font-weight:800; text-align:center; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .who { display:flex; align-items:center; gap:10px; min-width:0; }
+  .swatch { width:11px; height:11px; border-radius:3px; flex:none; }
+  .name { font-weight:700; font-size:18px; letter-spacing:-.01em; }
+  .badge { font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
+  .badge.host { color:var(--grad-b); border-color:color-mix(in srgb,var(--grad-b) 45%,transparent); }
+  .now { color:#22c55e; font-size:11px; font-weight:600; display:inline-flex; align-items:center; gap:5px; }
+  .big { grid-column:3; grid-row:1/3; text-align:right; }
+  .big b { font-size:24px; font-weight:750; font-variant-numeric:tabular-nums; letter-spacing:-.02em; display:block; line-height:1.1; }
+  .big span { color:var(--muted); font-size:11px; }
+  .spark { grid-column:2; grid-row:2; height:46px; margin:-2px -4px; }
+  .meta { grid-column:1/4; grid-row:3; display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:12.5px; padding-top:4px; border-top:1px dashed var(--line); margin-top:4px; }
+  .meta b { color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums; }
+
+  .panel { margin-top:26px; background:var(--card); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); padding:18px 16px 8px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .panel { animation:rise .6s .1s cubic-bezier(.2,.7,.2,1) both; }
+  }
+  .panel h2 { font-size:14px; margin:0 0 2px 4px; font-weight:650; }
+  .panel p { font-size:12px; color:var(--muted); margin:0 0 6px 4px; }
+  .billhead { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:2px; }
+  .billhead h2 { margin:0 0 0 4px; }
+  .msel { font:inherit; font-size:13px; font-weight:600; color:var(--ink); background:var(--track); border:1px solid var(--line); border-radius:8px; padding:5px 10px; cursor:pointer; }
+  .billbar { display:flex; height:26px; border-radius:8px; overflow:hidden; margin:10px 4px 16px; background:var(--track); gap:2px; }
+  .billbar > span { min-width:3px; transition:width .6s cubic-bezier(.2,.7,.2,1); }
+  .billrows { display:grid; gap:9px; padding:0 4px; }
+  .billrow { display:grid; grid-template-columns:1fr auto auto; align-items:center; gap:14px; }
+  .billrow .bn { display:flex; align-items:center; gap:9px; font-weight:650; }
+  .billrow .bp { color:var(--muted); font-variant-numeric:tabular-nums; font-size:12.5px; text-align:right; }
+  .billrow .bd { font-weight:750; font-variant-numeric:tabular-nums; font-size:17px; min-width:70px; text-align:right; letter-spacing:-.01em; }
+  .billfoot { margin:14px 4px 4px; padding-top:12px; border-top:1px dashed var(--line); font-size:13.5px; color:var(--muted); }
+  .billfoot b { color:var(--ink); font-size:19px; font-weight:750; }
+  footer { margin-top:26px; color:var(--muted); font-size:12px; }
+  .err { background:var(--card); border:1px solid #ef4444; border-radius:14px; padding:16px; color:#ef4444; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Claude usage leaderboard</h1>
+      <p class="sub">Ranked by output tokens used this calendar month. Output is what actually counts
+      against the subscription limit; cache reads make the raw total huge but barely move the needle.
+      Numbers come straight off each session's transcript and refresh on their own.</p>
+    </div>
+    <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="updated">loading</span></span></div>
+  </header>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel bill" id="billPanel">
+    <div class="billhead">
+      <h2>Monthly split</h2>
+      <select id="monthSel" class="msel" aria-label="Choose month"></select>
+    </div>
+    <p id="billIntro">The subscription divided by output tokens used that calendar month. Not a bill, just a
+    rough sense of what each person's usage is worth.</p>
+    <div class="billbar" id="billBar"></div>
+    <div class="billrows" id="billRows"></div>
+    <div class="billfoot" id="billFoot"></div>
+  </div>
+
+  <div class="panel" id="monthlyPanel">
+    <h2>Output by month</h2>
+    <p>Total output tokens each person used, month by month.</p>
+    <div id="monthlyChart" style="height:300px"></div>
+  </div>
+
+  <div class="panel" id="panel">
+    <h2>Output per hour, last 7 days</h2>
+    <p>Hover any point for the exact hour and token count.</p>
+    <div id="mainChart" style="height:320px"></div>
+  </div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+// Fixed color per user so a person keeps their color no matter their rank; unknown users
+// (new guests) get a stable color hashed from their username, not tied to position.
+const COLORS = { filip:"#3b82f6", ian:"#f59e0b", kate:"#10b981", michel:"#ec4899" };
+const POOL = ["#8b5cf6","#ef4444","#14b8a6","#eab308","#06b6d4","#f97316","#a855f7","#84cc16"];
+function hashIdx(s, n){ let h=0; for(let i=0;i<s.length;i++) h=(h*31 + s.charCodeAt(i))>>>0; return h % n; }
+const colorFor = u => COLORS[u] || POOL[hashIdx(u, POOL.length)];
+
+const fmt = n => n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
+const money = v => "$"+Number(v).toFixed(2);
+const medal = i => ["\u{1F947}","\u{1F948}","\u{1F949}"][i] || ("#"+(i+1));
+function ago(iso){ if(!iso) return "never"; const s=(Date.now()-new Date(iso).getTime())/1000;
+  if(s<90) return "just now"; if(s<3600) return Math.round(s/60)+" min ago";
+  if(s<86400) return Math.round(s/3600)+"h ago"; return Math.round(s/86400)+"d ago"; }
+const isDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+const ink = () => getComputedStyle(document.body).getPropertyValue("--ink").trim();
+const muted = () => getComputedStyle(document.body).getPropertyValue("--muted").trim();
+const reduceMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function countUp(el, to){
+  const from = Number(el.dataset.v || 0); el.dataset.v = to;
+  if(reduceMotion()){ el.textContent = fmt(to); return; }
+  const dur = 900, t0 = performance.now();
+  function step(t){ const p=Math.min(1,(t-t0)/dur); const e=1-Math.pow(1-p,3);
+    el.textContent = fmt(from + (to-from)*e); if(p<1) requestAnimationFrame(step); }
+  requestAnimationFrame(step);
+}
+
+// [timestamp, value] pairs for a user's 48h sparkline from the shared hour axis.
+const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); return u.spark.map((y,j)=>[ms[j], y]); };
+
+function sparkOpts(user, data){
+  const c = colorFor(user);
+  return {
+    chart:{ type:"area", height:46, sparkline:{enabled:true}, animations:{enabled:true, easing:"easeinout", speed:700} },
+    stroke:{ curve:"smooth", width:2 },
+    fill:{ type:"gradient", gradient:{ shadeIntensity:1, opacityFrom:.45, opacityTo:0, stops:[0,100] } },
+    colors:[c],
+    series:[{ name:"output", data }],
+    xaxis:{ type:"datetime" },
+    markers:{ size:0, hover:{size:4} },
+    tooltip:{ enabled:true, theme:isDark()?"dark":"light",
+      x:{ format:"ddd MMM d, h:mm TT" },
+      y:{ formatter:v=>(v||0).toLocaleString()+" output tokens", title:{formatter:()=>""} } }
+  };
+}
+
+const mainSeries = (d) => d.users.map(u => ({ name:u.name, data:u.hourly.map((y,j)=>[d.hour_ms[j], y]) }));
+function mainOpts(d){
+  return {
+    chart:{ type:"area", height:320, fontFamily:"inherit", background:"transparent",
+      toolbar:{show:false}, animations:{ enabled:true, easing:"easeinout", speed:900,
+        animateGradually:{enabled:true, delay:100}, dynamicAnimation:{enabled:true, speed:600} } },
+    theme:{ mode: isDark()?"dark":"light" },
+    colors: d.users.map(u=>colorFor(u.user)),
+    series: mainSeries(d),
+    stroke:{ curve:"straight", width:2, lineCap:"round" },
+    fill:{ type:"gradient", gradient:{ shadeIntensity:1, opacityFrom:.28, opacityTo:.02, stops:[0,95] } },
+    dataLabels:{ enabled:false },
+    grid:{ borderColor:"color-mix(in srgb, "+muted()+" 22%, transparent)", strokeDashArray:4, padding:{left:8,right:8} },
+    xaxis:{ type:"datetime", labels:{ style:{colors:muted()}, datetimeUTC:false, datetimeFormatter:{day:"MMM d", hour:"MMM d, ha"} },
+      axisBorder:{show:false}, axisTicks:{show:false}, tooltip:{enabled:false} },
+    yaxis:{ labels:{ style:{colors:muted()}, formatter:v=>fmt(v) } },
+    legend:{ position:"top", horizontalAlign:"left", labels:{colors:ink()}, markers:{radius:4}, fontWeight:600 },
+    tooltip:{ shared:true, theme:isDark()?"dark":"light", x:{ format:"ddd MMM d, h:mm TT" },
+      y:{ formatter:v=> (v||0).toLocaleString()+" output tokens" } },
+    markers:{ size:0, hover:{size:5} }
+  };
+}
+
+const monthlySeries = (d) => d.users.map(u => ({ name:u.name,
+  data: d.months.map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? r.output : 0; }) }));
+function monthlyOpts(d){
+  return {
+    chart:{ type:"bar", height:300, stacked:true, fontFamily:"inherit", background:"transparent",
+      toolbar:{show:false}, animations:{ enabled:true, easing:"easeinout", speed:800 } },
+    theme:{ mode: isDark()?"dark":"light" },
+    colors: d.users.map(u=>colorFor(u.user)),
+    series: monthlySeries(d),
+    plotOptions:{ bar:{ columnWidth: d.months.length<=2 ? "42%" : "62%",
+      borderRadius:4, borderRadiusApplication:"end", borderRadiusWhenStacked:"last" } },
+    dataLabels:{ enabled:false },
+    grid:{ borderColor:"color-mix(in srgb, "+muted()+" 22%, transparent)", strokeDashArray:4 },
+    xaxis:{ categories: d.months.map(m=>m.label), labels:{style:{colors:muted()}},
+      axisBorder:{show:false}, axisTicks:{show:false} },
+    yaxis:{ labels:{ style:{colors:muted()}, formatter:v=>fmt(v) } },
+    legend:{ position:"top", horizontalAlign:"left", labels:{colors:ink()}, markers:{radius:4}, fontWeight:600 },
+    tooltip:{ shared:true, intersect:false, theme:isDark()?"dark":"light",
+      y:{ formatter:v=>(v||0).toLocaleString()+" output tokens" } }
+  };
+}
+
+function populateMonths(d){
+  const sel = document.getElementById("monthSel");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  [...d.months].reverse().forEach(m => {   // newest first
+    const o = document.createElement("option"); o.value=m.key; o.textContent=m.label; sel.appendChild(o);
+  });
+  const keys = d.months.map(m=>m.key);
+  sel.value = keys.includes(prev) ? prev
+            : (keys.includes(d.current_month) ? d.current_month : keys[keys.length-1]);
+}
+
+function renderSplit(d, key){
+  const m = d.months.find(x=>x.key===key) || d.months[d.months.length-1];
+  if(!m) return;
+  const bar = document.getElementById("billBar"); bar.innerHTML="";
+  m.rows.forEach(r => {
+    if(!r.pct) return;
+    const s = document.createElement("span");
+    s.style.background = colorFor(r.user); s.style.width = r.pct+"%";
+    s.title = `${r.name}: ${money(r.share_usd)} (${r.pct}%)`;
+    bar.appendChild(s);
+  });
+  const rows = document.getElementById("billRows"); rows.innerHTML="";
+  m.rows.forEach(r => {
+    const row = document.createElement("div"); row.className="billrow";
+    row.innerHTML = `
+      <span class="bn"><span class="swatch" style="background:${colorFor(r.user)}"></span>${r.name}</span>
+      <span class="bp">${fmt(r.output)} output</span>
+      <span class="bd">${money(r.share_usd)}</span>`;
+    rows.appendChild(row);
+  });
+  document.getElementById("billFoot").innerHTML =
+    `<b>${fmt(m.total)}</b> output tokens in ${m.label}, split into the ${money(d.subscription_usd)} above. `
+    + `A rough gauge of the value each person got.`;
+}
+
+let DATA=null, mainChart=null, monthlyChart=null; const sparks={}; let lastSig="";
+const sig = d => d.users.map(u=>u.user).join(",")+"|"+d.months.map(m=>m.key).join(",");
+
+function build(d){
+  const cards = document.getElementById("cards"); cards.innerHTML="";
+  d.users.forEach((u,i) => {
+    const c = colorFor(u.user);
+    const el = document.createElement("div"); el.className="card"; el.style.animationDelay=(i*70)+"ms";
+    el.innerHTML = `
+      <div class="rank">${medal(i)}</div>
+      <div class="who">
+        <span class="swatch" style="background:${c}"></span>
+        <span class="name">${u.name}</span>
+        ${u.host ? '<span class="badge host">host</span>' : '<span class="badge">sandbox</span>'}
+        ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
+      </div>
+      <div class="spark" id="spark-${u.user}"></div>
+      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>output this month</span></div>
+      <div class="meta">
+        <span>last 5h <b class="num" id="fivh-${u.user}">0</b></span>
+        <span>total output <b class="num" id="tot-${u.user}">0</b></span>
+        <span>all tokens <b class="num" id="all-${u.user}">0</b></span>
+        <span>sessions <b>${u.sessions}</b></span>
+        <span>last used <b>${ago(u.last_used)}</b></span>
+      </div>`;
+    cards.appendChild(el);
+  });
+  Object.values(sparks).forEach(s=>s.destroy()); for(const k in sparks) delete sparks[k];
+  d.users.forEach(u => {
+    const s = new ApexCharts(document.getElementById("spark-"+u.user), sparkOpts(u.user, sparkData(d,u)));
+    s.render(); sparks[u.user]=s;
+    countUp(document.getElementById("mo-"+u.user), u.month_output);
+    countUp(document.getElementById("fivh-"+u.user), u.output_5h);
+    countUp(document.getElementById("tot-"+u.user), u.output_total);
+    countUp(document.getElementById("all-"+u.user), u.tokens_total);
+  });
+
+  populateMonths(d);
+  document.getElementById("monthSel").onchange = e => renderSplit(DATA, e.target.value);
+  renderSplit(d, document.getElementById("monthSel").value);
+
+  if(monthlyChart) monthlyChart.destroy();
+  monthlyChart = new ApexCharts(document.getElementById("monthlyChart"), monthlyOpts(d));
+  monthlyChart.render();
+
+  if(mainChart) mainChart.destroy();
+  mainChart = new ApexCharts(document.getElementById("mainChart"), mainOpts(d));
+  mainChart.render();
+
+  document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
+  document.getElementById("foot").textContent =
+    "Ranked by output this calendar month. Sparklines cover the last "+d.spark_hours+" hours. This page refreshes every 30 seconds.";
+}
+
+function refresh(d){
+  d.users.forEach(u => {
+    if(sparks[u.user]) sparks[u.user].updateSeries([{name:"output", data:sparkData(d,u)}]);
+    const vals = { mo:u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total };
+    for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
+  });
+  populateMonths(d);
+  renderSplit(d, document.getElementById("monthSel").value);
+  if(monthlyChart) monthlyChart.updateSeries(monthlySeries(d));
+  if(mainChart) mainChart.updateSeries(mainSeries(d));
+  document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
+}
+
+async function load(first){
+  try {
+    const r = await fetch("api?t="+Date.now(), {cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const d = await r.json(); DATA = d;
+    const s = sig(d);
+    if(first || s !== lastSig){ lastSig = s; build(d); }
+    else refresh(d);
+  } catch(e) {
+    document.getElementById("cards").innerHTML =
+      '<div class="err">Could not load the leaderboard ('+e.message+'). It refreshes every few minutes, try again shortly.</div>';
+  }
+}
+
+load(true);
+setInterval(()=>load(false), 30000);        // fallback poll
+// Live push: the server emits an SSE tick whenever the collector updates usage.db.
+try {
+  const es = new EventSource("stream");
+  es.onmessage = () => load(false);
+} catch (e) { /* SSE unsupported -> the poll above still keeps it fresh */ }
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", ()=>load(true));
+</script>
+</body>
+</html>

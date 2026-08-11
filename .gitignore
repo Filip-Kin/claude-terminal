@@ -1,0 +1,8 @@
+# your real deployment config (paths/usernames) — copy config.example.json to config.json
+config.json
+node_modules/
+*.log
+# usage.db lives outside the repo (see config "db"); never commit it
+*.db
+*.db-wal
+*.db-shm
