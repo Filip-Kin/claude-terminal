@@ -453,10 +453,10 @@ const server = Bun.serve({
         display: "standalone", display_override: ["standalone", "fullscreen", "minimal-ui"],
         orientation: "any", background_color: BG_COLOR, theme_color: THEME_COLOR,
         icons: [
-          { src: "/_ct/pwa/icon-192.png?v=2", sizes: "192x192", type: "image/png", purpose: "any" },
-          { src: "/_ct/pwa/icon-512.png?v=2", sizes: "512x512", type: "image/png", purpose: "any" },
-          { src: "/_ct/pwa/icon-maskable-192.png?v=2", sizes: "192x192", type: "image/png", purpose: "maskable" },
-          { src: "/_ct/pwa/icon-maskable-512.png?v=2", sizes: "512x512", type: "image/png", purpose: "maskable" },
+          { src: "/_ct/pwa/icon-192.png?v=3", sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-512.png?v=3", sizes: "512x512", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-maskable-192.png?v=3", sizes: "192x192", type: "image/png", purpose: "maskable" },
+          { src: "/_ct/pwa/icon-maskable-512.png?v=3", sizes: "512x512", type: "image/png", purpose: "maskable" },
         ],
       }, { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "no-cache" } });
     }
