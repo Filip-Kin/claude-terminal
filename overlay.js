@@ -357,8 +357,13 @@
     "body.theme-light #claude-tabbar .ctab.active{background:#dce8ff;border-color:#3d6cc4;color:#12305e}",
     "body.theme-light #claude-tabbar .ctab-btn{background:#fff;border-color:#d7d7d7;color:#444}",
     "body.theme-light #claude-tabbar .ctab-btn:hover{background:#ececec;color:#000}",
-    // tighter on small screens
-    "@media (max-width:600px){#claude-tabbar{gap:4px;padding:0 5px}#claude-tabbar .ctab{max-width:220px}#claude-tabbar .ctab .ctab-label{max-width:170px}}",
+    // tighter on small screens; theme toggle folds into the drawer on mobile
+    "@media (max-width:600px){#claude-tabbar{gap:4px;padding:0 5px}#claude-tabbar .ctab{max-width:220px}#claude-tabbar .ctab .ctab-label{max-width:170px}#claude-tabbar .ctab-theme{display:none}}",
+    // drawer settings rows (theme + notifications live here on mobile)
+    "#ct-drawer .ct-draw-sep{height:1px;margin:6px 10px;background:#333}",
+    "body.theme-light #ct-drawer .ct-draw-sep{background:#e2e2e2}",
+    "#ct-drawer .ct-draw-row .ic-lead{display:flex;align-items:center;opacity:.8;flex:0 0 auto}",
+    "#ct-drawer .ct-draw-row .sub{font-size:11px;opacity:.6;margin-left:auto;flex:0 0 auto}",
     // hide ttyd's own floating theme toggle; we drive it from the bar
     ".theme-toggle{display:none !important}",
   ].join("");
@@ -393,19 +398,14 @@
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
   hamBtn.innerHTML = SVG_HAM;
-  const bellBtn = document.createElement("div");
-  bellBtn.className = "ctab-btn ctab-bell";
-  bellBtn.title = "Enable notifications";
-  bellBtn.innerHTML = SVG_BELL_OFF;
   // tabs, then + right after them (left-aligned), spacer pushes the rest right;
   // history sits all the way on the right end.
   bar.appendChild(hamBtn); // mobile-only, leftmost
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
-  bar.appendChild(bellBtn);
   bar.appendChild(historyBtn);
-  bar.appendChild(themeBtn);
+  bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
 
   function mountBar() {
@@ -802,6 +802,33 @@
     nrow.appendChild(plus); nrow.appendChild(nl);
     nrow.addEventListener("click", () => { closeDrawer(); newSession(); });
     list.appendChild(nrow);
+
+    // settings live here (mobile has no top-bar theme/notification buttons)
+    list.appendChild(Object.assign(document.createElement("div"), { className: "ct-draw-sep" }));
+
+    const themeRow = document.createElement("div"); themeRow.className = "ct-draw-row";
+    const tIc = document.createElement("span"); tIc.className = "ic-lead"; tIc.innerHTML = isLight() ? SVG_MOON : SVG_SUN;
+    const tLbl = document.createElement("span"); tLbl.className = "lbl"; tLbl.textContent = isLight() ? "Dark mode" : "Light mode";
+    themeRow.appendChild(tIc); themeRow.appendChild(tLbl);
+    themeRow.addEventListener("click", async () => {
+      await setTheme(!isLight());
+      tIc.innerHTML = isLight() ? SVG_MOON : SVG_SUN;
+      tLbl.textContent = isLight() ? "Dark mode" : "Light mode";
+    });
+    list.appendChild(themeRow);
+
+    const notifRow = document.createElement("div"); notifRow.className = "ct-draw-row"; notifRow.id = "ct-draw-notif";
+    const nIc = document.createElement("span"); nIc.className = "ic-lead"; nIc.innerHTML = SVG_BELL_OFF;
+    const nLbl = document.createElement("span"); nLbl.className = "lbl"; nLbl.textContent = "Notifications";
+    const nSub = document.createElement("span"); nSub.className = "sub"; nSub.textContent = "…";
+    notifRow.appendChild(nIc); notifRow.appendChild(nLbl); notifRow.appendChild(nSub);
+    if (!pushSupported()) { nSub.textContent = "n/a"; notifRow.style.opacity = ".5"; }
+    else {
+      paintNotifRow(nIc, nSub);
+      notifRow.addEventListener("click", async () => { nSub.textContent = "…"; await toggleNotif(); paintNotifRow(nIc, nSub); });
+    }
+    list.appendChild(notifRow);
+
     panel.appendChild(head); panel.appendChild(list); drawerEl.appendChild(panel);
     drawerEl.addEventListener("click", (e) => { if (e.target === drawerEl) closeDrawer(); });
     document.body.appendChild(drawerEl);
@@ -834,7 +861,7 @@
     add("meta", { name: "mobile-web-app-capable", content: "yes" });
     add("meta", { name: "apple-mobile-web-app-status-bar-style", content: "black-translucent" });
     add("meta", { name: "apple-mobile-web-app-title", content: "Claude" });
-    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png" });
+    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png?v=2" });
   })();
 
   // Service worker (root scope) — drives push + installability. Served from /_ct/sw.js
@@ -850,7 +877,7 @@
     });
   }
 
-  // #region notification bell (enable/disable Web Push)
+  // #region Web Push enable/disable (driven from the drawer's Notifications row)
   function b64ToUint8(base64) {
     const pad = "=".repeat((4 - (base64.length % 4)) % 4);
     const b = (base64 + pad).replace(/-/g, "+").replace(/_/g, "/");
@@ -859,14 +886,12 @@
     return out;
   }
   const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-  function paintBell(on) {
-    bellBtn.innerHTML = on ? SVG_BELL : SVG_BELL_OFF;
-    bellBtn.title = on ? "Notifications on — click to turn off" : "Enable notifications (prompt done / waiting)";
-    bellBtn.classList.toggle("on", !!on);
-  }
   async function currentSub() {
     try { const reg = swReg || (await navigator.serviceWorker.ready); return await reg.pushManager.getSubscription(); }
     catch { return null; }
+  }
+  async function notifOn() {
+    return pushSupported() && Notification.permission === "granted" && !!(await currentSub());
   }
   async function enableNotifications() {
     if (!pushSupported()) {
@@ -885,7 +910,6 @@
         sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) });
       }
       await api("subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub) });
-      paintBell(true);
       showToast("Notifications enabled 🦆", "success");
     } catch (e) {
       log("subscribe failed", e);
@@ -898,18 +922,17 @@
       await api("unsubscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => {});
       try { await sub.unsubscribe(); } catch {}
     }
-    paintBell(false);
     showToast("Notifications off", "info");
   }
-  bellBtn.addEventListener("click", async () => {
-    const sub = await currentSub();
-    if (sub && Notification.permission === "granted") disableNotifications();
-    else enableNotifications();
-  });
-  (async () => {
-    if (!pushSupported()) { bellBtn.style.display = "none"; return; }
-    paintBell(!!(await currentSub()) && Notification.permission === "granted");
-  })();
+  async function toggleNotif() {
+    if (await notifOn()) await disableNotifications();
+    else await enableNotifications();
+  }
+  async function paintNotifRow(icEl, subEl) {
+    const on = await notifOn();
+    if (icEl) icEl.innerHTML = on ? SVG_BELL : SVG_BELL_OFF;
+    if (subEl) subEl.textContent = on ? "On" : "Off";
+  }
   // #endregion
 
   // #region focus heartbeat (suppress pushes for the tab you're actively watching)
@@ -938,7 +961,7 @@
     installBanner.id = "ct-install";
     installBanner.className = opts.ios ? "ios" : "";
     const icon = document.createElement("img");
-    icon.src = "/_ct/pwa/icon-192.png";
+    icon.src = "/_ct/pwa/icon-192.png?v=2";
     icon.alt = "";
     const txt = document.createElement("div");
     txt.className = "ct-inst-txt";
@@ -980,6 +1003,44 @@
   // iOS Safari has no beforeinstallprompt — show the add-to-home-screen hint instead.
   if (isIOS() && isMobile() && !isStandalone() && !installDismissed()) {
     setTimeout(() => showInstallBanner({ ios: true }), 1600);
+  }
+  // #endregion
+
+  // #region mobile keyboard: slide the terminal up (no resize) + no auto-keyboard
+  // When the on-screen keyboard opens, slide the ttyd frame up by the keyboard height
+  // so the input line clears the keyboard — a transform, NOT a resize (xterm doesn't
+  // reflow), and the fixed tab bar stays put at the top.
+  const vv = window.visualViewport;
+  function applyKeyboardShift() {
+    if (!vv) return;
+    const tc = document.getElementById("terminal-container");
+    if (!tc) return;
+    const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+    tc.style.transform = kb > 120 ? "translateY(-" + kb + "px)" : "";
+    // if the browser scrolled the visual viewport, keep the fixed bar on the visible top
+    bar.style.transform = vv.offsetTop ? "translateY(" + Math.round(vv.offsetTop) + "px)" : "";
+  }
+  if (vv && isMobile()) {
+    vv.addEventListener("resize", applyKeyboardShift);
+    vv.addEventListener("scroll", applyKeyboardShift);
+  }
+
+  // Don't pop the on-screen keyboard on its own: ttyd focuses xterm on load, and a tab
+  // switch reloads the page. Blur the terminal input until the user actually taps the
+  // terminal — then their tap focuses it and the keyboard opens as expected.
+  let userTappedTerminal = false;
+  document.addEventListener("touchstart", (e) => {
+    if (e.target && e.target.closest && e.target.closest("#terminal-container")) userTappedTerminal = true;
+  }, { capture: true });
+  function blurTerminalInput() {
+    if (userTappedTerminal) return;
+    const ta = document.querySelector(".xterm-helper-textarea");
+    if (ta) ta.blur();
+    const ae = document.activeElement;
+    if (ae && ae !== document.body && typeof ae.blur === "function") ae.blur();
+  }
+  if (isMobile()) {
+    [0, 80, 200, 400, 700, 1100].forEach((d) => setTimeout(blurTerminalInput, d));
   }
   // #endregion
   // #endregion

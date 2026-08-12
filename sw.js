@@ -3,8 +3,8 @@
 // Served from /_paste/sw.js but registered at scope "/" (needs the
 // Service-Worker-Allowed: / response header, which server.ts sets).
 
-const ICON = "/_ct/pwa/icon-192.png";
-const BADGE = "/_ct/pwa/favicon-32.png";
+const ICON = "/_ct/pwa/icon-192.png?v=2";
+const BADGE = "/_ct/pwa/favicon-32.png?v=2";
 
 self.addEventListener("install", () => {
   self.skipWaiting();
