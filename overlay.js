@@ -358,7 +358,7 @@
     "body.theme-light #claude-tabbar .ctab-btn{background:#fff;border-color:#d7d7d7;color:#444}",
     "body.theme-light #claude-tabbar .ctab-btn:hover{background:#ececec;color:#000}",
     // tighter on small screens; theme toggle folds into the drawer on mobile
-    "@media (max-width:600px){#claude-tabbar{gap:4px;padding:0 5px}#claude-tabbar .ctab{max-width:220px}#claude-tabbar .ctab .ctab-label{max-width:170px}#claude-tabbar .ctab-theme{display:none}}",
+    "@media (max-width:600px){#claude-tabbar{gap:4px;padding:0 5px}#claude-tabbar .ctab{max-width:220px}#claude-tabbar .ctab .ctab-label{max-width:170px}#claude-tabbar .ctab-theme,#claude-tabbar .ctab-bell{display:none}}",
     // drawer settings rows (theme + notifications live here on mobile)
     "#ct-drawer .ct-draw-sep{height:1px;margin:6px 10px;background:#333}",
     "body.theme-light #ct-drawer .ct-draw-sep{background:#e2e2e2}",
@@ -398,12 +398,17 @@
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
   hamBtn.innerHTML = SVG_HAM;
+  const bellBtn = document.createElement("div"); // desktop only (mobile uses the drawer)
+  bellBtn.className = "ctab-btn ctab-bell";
+  bellBtn.title = "Enable notifications";
+  bellBtn.innerHTML = SVG_BELL_OFF;
   // tabs, then + right after them (left-aligned), spacer pushes the rest right;
   // history sits all the way on the right end.
   bar.appendChild(hamBtn); // mobile-only, leftmost
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
+  bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
@@ -932,6 +937,19 @@
     const on = await notifOn();
     if (icEl) icEl.innerHTML = on ? SVG_BELL : SVG_BELL_OFF;
     if (subEl) subEl.textContent = on ? "On" : "Off";
+  }
+  // Desktop top-bar bell (mobile uses the drawer row instead; CSS hides it ≤600px).
+  async function paintBell() {
+    const on = await notifOn();
+    bellBtn.innerHTML = on ? SVG_BELL : SVG_BELL_OFF;
+    bellBtn.title = on ? "Notifications on — click to turn off" : "Enable notifications (prompt done / waiting)";
+    bellBtn.classList.toggle("on", on);
+  }
+  if (pushSupported()) {
+    bellBtn.addEventListener("click", async () => { await toggleNotif(); paintBell(); });
+    paintBell();
+  } else {
+    bellBtn.style.display = "none";
   }
   // #endregion
 
