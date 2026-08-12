@@ -16,12 +16,17 @@ import { join } from "node:path";
 import { openCostDb } from "./cost-db.ts";
 
 type CostCfg = {
+  owner?: string;
+  names?: Record<string, string>;
   db: string;
   cloudCostDb?: string;
   cloudHost?: string;
   collectSeconds?: number;
   costSampleClampSeconds?: number;
   costOwnerTeam?: number;
+  // owner-team Coolify projects (by id or name) to keep as their own bucket; every
+  // other owner project folds into the single owner bucket. [] = merge everything.
+  costSeparateProjects?: (number | string)[];
   port?: number;
 };
 
@@ -129,16 +134,29 @@ function matchUuid(name: string, known: Set<string>): string | null {
 }
 
 type Bucket = { bucket: string; bucketName: string; teamId: number | null };
+type BucketOpts = {
+  ownerTeam: number;
+  ownerName: string;
+  // Owner-team projects to keep as their own bucket (e.g. FTA Buddy, The Orange
+  // Alliance). Everything else the owner runs folds into the single owner bucket.
+  separateIds: Set<number>;
+  separateNames: Set<string>;
+  teamNames: Map<number, string>;
+};
 function bucketFor(
   res: { name: string; projId: number; projName: string; teamId: number } | undefined,
   containerName: string,
-  ownerTeam: number,
-  teamNames: Map<number, string>,
+  o: BucketOpts,
 ): Bucket {
   if (res) {
-    if (res.teamId === ownerTeam) return { bucket: `proj:${res.projId}`, bucketName: res.projName, teamId: res.teamId };
+    if (res.teamId === o.ownerTeam) {
+      const separate = o.separateIds.has(res.projId) || o.separateNames.has(res.projName.toLowerCase());
+      if (separate) return { bucket: `proj:${res.projId}`, bucketName: res.projName, teamId: res.teamId };
+      // the owner's standard usage: all their other projects under one name
+      return { bucket: "owner", bucketName: o.ownerName, teamId: res.teamId };
+    }
     // guest team: one bucket per guest person (their project is just "sandbox")
-    return { bucket: `guest:${res.teamId}`, bucketName: teamNames.get(res.teamId) || res.projName, teamId: res.teamId };
+    return { bucket: `guest:${res.teamId}`, bucketName: o.teamNames.get(res.teamId) || res.projName, teamId: res.teamId };
   }
   if (isInfra(containerName)) return { bucket: "system", bucketName: "System / infra", teamId: null };
   return { bucket: "unattributed", bucketName: "Unattributed", teamId: null };
@@ -154,7 +172,7 @@ function metaGet(db: Database, key: string): string | null {
   return r ? r.value : null;
 }
 
-function accumulate(db: Database, host: string, s: Sample, ownerTeam: number, intervalSec: number): void {
+function accumulate(db: Database, host: string, s: Sample, opts: BucketOpts, intervalSec: number): void {
   const now = new Date();
   const month = utcMonth(now);
   const nowIso = now.toISOString().replace(/\.\d+Z$/, "+00:00");
@@ -168,7 +186,7 @@ function accumulate(db: Database, host: string, s: Sample, ownerTeam: number, in
     const uuid = matchUuid(c.name, known);
     const res = uuid ? s.resources.get(uuid) : undefined;
     const rkey = uuid ?? c.name;
-    const b = bucketFor(res, c.name, ownerTeam, s.teamNames);
+    const b = bucketFor(res, c.name, opts);
     const name = res ? res.name : c.name;
     const a = agg.get(rkey);
     if (a) { a.bytes += c.bytes; a.cores += c.cores; }
@@ -213,11 +231,22 @@ export async function sampleCloudCost(configPath: string): Promise<boolean> {
   const nominal = cfg.collectSeconds || 60;
   const clamp = cfg.costSampleClampSeconds || Math.max(nominal * 2, 150);
   const ownerTeam = cfg.costOwnerTeam ?? 0;
+  const owner = cfg.owner || "me";
+  const ownerName = cfg.names?.[owner] || owner.charAt(0).toUpperCase() + owner.slice(1);
+  const sep = cfg.costSeparateProjects || [];
+  const opts: BucketOpts = {
+    ownerTeam,
+    ownerName,
+    separateIds: new Set(sep.filter((x): x is number => typeof x === "number")),
+    separateNames: new Set(sep.filter((x): x is string => typeof x === "string").map((x) => x.toLowerCase())),
+    teamNames: new Map(),
+  };
 
   const out = await sshSample(host);
   if (!out) return false;
   const sample = parseSample(out);
   if (!sample) { console.error("cost sample: could not parse stats/map"); return false; }
+  opts.teamNames = sample.teamNames;
 
   const db = openCostDb(dbPath);
   try {
@@ -227,7 +256,7 @@ export async function sampleCloudCost(configPath: string): Promise<boolean> {
     const last = Number(metaGet(db, `last_sample_at:cloud`) || 0);
     let interval = last ? (Date.now() - last) / 1000 : nominal;
     if (!(interval > 0) || interval > clamp) interval = Math.min(nominal, clamp);
-    accumulate(db, "cloud", sample, ownerTeam, interval);
+    accumulate(db, "cloud", sample, opts, interval);
   } finally {
     db.close();
   }

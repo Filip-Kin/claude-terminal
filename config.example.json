@@ -6,21 +6,31 @@
   "usagePage": true,
   "subscriptionUsd": 0,
   "collectSeconds": 60,
-  "historyHide": ["/path/to/an/automation/cwd"],
+  "historyHide": [
+    "/path/to/an/automation/cwd"
+  ],
   "extraUsers": {
-    "some-bot": ["/path/to/another/.claude/projects"]
+    "some-bot": [
+      "/path/to/another/.claude/projects"
+    ]
   },
-  "names": { "me": "Me" },
-  "hosts": ["me"],
-  "colors": { "me": "#3b82f6" },
-  "corsOrigins": ["https://home.example.com"],
-
+  "names": {
+    "me": "Me"
+  },
+  "hosts": [
+    "me"
+  ],
+  "colors": {
+    "me": "#3b82f6"
+  },
+  "corsOrigins": [
+    "https://home.example.com"
+  ],
   "appName": "Claude Terminal",
   "appShort": "Claude",
   "themeColor": "#D97757",
   "bgColor": "#1a1613",
   "vapidSubject": "mailto:you@example.com",
-
   "spawnCwd": "/home/me/projects",
   "spawnHelper": "/home/me/.local/bin/claude-spawn",
   "cloudHost": "root@203.0.113.10",
@@ -31,5 +41,16 @@
   "costRamWeight": 0.5,
   "costCpuWeight": 0.5,
   "costOwnerTeam": 0,
-  "costColors": { "proj:2": "#38bdf8", "guest:2": "#f59e0b", "guest:3": "#ec4899", "system": "#64748b" }
+  "costSeparateProjects": [
+    2,
+    7
+  ],
+  "costColors": {
+    "owner": "#3b82f6",
+    "proj:7": "#14b8a6",
+    "proj:2": "#a855f7",
+    "guest:2": "#f59e0b",
+    "guest:3": "#ec4899",
+    "system": "#64748b"
+  }
 }
