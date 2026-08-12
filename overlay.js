@@ -76,15 +76,20 @@
   // DRAG into wheel notches on the terminal. A tap or horizontal move is left alone so
   // clicks, cursor placement and selection still pass through to xterm/tmux.
   const NOTCH = 20; // px of finger travel per wheel notch
+  // don't hijack touches inside our own UI (the history dialog + the tab bar) — they
+  // need native scrolling.
+  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #claude-tabbar"));
   let tStartX = 0, tStartY = 0, tLastY = 0, tAccum = 0, tScroll = false;
   document.addEventListener("touchstart", (e) => {
     tScroll = false; tAccum = 0;
+    if (inOverlayUi(e.target)) return;
     if (e.touches.length === 1) {
       tStartX = e.touches[0].clientX;
       tStartY = tLastY = e.touches[0].clientY;
     }
   }, { capture: true, passive: true });
   document.addEventListener("touchmove", (e) => {
+    if (inOverlayUi(e.target)) return;
     if (e.touches.length !== 1) return;
     const t = e.touches[0];
     if (!tScroll) {
@@ -291,7 +296,7 @@
     "body.theme-light #ct-histmodal .ct-hist-search{background:#f6f6f6;border-color:#dcdcdc;color:#1f1f1f}",
     "#ct-histmodal .ct-hist-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
     "#ct-histmodal .ct-hist-close:hover{opacity:1}",
-    "#ct-histmodal .ct-hist-list{overflow-y:auto;padding:6px}",
+    "#ct-histmodal .ct-hist-list{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:6px}",
     "#ct-histmodal .ct-hist-row{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:7px;cursor:pointer}",
     "#ct-histmodal .ct-hist-row:hover{background:#2c2c2c}",
     "#ct-histmodal .ct-hist-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
