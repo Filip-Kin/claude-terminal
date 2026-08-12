@@ -9,7 +9,7 @@
 import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
-import { watch, readdirSync, statSync } from "node:fs";
+import { watch, readdirSync, statSync, existsSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import webpush from "web-push";
 
@@ -408,6 +408,39 @@ function cors(req: Request): Record<string, string> {
 }
 // #endregion
 
+// #region spawn a detached worker tab (POST /sessions/spawn)
+// Both the `claude-spawn` CLI and this endpoint go through the same helper script, so the
+// tricky bits (workspace-trust pre-seed, safe prompt quoting, PATH, tmux socket) live in
+// exactly one place. Guests own session creation via their in-container sidecar, so this
+// endpoint is how a guest's Claude spins off a task tab too.
+const SPAWN_HELPER: string =
+  cfg.spawnHelper ||
+  (existsSync(join(HOME, ".local/bin/claude-spawn")) ? join(HOME, ".local/bin/claude-spawn") : "/usr/local/bin/claude-spawn");
+// Default working dir when a spawn names none: an already-trusted root (the host's files
+// root, a guest's /workspace). Falls back to HOME.
+const SPAWN_CWD: string = cfg.spawnCwd || HOME;
+
+async function spawnWorker(name: string | undefined, cwd: string, prompt: string): Promise<{ id: string } | { error: string }> {
+  const args = [SPAWN_HELPER, "--cwd", cwd, "--prompt-file", "-"]; // prompt over stdin: no argv limit, no quoting
+  if (name) args.push("--name", name);
+  try {
+    const proc = Bun.spawn(args, {
+      env: { ...process.env, TMUX_TMPDIR: process.env.TMUX_TMPDIR || "/tmp" },
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    proc.stdin.write(prompt);
+    await proc.stdin.end();
+    const out = (await new Response(proc.stdout).text()).trim();
+    const err = (await new Response(proc.stderr).text()).trim();
+    const code = await proc.exited;
+    if (code !== 0 || !out) return { error: err || `claude-spawn exited ${code}` };
+    return { id: out.split("\n").pop()!.trim() };
+  } catch (e: any) {
+    return { error: `could not run ${SPAWN_HELPER}: ${e?.message || e}` };
+  }
+}
+// #endregion
+
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
@@ -617,6 +650,21 @@ const server = Bun.serve({
       }
       pending.set(id, Math.floor(Date.now() / 1000)); // show it immediately
       return Response.json({ id }, { headers: cors(req) });
+    }
+    // Spin off a NEW detached tab running a fresh Claude on a task. The session is
+    // created immediately (unlike /sessions/new, which defers creation to when the tab
+    // is opened); pending still registers it so the chip shows without a /sessions poll.
+    if (req.method === "POST" && path === "/sessions/spawn") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      let body: any = {}; try { body = await req.json(); } catch {}
+      const prompt = String(body.prompt ?? "").trim();
+      if (!prompt) return new Response("Missing prompt", { status: 400 });
+      const cwd = body.cwd ? String(body.cwd) : SPAWN_CWD;
+      const name = body.name ? String(body.name).replace(/[^A-Za-z0-9_-]/g, "") : undefined;
+      const res = await spawnWorker(name || undefined, cwd, prompt);
+      if ("error" in res) return new Response(res.error, { status: 500 });
+      pending.set(res.id, Math.floor(Date.now() / 1000)); // show the tab instantly
+      return Response.json({ id: res.id }, { headers: cors(req) });
     }
     if (req.method === "POST" && path === "/sessions/close") {
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });

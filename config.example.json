@@ -19,5 +19,8 @@
   "appShort": "Claude",
   "themeColor": "#D97757",
   "bgColor": "#1a1613",
-  "vapidSubject": "mailto:you@example.com"
+  "vapidSubject": "mailto:you@example.com",
+
+  "spawnCwd": "/home/me/projects",
+  "spawnHelper": "/home/me/.local/bin/claude-spawn"
 }

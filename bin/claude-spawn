@@ -1,0 +1,141 @@
+#!/bin/bash
+# claude-spawn: spin off a NEW claude-terminal tab that runs a fresh, detached Claude
+# on a given task. The tab shows up in the browser tab bar; open it any time to watch
+# the spawned session work (it keeps going whether or not anyone is looking).
+#
+# It creates a detached tmux session on the same socket the tab bar enumerates, running
+#   claude "<prompt>" --dangerously-skip-permissions
+# in the given directory. The ttyd wrapper attaches to that already-running session with
+# `new-session -A` when you open the tab, so opening it never restarts the work.
+#
+# Two facts this relies on, both verified against the live Claude CLI:
+#   1. `claude "<prompt>"` in an interactive pty AUTO-SUBMITS the prompt (it doesn't just
+#      pre-fill the box), so the spawned session starts working on its own.
+#   2. The workspace trust dialog is NOT skipped in interactive mode, so a cwd with no
+#      trusted ancestor would sit on that prompt forever. We pre-seed trust for the cwd
+#      before launching (same thing the guest entrypoint does for /workspace).
+#
+# Usage:
+#   claude-spawn --prompt "do the thing" [--name NAME] [--cwd DIR]
+#   claude-spawn --prompt-file /path/to/prompt.txt [--name NAME] [--cwd DIR]
+#
+# Options:
+#   -p, --prompt TEXT        the task (auto-submitted to the fresh Claude). Required
+#                            unless --prompt-file is given.
+#   -f, --prompt-file FILE   read the prompt from FILE (preferred for long/multi-line
+#                            prompts). Use "-" to read stdin.
+#   -n, --name NAME          tab/tmux session name. Sanitised to [A-Za-z0-9_-].
+#                            Default: a generated "spawn-<time>-<rand>" id.
+#   -c, --cwd DIR            working directory for the spawned Claude. Default: $PWD.
+#   -h, --help               this help.
+#
+# Prints the tmux session name (= the tab id) on stdout.
+# Env: TMUX_TMPDIR selects the tmux socket dir (default /tmp, matching the sidecar).
+set -uo pipefail
+
+die() { echo "claude-spawn: $*" >&2; exit 1; }
+
+name=""
+cwd=""
+prompt=""
+prompt_file=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--name)        name="${2:-}"; shift 2 ;;
+        -c|--cwd)         cwd="${2:-}"; shift 2 ;;
+        -p|--prompt)      prompt="${2:-}"; shift 2 ;;
+        -f|--prompt-file) prompt_file="${2:-}"; shift 2 ;;
+        -h|--help)        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)                die "unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+# Prompt: file (or stdin) wins if given, else the inline string.
+if [ -n "$prompt_file" ]; then
+    if [ "$prompt_file" = "-" ]; then
+        prompt="$(cat)"
+    else
+        [ -f "$prompt_file" ] || die "prompt file not found: $prompt_file"
+        prompt="$(cat "$prompt_file")"
+    fi
+fi
+[ -n "${prompt//[$' \t\n']/}" ] || die "a non-empty --prompt or --prompt-file is required"
+
+# cwd default = caller's cwd; must exist.
+[ -n "$cwd" ] || cwd="$PWD"
+[ -d "$cwd" ] || die "cwd is not a directory: $cwd"
+cwd="$(cd "$cwd" && pwd -P)"   # canonicalise (realpath), matching the trust key
+
+# Name: sanitise to the same charset the tab bar / ttyd wrapper allow. Generate one
+# if not supplied.
+if [ -z "$name" ]; then
+    name="spawn-$(date +%H%M%S)-$RANDOM"
+fi
+name="${name//[^A-Za-z0-9_-]/}"
+[ -n "$name" ] || die "name reduced to empty after sanitising"
+
+sockdir="${TMUX_TMPDIR:-/tmp}"
+
+# Refuse to clobber an existing session (would otherwise silently attach to unrelated
+# work). The caller can retry with a different name.
+if TMUX_TMPDIR="$sockdir" tmux has-session -t "=$name" 2>/dev/null; then
+    die "a tmux session named '$name' already exists (pick another --name)"
+fi
+
+# Pre-seed workspace trust for the cwd so the spawned Claude never blocks on the trust
+# dialog. No-op if the cwd or any ancestor is already trusted, so a default spawn into
+# an already-trusted tree (files root / /workspace) writes nothing. Uses a lock + atomic
+# rename; a concurrent Claude rewriting ~/.claude.json is a tiny race and the seed only
+# needs to survive the second until the spawned Claude reads it at startup.
+CLAUDE_SPAWN_CWD="$cwd" python3 - <<'PY' || die "could not pre-seed folder trust"
+import json, os, sys, tempfile
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+cwd = os.path.realpath(os.environ["CLAUDE_SPAWN_CWD"])
+p = os.path.join(os.path.expanduser("~"), ".claude.json")
+lock = open(p + ".spawnlock", "w")
+if fcntl:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+try:
+    try:
+        d = json.load(open(p))
+    except FileNotFoundError:
+        d = {}
+    projs = d.setdefault("projects", {})
+    def has_trusted_ancestor(path):
+        cur = path
+        while True:
+            e = projs.get(cur)
+            if isinstance(e, dict) and e.get("hasTrustDialogAccepted"):
+                return True
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                return False
+            cur = parent
+    if not has_trusted_ancestor(cwd):
+        entry = projs.setdefault(cwd, {})
+        entry["hasTrustDialogAccepted"] = True
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p) or ".")
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, p)
+finally:
+    if fcntl:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+PY
+
+# Launch detached. tmux execs a MULTI-arg command directly (no shell), so the prompt is
+# passed as one literal argv element ($1) with zero quoting hazard, and naming /bin/bash
+# explicitly dodges the uid-33 nologin trap in guest containers. The wrapper prepends
+# ~/.local/bin so the spawned Claude finds its tools (claude-notify, gh, ...) even when
+# the tmux server's inherited PATH is bare, and resolves `claude` via PATH so it works on
+# the host (~/.local/bin/claude) and inside guests (/config/.local/bin/claude) alike.
+TMUX_TMPDIR="$sockdir" tmux new-session -d -s "$name" -c "$cwd" \
+    /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec claude "$1" --dangerously-skip-permissions' \
+    claude-spawn "$prompt" \
+    || die "tmux new-session failed"
+
+echo "$name"
