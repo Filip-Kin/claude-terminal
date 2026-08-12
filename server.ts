@@ -236,18 +236,31 @@ async function pushAll(payload: NotifPayload): Promise<{ sent: number; pruned: n
   const data = JSON.stringify(payload);
   const dead: string[] = [];
   await Promise.all(subs.map(async (s) => {
-    try { await webpush.sendNotification(s as any, data, { TTL: 120 }); }
+    // urgency:high tells the push service (FCM/Mozilla/APNs) to deliver immediately
+    // instead of batching for power-saving, which is what made pushes feel slow.
+    try { await webpush.sendNotification(s as any, data, { TTL: 120, urgency: "high" }); }
     catch (e: any) { const c = e?.statusCode; if (c === 404 || c === 410) dead.push(s.endpoint); }
   }));
   for (const d of dead) removeSub(d);
   return { sent: subs.length, pruned: dead.length };
 }
 
-// Focus heartbeat: the overlay POSTs the session it is actively watching so we can
-// suppress a redundant prompt-finished push for the tab already on your screen.
-let activeId: string | null = null;
-let activeAt = 0;
-const ACTIVE_WINDOW_MS = 40000;
+// Focus heartbeat: each open terminal POSTs the session it is actively watching so we
+// can suppress a redundant prompt-finished push for a tab already on someone's screen.
+// Keyed per session (not a single global) so multiple devices are handled correctly:
+// any device watching session X keeps X "fresh", and it only becomes notifiable again
+// once NO device has reported watching it within the window.
+const ACTIVE_WINDOW_MS = 22000;
+const watchedAt = new Map<string, number>();
+function markWatched(id: string) {
+  const now = Date.now();
+  watchedAt.set(id, now);
+  for (const [k, v] of watchedAt) if (now - v >= ACTIVE_WINDOW_MS) watchedAt.delete(k); // prune stale
+}
+function isWatched(id: string): boolean {
+  const t = watchedAt.get(id);
+  return t != null && Date.now() - t < ACTIVE_WINDOW_MS;
+}
 
 // Local services (loopback, no Remote-User header) and the authenticated owner may
 // trigger notifications; a different authenticated user (guest via nginx) may not.
@@ -500,8 +513,7 @@ const server = Bun.serve({
     if (req.method === "POST" && path === "/active") {
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });
       let body: any = {}; try { body = await req.json(); } catch {}
-      activeId = body?.id != null ? String(body.id) : null;
-      activeAt = Date.now();
+      if (body?.id != null) markWatched(String(body.id));
       return Response.json({ ok: true }, { headers: cors(req) });
     }
     // Generic: anything the owner (or a local service like stonkbot) wants to push.
@@ -531,7 +543,7 @@ const server = Bun.serve({
       const id = String(body.id || "");
       const kind = String(body.kind || "done");
       if (!id) return new Response("Missing id", { status: 400 });
-      if (activeId === id && Date.now() - activeAt < ACTIVE_WINDOW_MS) {
+      if (isWatched(id)) {
         return Response.json({ ok: true, suppressed: true });
       }
       const t = (await titleForSession(id)) || `Session ${id}`;

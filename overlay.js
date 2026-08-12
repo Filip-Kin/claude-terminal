@@ -953,16 +953,27 @@
   }
   // #endregion
 
-  // #region focus heartbeat (suppress pushes for the tab you're actively watching)
+  // #region watch heartbeat (suppress pushes for the tab you're actively looking at)
+  // While this tab is on screen, tell the server which session it's showing so a
+  // prompt-finished/waiting push for that session is suppressed. On mobile the app
+  // being visible (foreground) is the signal — document.hasFocus() is unreliable there,
+  // which is why notifications weren't being suppressed on the phone. On desktop we also
+  // require window focus, so a visible-but-unfocused window still notifies you. When you
+  // leave, we simply stop reporting and the server entry goes stale within ~20s.
+  function isWatching() {
+    if (document.visibilityState !== "visible") return false;
+    if (!isMobile() && typeof document.hasFocus === "function" && !document.hasFocus()) return false;
+    return true;
+  }
   function sendActive() {
-    const watching = document.visibilityState === "visible" && document.hasFocus();
-    api("active", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: watching ? curId() : null }) }).catch(() => {});
+    if (!isWatching()) return;
+    api("active", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: curId() }) }).catch(() => {});
   }
   sendActive();
-  setInterval(sendActive, 15000);
+  setInterval(sendActive, 10000);
   document.addEventListener("visibilitychange", sendActive);
   window.addEventListener("focus", sendActive);
-  window.addEventListener("blur", sendActive);
+  window.addEventListener("pageshow", sendActive);
   // #endregion
 
   // #region mobile install prompt
