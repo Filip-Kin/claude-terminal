@@ -12,6 +12,7 @@ import { join, dirname } from "node:path";
 import { watch, readdirSync, statSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import webpush from "web-push";
+import { buildCostReport } from "./cost.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -427,6 +428,14 @@ const server = Bun.serve({
       if (req.method === "POST" && path === "/internal/tick") { broadcast(); return new Response("ok"); }
       if (req.method === "GET" && path === "/usage/api") {
         return Response.json(buildLeaderboard(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
+      }
+      // Cloud cost split (second dashboard section). Reads cloud_cost.db via its own
+      // module; answers { available:false, ... } gracefully until the collector has samples.
+      if (req.method === "GET" && path === "/usage/cost/api") {
+        let report: any;
+        try { report = buildCostReport(cfg); }
+        catch (e: any) { report = { available: false, reason: String(e?.message || e) }; }
+        return Response.json(report, { headers: { "Cache-Control": "no-store", ...cors(req) } });
       }
       if (req.method === "GET" && path === "/usage/stream") {
         const stream = new ReadableStream({

@@ -11,6 +11,7 @@
 import { openSync, fstatSync, readSync, closeSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { openDb } from "./db.ts";
+import { sampleCloudCost } from "./cost-collector.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -190,5 +191,13 @@ try {
   await fetch(`http://127.0.0.1:${notifyPort}/internal/tick`, { method: "POST" });
 } catch {
   // server not running / not this deploy -> the page's fallback poll still refreshes
+}
+
+// Cloud cost-split sample (separate module + DB). Non-fatal: a slow/unreachable cloud
+// host must never disturb token-usage collection. No-ops unless cloudHost is configured.
+try {
+  await sampleCloudCost(CONFIG_PATH);
+} catch (e) {
+  console.error("cloud cost sample failed:", e);
 }
 

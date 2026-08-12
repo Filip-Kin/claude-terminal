@@ -81,6 +81,21 @@
   .billfoot b { color:var(--ink); font-size:19px; font-weight:750; }
   footer { margin-top:26px; color:var(--muted); font-size:12px; }
   .err { background:var(--card); border:1px solid #ef4444; border-radius:14px; padding:16px; color:#ef4444; }
+
+  /* cloud cost split (second section) */
+  .sectionhead { margin:52px 0 0; display:flex; align-items:flex-end; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+  .sectionhead h1 { font-size:22px; }
+  .costsub { color:var(--muted); font-size:13px; margin:8px 0 0; max-width:70ch; }
+  .util { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:6px 4px 14px; }
+  @media (max-width:520px){ .util { grid-template-columns:1fr; } }
+  .util .u { background:var(--track); border:1px solid var(--line); border-radius:12px; padding:11px 13px; }
+  .util .ul { display:flex; justify-content:space-between; align-items:baseline; font-size:12.5px; color:var(--muted); margin-bottom:8px; }
+  .util .ul b { color:var(--ink); font-size:16px; font-weight:750; font-variant-numeric:tabular-nums; }
+  .util .track { height:8px; border-radius:6px; background:var(--line); overflow:hidden; }
+  .util .track > span { display:block; height:100%; border-radius:6px; transition:width .6s cubic-bezier(.2,.7,.2,1); }
+  .billrow .bn small { color:var(--muted); font-weight:500; font-size:11.5px; display:block; margin-top:1px; }
+  .billrow .brc { color:var(--muted); font-variant-numeric:tabular-nums; font-size:12px; text-align:right; white-space:nowrap; }
+  .costnote { margin-top:6px; font-size:11.5px; color:var(--muted); }
 </style>
 </head>
 <body>
@@ -120,6 +135,32 @@
     <p>Hover any point for the exact hour and token count.</p>
     <div id="mainChart" style="height:320px"></div>
   </div>
+
+  <!-- #region Cloud server cost split (second section) -->
+  <div id="costSection" style="display:none">
+    <div class="sectionhead">
+      <div>
+        <h1>Cloud server cost split</h1>
+        <p class="costsub">The DigitalOcean droplet is one fixed monthly bill. This splits it by how much
+        RAM and CPU each project (and each guest) actually drew, sampled every minute. The NAS is home
+        hardware on home power, so its apps are a free pit of compute and don't figure in here.</p>
+      </div>
+      <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="costUpdated">loading</span></span></div>
+    </div>
+
+    <div class="panel" id="costPanel">
+      <div class="billhead">
+        <h2>Monthly split by resource use</h2>
+        <select id="costMonthSel" class="msel" aria-label="Choose month"></select>
+      </div>
+      <p id="costIntro">Each project's slice of the droplet bill, weighted by the RAM and CPU it used that month.</p>
+      <div class="util" id="costUtil"></div>
+      <div class="billbar" id="costBar"></div>
+      <div class="billrows" id="costRows"></div>
+      <div class="billfoot" id="costFoot"></div>
+    </div>
+  </div>
+  <!-- #endregion -->
 
   <footer id="foot"></footer>
 </div>
@@ -342,6 +383,99 @@ try {
   es.onmessage = () => load(false);
 } catch (e) { /* SSE unsupported -> the poll above still keeps it fresh */ }
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", ()=>load(true));
+</script>
+
+<script>
+// #region Cloud server cost split — self-contained, reuses fmt/money/ago/colorFor from above.
+const gib = b => (b/1073741824);
+const fmtBytes = b => b>=1073741824 ? gib(b).toFixed(gib(b)>=10?1:2)+" GiB" : (b/1048576).toFixed(0)+" MiB";
+const fmtCores = c => c.toFixed(c>=1?2:2)+" vCPU";
+// buckets carry a backend color when configured, else fall back to the shared colorFor() hash.
+const costColor = b => b.color || colorFor(b.bucket);
+
+let COST=null;
+function costMonth(){ const s=document.getElementById("costMonthSel"); return s.value; }
+
+function renderCost(d, key){
+  const m = d.months.find(x=>x.key===key) || d.months[d.months.length-1];
+  if(!m) return;
+
+  // live utilization (right now, current month only)
+  const util = document.getElementById("costUtil");
+  if(key===d.current_month && d.live){
+    const rp = d.live.mem_used_pct, cp = d.live.cpu_used_pct;
+    util.style.display="";
+    util.innerHTML = `
+      <div class="u">
+        <div class="ul"><span>RAM in use now</span><b>${fmtBytes(d.live.ram_bytes)}${rp!=null?" · "+rp+"%":""}</b></div>
+        <div class="track"><span style="width:${Math.min(100,rp||0)}%;background:linear-gradient(90deg,#6366f1,#8b5cf6)"></span></div>
+      </div>
+      <div class="u">
+        <div class="ul"><span>CPU in use now</span><b>${fmtCores(d.live.cpu_cores)}${cp!=null?" · "+cp+"%":""}</b></div>
+        <div class="track"><span style="width:${Math.min(100,cp||0)}%;background:linear-gradient(90deg,#06b6d4,#22c55e)"></span></div>
+      </div>`;
+  } else { util.style.display="none"; util.innerHTML=""; }
+
+  // stacked bar by each bucket's weight (its share of the bill)
+  const bar = document.getElementById("costBar"); bar.innerHTML="";
+  m.buckets.forEach(b => {
+    if(!b.weight_pct) return;
+    const s = document.createElement("span");
+    s.style.background = costColor(b); s.style.width = b.weight_pct+"%";
+    s.title = `${b.name}: ${money(b.share_usd)} (${b.weight_pct}%)`;
+    bar.appendChild(s);
+  });
+
+  const rows = document.getElementById("costRows"); rows.innerHTML="";
+  m.buckets.forEach(b => {
+    const top = b.resources && b.resources.length ? b.resources[0].name : "";
+    const extra = b.resources && b.resources.length>1 ? ` +${b.resources.length-1} more` : "";
+    const sub = top ? `${top}${extra}` : "";
+    const row = document.createElement("div"); row.className="billrow";
+    row.innerHTML = `
+      <span class="bn"><span class="swatch" style="background:${costColor(b)}"></span>
+        <span>${b.name}${sub?`<small>${sub}</small>`:""}</span></span>
+      <span class="brc">${fmtBytes(b.avg_ram_bytes)} avg<br>${b.ram_pct}% RAM · ${b.cpu_pct}% CPU</span>
+      <span class="bd">${money(b.share_usd)}</span>`;
+    rows.appendChild(row);
+  });
+
+  const dr = d.droplet;
+  document.getElementById("costFoot").innerHTML =
+    `<b>${money(dr.monthly_usd)}/mo</b> for ${dr.desc}, split ${Math.round(d.ram_weight*100)}% by RAM / ${Math.round(d.cpu_weight*100)}% by CPU.`
+    + (dr.note ? `<div class="costnote">${dr.note}</div>` : "");
+}
+
+function populateCostMonths(d){
+  const sel = document.getElementById("costMonthSel");
+  const prev = sel.value; sel.innerHTML="";
+  [...d.months].reverse().forEach(m => { const o=document.createElement("option"); o.value=m.key; o.textContent=m.label; sel.appendChild(o); });
+  const keys = d.months.map(m=>m.key);
+  sel.value = keys.includes(prev) ? prev : (keys.includes(d.current_month) ? d.current_month : keys[keys.length-1]);
+}
+
+async function loadCost(){
+  try {
+    const r = await fetch("cost/api?t="+Date.now(), {cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const d = await r.json(); COST=d;
+    const sec = document.getElementById("costSection");
+    if(!d.available || !d.months || !d.months.length){ sec.style.display="none"; return; }
+    sec.style.display="";
+    populateCostMonths(d);
+    document.getElementById("costMonthSel").onchange = e => renderCost(COST, e.target.value);
+    renderCost(d, costMonth());
+    document.getElementById("costUpdated").textContent = "updated "+ago(d.generated_at);
+  } catch(e) {
+    // leave the section hidden on error; the token board above is unaffected.
+    document.getElementById("costSection").style.display="none";
+  }
+}
+
+loadCost();
+setInterval(loadCost, 30000);
+try { const esc = new EventSource("stream"); esc.onmessage = () => loadCost(); } catch(e){}
+// #endregion
 </script>
 </body>
 </html>
