@@ -9,7 +9,7 @@
 import { mkdir, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
-import { watch } from "node:fs";
+import { watch, readdirSync, statSync } from "node:fs";
 import { Database } from "bun:sqlite";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
@@ -230,6 +230,55 @@ async function stateForSession(name: string): Promise<string> {
   } catch {}
   return "seen";
 }
+// #region conversation history (like /resume) — list the owner's past transcripts
+function listTranscripts(): { path: string; sessionId: string; project: string; mtime: number }[] {
+  const base = cfg.dataDir;
+  const out: any[] = [];
+  let projs;
+  try { projs = readdirSync(base, { withFileTypes: true }); } catch { return out; }
+  for (const p of projs) {
+    if (!p.isDirectory()) continue;
+    if (p.name.startsWith("-tmp-")) continue; // skip scratch/ephemeral cwds
+    const pdir = join(base, p.name);
+    let files;
+    try { files = readdirSync(pdir); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      const fp = join(pdir, f);
+      let st;
+      try { st = statSync(fp); } catch { continue; }
+      out.push({ path: fp, sessionId: f.slice(0, -6), project: p.name, mtime: st.mtimeMs });
+    }
+  }
+  return out;
+}
+
+// Pull a display title (Claude's ai-title, else the first real user message) and the
+// session's original cwd from a transcript.
+async function convMeta(path: string): Promise<{ title: string | null; cwd: string | null }> {
+  const title = await lastAiTitle(path);
+  let cwd: string | null = null;
+  let first: string | null = null;
+  try {
+    const head = await Bun.file(path).slice(0, 65536).text();
+    for (const line of head.split("\n")) {
+      if (!line.trim()) continue;
+      let d: any;
+      try { d = JSON.parse(line); } catch { continue; }
+      if (!cwd && d.cwd) cwd = d.cwd;
+      if (!first && d.type === "user") {
+        const c = d.message?.content;
+        let txt = typeof c === "string" ? c : Array.isArray(c) ? c.filter((b: any) => b?.type === "text").map((b: any) => b.text).join(" ") : "";
+        txt = (txt || "").trim();
+        if (txt && !txt.startsWith("<")) first = txt.replace(/\s+/g, " ").slice(0, 100);
+      }
+      if (cwd && first) break;
+    }
+  } catch {}
+  return { title: title || first, cwd };
+}
+// #endregion
+
 async function allocateId(): Promise<number> {
   let counter = 1;
   try { counter = parseInt(await Bun.file(COUNTER_FILE).text(), 10) || 1; } catch {}
@@ -342,9 +391,26 @@ const server = Bun.serve({
       withTitles.sort((a, b) => (a.id === "1" ? -1 : b.id === "1" ? 1 : 0));
       return Response.json(withTitles, { headers: cors(req) });
     }
+    if (req.method === "GET" && path === "/history") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      const all = listTranscripts().sort((a, b) => b.mtime - a.mtime).slice(0, 60);
+      const rows = await Promise.all(all.map(async (t) => {
+        const m = await convMeta(t.path);
+        return { sessionId: t.sessionId, title: m.title, cwd: m.cwd, mtime: Math.floor(t.mtime) };
+      }));
+      return Response.json(rows.filter((r) => r.title), { headers: cors(req) });
+    }
+
     if (req.method === "POST" && path === "/sessions/new") {
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      let body: any = {};
+      try { body = await req.json(); } catch {}
       const id = String(await allocateId());
+      if (body.resume) {
+        // the ttyd wrapper consumes this to run `claude --resume <id>` in the right cwd
+        const line = `${String(body.resume)}\t${String(body.cwd || "")}`;
+        try { await Bun.write(join(REG_DIR, `${id}.resume`), line); } catch {}
+      }
       pending.set(id, Math.floor(Date.now() / 1000)); // show it immediately
       return Response.json({ id }, { headers: cors(req) });
     }

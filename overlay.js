@@ -247,6 +247,8 @@
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="12" y="8" width="3" height="10"/><rect x="17" y="4" width="3" height="14"/></svg>';
   const SVG_REFRESH =
     '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>';
+  const SVG_HISTORY =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
 
   const barStyle = document.createElement("style");
   barStyle.textContent = [
@@ -280,6 +282,21 @@
     "#claude-tabbar .ctab-new{font-size:18px;line-height:1}",
     "#claude-tabbar .ctab-usage{width:auto;padding:0 9px;gap:5px}",
     "#claude-tabbar .ctab-usage .ctab-usage-fig{font-size:11px;font-variant-numeric:tabular-nums}",
+    // history dialog (resume a past conversation)
+    "#ct-histmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5)}",
+    "#ct-histmodal .ct-hist{margin-top:" + (BAR_H + 12) + "px;width:min(640px,92vw);max-height:78vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-histmodal .ct-hist-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-histmodal .ct-hist-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
+    "#ct-histmodal .ct-hist-close:hover{opacity:1}",
+    "#ct-histmodal .ct-hist-list{overflow-y:auto;padding:6px}",
+    "#ct-histmodal .ct-hist-row{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:7px;cursor:pointer}",
+    "#ct-histmodal .ct-hist-row:hover{background:#2c2c2c}",
+    "#ct-histmodal .ct-hist-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    "#ct-histmodal .ct-hist-sub{font-size:11px;color:#9a9a9a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    "body.theme-light #ct-histmodal .ct-hist{background:#fff;color:#1f1f1f;border-color:#dcdcdc}",
+    "body.theme-light #ct-histmodal .ct-hist-head{border-color:#ececec}",
+    "body.theme-light #ct-histmodal .ct-hist-row:hover{background:#f0f0f0}",
+    "body.theme-light #ct-histmodal .ct-hist-sub{color:#777}",
     // light theme (ttyd toggles body.theme-light)
     "body.theme-light #claude-tabbar{background:#f3f3f3;border-bottom-color:#dcdcdc;color:#333}",
     "body.theme-light #claude-tabbar .ctab{background:#fff;border-color:#d7d7d7}",
@@ -315,12 +332,18 @@
   themeBtn.className = "ctab-btn ctab-theme";
   themeBtn.title = "Toggle light/dark";
   themeBtn.innerHTML = SVG_SUN; // default so it's never blank before the theme loads
-  // tabs, then + right after them (left-aligned), spacer pushes the rest right
+  const historyBtn = document.createElement("div");
+  historyBtn.className = "ctab-btn ctab-history";
+  historyBtn.title = "Conversation history (resume a past chat)";
+  historyBtn.innerHTML = SVG_HISTORY;
+  // tabs, then + right after them (left-aligned), spacer pushes the rest right;
+  // history sits all the way on the right end.
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
   bar.appendChild(themeBtn);
   bar.appendChild(usageBtn);
+  bar.appendChild(historyBtn);
 
   function mountBar() {
     if (!document.body) return;
@@ -566,6 +589,94 @@
   }
   refreshUsage();
   setInterval(refreshUsage, 60000);
+  // #endregion
+
+  // #region conversation history dialog (resume, like /resume)
+  function ago(ms) {
+    const s = Math.max(0, (Date.now() - ms) / 1000);
+    if (s < 60) return "just now";
+    const m = s / 60; if (m < 60) return Math.floor(m) + "m ago";
+    const h = m / 60; if (h < 24) return Math.floor(h) + "h ago";
+    const d = h / 24; if (d < 30) return Math.floor(d) + "d ago";
+    return new Date(ms).toLocaleDateString();
+  }
+  let histEl = null, histEsc = null;
+  function closeHistory() {
+    if (histEl) { histEl.remove(); histEl = null; }
+    if (histEsc) { document.removeEventListener("keydown", histEsc, true); histEsc = null; }
+  }
+  async function resumeConversation(sessionId, cwd) {
+    try {
+      const r = await api("sessions/new", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resume: sessionId, cwd: cwd || "" }),
+      });
+      const { id } = await r.json();
+      closeHistory();
+      switchTo(id); // open the resumed conversation in the current tab
+    } catch (e) {
+      showToast("Could not resume", "error");
+    }
+  }
+  async function openHistory() {
+    if (histEl) { closeHistory(); return; }
+    let rows;
+    try {
+      const r = await api("history");
+      if (!r.ok) throw new Error(String(r.status));
+      rows = await r.json();
+    } catch (e) {
+      showToast("Could not load history", "error");
+      return;
+    }
+    histEl = document.createElement("div");
+    histEl.id = "ct-histmodal";
+    const panel = document.createElement("div");
+    panel.className = "ct-hist";
+    const head = document.createElement("div");
+    head.className = "ct-hist-head";
+    const h = document.createElement("span");
+    h.textContent = "Resume a conversation";
+    const x = document.createElement("span");
+    x.className = "ct-hist-close";
+    x.textContent = "×";
+    x.addEventListener("click", closeHistory);
+    head.appendChild(h);
+    head.appendChild(x);
+    const list = document.createElement("div");
+    list.className = "ct-hist-list";
+    if (!rows.length) {
+      const e = document.createElement("div");
+      e.className = "ct-hist-row";
+      e.textContent = "No past conversations found.";
+      list.appendChild(e);
+    }
+    for (const c of rows) {
+      const row = document.createElement("div");
+      row.className = "ct-hist-row";
+      const t = document.createElement("div");
+      t.className = "ct-hist-title";
+      t.textContent = c.title || c.sessionId;
+      const sub = document.createElement("div");
+      sub.className = "ct-hist-sub";
+      const where = c.cwd ? " · " + c.cwd.replace(/^\/home\/[^/]+/, "~") : "";
+      sub.textContent = ago(c.mtime) + where;
+      row.appendChild(t);
+      row.appendChild(sub);
+      row.title = (c.title || c.sessionId) + (c.cwd ? "  (" + c.cwd + ")" : "");
+      row.addEventListener("click", () => resumeConversation(c.sessionId, c.cwd));
+      list.appendChild(row);
+    }
+    panel.appendChild(head);
+    panel.appendChild(list);
+    histEl.appendChild(panel);
+    histEl.addEventListener("click", (e) => { if (e.target === histEl) closeHistory(); });
+    document.body.appendChild(histEl);
+    histEsc = (e) => { if (e.key === "Escape") closeHistory(); };
+    document.addEventListener("keydown", histEsc, true);
+  }
+  historyBtn.addEventListener("click", openHistory);
   // #endregion
 
   newBtn.addEventListener("click", newSession);
