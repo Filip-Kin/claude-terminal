@@ -234,12 +234,17 @@ async function stateForSession(name: string): Promise<string> {
 function listTranscripts(): { path: string; sessionId: string; project: string; mtime: number }[] {
   const base = cfg.dataDir;
   const out: any[] = [];
+  // Automation/agents (stonkbot, sleeper, ...) run their own `claude --print` under
+  // these dirs; exclude them so history shows only the owner's interactive chats.
+  const exclude: string[] = [];
+  for (const dirs of Object.values(cfg.extraUsers || {})) for (const d of dirs as string[]) exclude.push(d);
   let projs;
   try { projs = readdirSync(base, { withFileTypes: true }); } catch { return out; }
   for (const p of projs) {
     if (!p.isDirectory()) continue;
     if (p.name.startsWith("-tmp-")) continue; // skip scratch/ephemeral cwds
     const pdir = join(base, p.name);
+    if (exclude.some((d) => pdir === d || pdir.startsWith(d + "/"))) continue;
     let files;
     try { files = readdirSync(pdir); } catch { continue; }
     for (const f of files) {

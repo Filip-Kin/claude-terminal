@@ -286,6 +286,9 @@
     "#ct-histmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5)}",
     "#ct-histmodal .ct-hist{margin-top:" + (BAR_H + 12) + "px;width:min(640px,92vw);max-height:78vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
     "#ct-histmodal .ct-hist-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-histmodal .ct-hist-search{margin:8px 10px 2px;padding:7px 10px;border-radius:7px;border:1px solid #3a3a3a;background:#161616;color:#e6e6e6;font:13px system-ui,sans-serif;outline:none}",
+    "#ct-histmodal .ct-hist-search:focus{border-color:#3d6cc4}",
+    "body.theme-light #ct-histmodal .ct-hist-search{background:#f6f6f6;border-color:#dcdcdc;color:#1f1f1f}",
     "#ct-histmodal .ct-hist-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
     "#ct-histmodal .ct-hist-close:hover{opacity:1}",
     "#ct-histmodal .ct-hist-list{overflow-y:auto;padding:6px}",
@@ -341,9 +344,9 @@
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
+  bar.appendChild(historyBtn);
   bar.appendChild(themeBtn);
   bar.appendChild(usageBtn);
-  bar.appendChild(historyBtn);
 
   function mountBar() {
     if (!document.body) return;
@@ -644,35 +647,51 @@
     x.addEventListener("click", closeHistory);
     head.appendChild(h);
     head.appendChild(x);
+    const search = document.createElement("input");
+    search.className = "ct-hist-search";
+    search.type = "text";
+    search.placeholder = "Search conversations…";
     const list = document.createElement("div");
     list.className = "ct-hist-list";
-    if (!rows.length) {
-      const e = document.createElement("div");
-      e.className = "ct-hist-row";
-      e.textContent = "No past conversations found.";
-      list.appendChild(e);
+    function renderList(q) {
+      q = (q || "").trim().toLowerCase();
+      list.innerHTML = "";
+      const shown = rows.filter((c) => !q
+        || (c.title || c.sessionId).toLowerCase().includes(q)
+        || (c.cwd || "").toLowerCase().includes(q));
+      if (!shown.length) {
+        const e = document.createElement("div");
+        e.className = "ct-hist-row";
+        e.textContent = rows.length ? "No matches." : "No past conversations found.";
+        list.appendChild(e);
+        return;
+      }
+      for (const c of shown) {
+        const row = document.createElement("div");
+        row.className = "ct-hist-row";
+        const t = document.createElement("div");
+        t.className = "ct-hist-title";
+        t.textContent = c.title || c.sessionId;
+        const sub = document.createElement("div");
+        sub.className = "ct-hist-sub";
+        const where = c.cwd ? " · " + c.cwd.replace(/^\/home\/[^/]+/, "~") : "";
+        sub.textContent = ago(c.mtime) + where;
+        row.appendChild(t);
+        row.appendChild(sub);
+        row.title = (c.title || c.sessionId) + (c.cwd ? "  (" + c.cwd + ")" : "");
+        row.addEventListener("click", () => resumeConversation(c.sessionId, c.cwd));
+        list.appendChild(row);
+      }
     }
-    for (const c of rows) {
-      const row = document.createElement("div");
-      row.className = "ct-hist-row";
-      const t = document.createElement("div");
-      t.className = "ct-hist-title";
-      t.textContent = c.title || c.sessionId;
-      const sub = document.createElement("div");
-      sub.className = "ct-hist-sub";
-      const where = c.cwd ? " · " + c.cwd.replace(/^\/home\/[^/]+/, "~") : "";
-      sub.textContent = ago(c.mtime) + where;
-      row.appendChild(t);
-      row.appendChild(sub);
-      row.title = (c.title || c.sessionId) + (c.cwd ? "  (" + c.cwd + ")" : "");
-      row.addEventListener("click", () => resumeConversation(c.sessionId, c.cwd));
-      list.appendChild(row);
-    }
+    search.addEventListener("input", () => renderList(search.value));
+    renderList("");
     panel.appendChild(head);
+    panel.appendChild(search);
     panel.appendChild(list);
     histEl.appendChild(panel);
     histEl.addEventListener("click", (e) => { if (e.target === histEl) closeHistory(); });
     document.body.appendChild(histEl);
+    search.focus();
     histEsc = (e) => { if (e.key === "Escape") closeHistory(); };
     document.addEventListener("keydown", histEsc, true);
   }
