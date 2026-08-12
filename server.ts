@@ -17,8 +17,14 @@ const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
 const OWNER: string = cfg.owner;
 const DB_PATH: string = cfg.db;
 const PORT = Number(process.env.PORT || cfg.port || 7682);
-const HOST = "127.0.0.1";
+// 127.0.0.1 on the host (nginx is local); guests set "0.0.0.0" so docker port
+// publishing can reach the in-container sidecar.
+const HOST = cfg.host || "127.0.0.1";
 
+// Terminal-only mode (no usage tracking) = per-guest sidecars: they serve the tab bar
+// + paste for one isolated container and don't open a usage DB or serve the dashboard.
+const USAGE_PAGE = cfg.usagePage !== false;
+const GATE = cfg.gateTerminal !== false; // guests are per-container isolated -> can disable
 const HOME = process.env.HOME || `/home/${OWNER}`;
 const REG_DIR = join(HOME, ".claude", "tab-registry");
 const COUNTER_FILE = join(REG_DIR, ".counter");
@@ -37,8 +43,8 @@ await mkdir(UPLOAD_DIR, { recursive: true });
 await mkdir(REG_DIR, { recursive: true });
 
 // read-only handle on the collector-written DB (WAL, so it sees committed writes)
-const db = new Database(DB_PATH, { readonly: true });
-db.exec("PRAGMA busy_timeout = 5000;");
+const db: Database | null = USAGE_PAGE ? new Database(DB_PATH, { readonly: true }) : null;
+if (db) db.exec("PRAGMA busy_timeout = 5000;");
 
 // #region usage leaderboard (SQLite -> the leaderboard.json shape the page already consumes)
 const ROLLING_HOURS = 5, GAUGE_MAX = 5_000_000, HOURLY_HOURS = 168, SPARK_HOURS = 48;
@@ -82,10 +88,10 @@ function splitCents(amounts: Record<string, number>, pot: number): Record<string
   return cents;
 }
 
-const qUsers = db.query("SELECT user FROM cumulative ORDER BY user");
-const qHours = db.query("SELECT hour_utc, total, output FROM hourly WHERE user = ?");
-const qCum = db.query("SELECT * FROM cumulative WHERE user = ?");
-const qMeta = db.query("SELECT * FROM meta WHERE user = ?");
+const qUsers = db?.query("SELECT user FROM cumulative ORDER BY user") as any;
+const qHours = db?.query("SELECT hour_utc, total, output FROM hourly WHERE user = ?") as any;
+const qCum = db?.query("SELECT * FROM cumulative WHERE user = ?") as any;
+const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 
 function buildLeaderboard() {
   const now = new Date();
@@ -164,6 +170,7 @@ function buildLeaderboard() {
 }
 
 function ownerFigure() {
+  if (!db) return { output_5h: null, share_usd: null, month_label: null };
   const lb = buildLeaderboard();
   const me = lb.users.find((u: any) => u.user === OWNER) || {};
   return { output_5h: me.output_5h ?? null, share_usd: me.share_usd ?? null, month_label: lb.month_label };
@@ -177,10 +184,12 @@ function broadcast() {
   for (const c of sseClients) { try { c.enqueue(enc.encode("data: tick\n\n")); } catch {} }
 }
 let watchTimer: any = null;
-try {
-  // WAL writes land in usage.db-wal, so watch the whole DB directory, debounced.
-  watch(dirname(DB_PATH), () => { clearTimeout(watchTimer); watchTimer = setTimeout(broadcast, 300); });
-} catch (e) { console.error("db watch failed", e); }
+if (USAGE_PAGE) {
+  try {
+    // WAL writes land in usage.db-wal, so watch the whole DB directory, debounced.
+    watch(dirname(DB_PATH), () => { clearTimeout(watchTimer); watchTimer = setTimeout(broadcast, 300); });
+  } catch (e) { console.error("db watch failed", e); }
+}
 // #endregion
 
 // #region terminal sidecar helpers (unchanged behaviour, owner-gated)
@@ -309,7 +318,10 @@ async function writeTheme(theme: string): Promise<void> {
 const PENDING_TTL_MS = 45000;
 const pending = new Map<string, number>(); // id -> created (unix seconds)
 
-function allowed(req: Request): boolean { const ru = req.headers.get("remote-user"); return !ru || ru === OWNER; }
+// Strict: require nginx's Remote-User to equal the owner. nginx sets it per-user on
+// every /_paste route, but a direct cross-container request has no such header, so
+// guests can't reach each other's sidecars on the shared docker bridge.
+function allowed(req: Request): boolean { return !GATE || req.headers.get("remote-user") === OWNER; }
 function cors(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") || "";
   for (const o of cfg.corsOrigins || []) if (origin === o) return { "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", Vary: "Origin" };
@@ -325,39 +337,39 @@ const server = Bun.serve({
 
     // Deterministic live push: the collector POSTs here after it commits usage.db.
     // The server binds 127.0.0.1 only, so this is inherently localhost-only.
-    if (req.method === "POST" && path === "/internal/tick") { broadcast(); return new Response("ok"); }
+    // The tab bar's usage figure. Always answers; terminal-only guests get nulls.
+    if (req.method === "GET" && path === "/usage") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      return Response.json(ownerFigure(), { headers: cors(req) });
+    }
 
-    // #region usage dashboard (public)
-    if (req.method === "GET" && (path === "/usage/api")) {
-      return Response.json(buildLeaderboard(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
-    }
-    if (req.method === "GET" && path === "/usage/stream") {
-      const stream = new ReadableStream({
-        start(controller) {
-          sseClients.add(controller);
-          controller.enqueue(new TextEncoder().encode("retry: 5000\ndata: hello\n\n"));
-        },
-        cancel() {},
-      });
-      // drop the controller when the client disconnects
-      req.signal?.addEventListener("abort", () => { for (const c of sseClients) { /* GC on next broadcast */ } });
-      return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
-    }
-    if (req.method === "GET" && (path === "/usage" || path === "/usage/" )) {
-      // exact /usage from the terminal side is the owner figure; /usage/ is the page
-      if (path === "/usage") {
-        if (!allowed(req)) return new Response("Forbidden", { status: 403 });
-        return Response.json(ownerFigure(), { headers: cors(req) });
+    // #region usage dashboard (public) — only when this instance hosts it
+    if (USAGE_PAGE) {
+      if (req.method === "POST" && path === "/internal/tick") { broadcast(); return new Response("ok"); }
+      if (req.method === "GET" && path === "/usage/api") {
+        return Response.json(buildLeaderboard(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
       }
-      return new Response(Bun.file(join(PUBLIC_DIR, "index.html")), { headers: { "Content-Type": "text/html; charset=utf-8" } });
-    }
-    if (req.method === "GET" && path.startsWith("/usage/")) {
-      const rel = path.slice("/usage/".length);
-      if (rel && !rel.includes("..") && !rel.includes("/")) {
-        const f = Bun.file(join(PUBLIC_DIR, rel));
-        if (await f.exists()) return new Response(f);
+      if (req.method === "GET" && path === "/usage/stream") {
+        const stream = new ReadableStream({
+          start(controller) {
+            sseClients.add(controller);
+            controller.enqueue(new TextEncoder().encode("retry: 5000\ndata: hello\n\n"));
+          },
+          cancel() {},
+        });
+        return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
       }
-      return new Response("Not Found", { status: 404 });
+      if (req.method === "GET" && path === "/usage/") {
+        return new Response(Bun.file(join(PUBLIC_DIR, "index.html")), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      }
+      if (req.method === "GET" && path.startsWith("/usage/")) {
+        const rel = path.slice("/usage/".length);
+        if (rel && !rel.includes("..") && !rel.includes("/")) {
+          const f = Bun.file(join(PUBLIC_DIR, rel));
+          if (await f.exists()) return new Response(f);
+        }
+        return new Response("Not Found", { status: 404 });
+      }
     }
     // #endregion
 
