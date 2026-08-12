@@ -403,7 +403,11 @@ const server = Bun.serve({
         const m = await convMeta(t.path);
         return { sessionId: t.sessionId, title: m.title, cwd: m.cwd, mtime: Math.floor(t.mtime) };
       }));
-      return Response.json(rows.filter((r) => r.title), { headers: cors(req) });
+      const hide: string[] = cfg.historyHide || [];
+      return Response.json(
+        rows.filter((r) => r.title && !hide.some((h) => (r.cwd || "").startsWith(h))),
+        { headers: cors(req) },
+      );
     }
 
     if (req.method === "POST" && path === "/sessions/new") {

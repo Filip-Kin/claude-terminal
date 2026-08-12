@@ -78,7 +78,7 @@
   const NOTCH = 20; // px of finger travel per wheel notch
   // don't hijack touches inside our own UI (the history dialog + the tab bar) — they
   // need native scrolling.
-  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #claude-tabbar"));
+  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-drawer, #claude-tabbar"));
   let tStartX = 0, tStartY = 0, tLastY = 0, tAccum = 0, tScroll = false;
   document.addEventListener("touchstart", (e) => {
     tScroll = false; tAccum = 0;
@@ -254,6 +254,8 @@
     '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>';
   const SVG_HISTORY =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
+  const SVG_HAM =
+    '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>';
 
   const barStyle = document.createElement("style");
   barStyle.textContent = [
@@ -305,6 +307,31 @@
     "body.theme-light #ct-histmodal .ct-hist-head{border-color:#ececec}",
     "body.theme-light #ct-histmodal .ct-hist-row:hover{background:#f0f0f0}",
     "body.theme-light #ct-histmodal .ct-hist-sub{color:#777}",
+    // hamburger (mobile only) + left drawer with the full tab list
+    "#claude-tabbar .ctab-ham{display:none}",
+    "@media (max-width:600px){#claude-tabbar .ctab-ham{display:flex}#claude-tabbar .ctab-list .ctab:not(.active){display:none}#claude-tabbar .ctab{max-width:60vw}#claude-tabbar .ctab .ctab-label{max-width:44vw}}",
+    "#ct-drawer{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.5)}",
+    "#ct-drawer .ct-draw{position:absolute;top:0;left:0;bottom:0;width:min(300px,84vw);background:#1e1e1e;color:#e6e6e6;border-right:1px solid #383838;display:flex;flex-direction:column;box-shadow:2px 0 26px rgba(0,0,0,.5);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-drawer .ct-draw-head{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-drawer .ct-draw-list{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:6px}",
+    "#ct-drawer .ct-draw-row{display:flex;align-items:center;gap:9px;padding:11px 10px;border-radius:8px;cursor:pointer}",
+    "#ct-drawer .ct-draw-row:hover{background:#2c2c2c}",
+    "#ct-drawer .ct-draw-row.active{background:#2b3b55}",
+    "#ct-drawer .ct-draw-row .lbl{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    "#ct-drawer .ct-draw-row .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:#6b7280}",
+    "#ct-drawer .ct-draw-row .dot.thinking{background:#f59e0b}",
+    "#ct-drawer .ct-draw-row .dot.waiting{background:#a855f7}",
+    "#ct-drawer .ct-draw-row .dot.done{background:#22c55e}",
+    "#ct-drawer .ct-draw-row .dot.seen{background:#6b7280}",
+    "#ct-drawer .ct-draw-row .ic{display:flex;align-items:center;opacity:.6;padding:4px;border-radius:5px}",
+    "#ct-drawer .ct-draw-row .ic:hover{opacity:1;background:rgba(255,255,255,.14)}",
+    "#ct-drawer .ct-draw-row .ic.x{font-size:17px;line-height:1}",
+    "#ct-drawer .ct-draw-new{opacity:.85;font-weight:600}",
+    "body.theme-light #ct-drawer .ct-draw{background:#fff;color:#1f1f1f;border-color:#dcdcdc}",
+    "body.theme-light #ct-drawer .ct-draw-head{border-color:#ececec}",
+    "body.theme-light #ct-drawer .ct-draw-row:hover{background:#f0f0f0}",
+    "body.theme-light #ct-drawer .ct-draw-row.active{background:#dce8ff}",
+    "body.theme-light #ct-drawer .ct-draw-row .ic:hover{background:rgba(0,0,0,.08)}",
     // light theme (ttyd toggles body.theme-light)
     "body.theme-light #claude-tabbar{background:#f3f3f3;border-bottom-color:#dcdcdc;color:#333}",
     "body.theme-light #claude-tabbar .ctab{background:#fff;border-color:#d7d7d7}",
@@ -344,8 +371,13 @@
   historyBtn.className = "ctab-btn ctab-history";
   historyBtn.title = "Conversation history (resume a past chat)";
   historyBtn.innerHTML = SVG_HISTORY;
+  const hamBtn = document.createElement("div");
+  hamBtn.className = "ctab-btn ctab-ham";
+  hamBtn.title = "All tabs";
+  hamBtn.innerHTML = SVG_HAM;
   // tabs, then + right after them (left-aligned), spacer pushes the rest right;
   // history sits all the way on the right end.
+  bar.appendChild(hamBtn); // mobile-only, leftmost
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
@@ -701,6 +733,57 @@
     document.addEventListener("keydown", histEsc, true);
   }
   historyBtn.addEventListener("click", openHistory);
+  // #endregion
+
+  // #region mobile tab drawer (hamburger)
+  let drawerEl = null, drawerEsc = null;
+  function closeDrawer() {
+    if (drawerEl) { drawerEl.remove(); drawerEl = null; }
+    if (drawerEsc) { document.removeEventListener("keydown", drawerEsc, true); drawerEsc = null; }
+  }
+  function openDrawer() {
+    if (drawerEl) { closeDrawer(); return; }
+    drawerEl = document.createElement("div");
+    drawerEl.id = "ct-drawer";
+    const panel = document.createElement("div"); panel.className = "ct-draw";
+    const head = document.createElement("div"); head.className = "ct-draw-head";
+    const h = document.createElement("span"); h.textContent = "Sessions";
+    const x = document.createElement("span"); x.className = "ct-hist-close"; x.textContent = "×";
+    x.addEventListener("click", closeDrawer);
+    head.appendChild(h); head.appendChild(x);
+    const list = document.createElement("div"); list.className = "ct-draw-list";
+    const cur = curId();
+    for (const s of lastSessions) {
+      const state = STATES.includes(s.state) ? s.state : "seen";
+      const label = s.id === MAIN_ID && s.title === s.id ? "main" : s.title;
+      const row = document.createElement("div"); row.className = "ct-draw-row" + (s.id === cur ? " active" : "");
+      const dot = document.createElement("span"); dot.className = "dot " + state;
+      const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = label;
+      const open = document.createElement("span"); open.className = "ic"; open.innerHTML = SVG_OPEN; open.title = "Open in new tab";
+      open.addEventListener("click", (e) => { e.stopPropagation(); window.open("/?arg=" + encodeURIComponent(s.id), "_blank"); });
+      const close = document.createElement("span");
+      if (s.id === MAIN_ID) { close.className = "ic"; close.innerHTML = SVG_REFRESH; close.title = "Restart main"; }
+      else { close.className = "ic x"; close.textContent = "×"; close.title = "Close"; }
+      close.addEventListener("click", (e) => { e.stopPropagation(); closeSession(s.id); closeDrawer(); });
+      row.appendChild(dot); row.appendChild(lbl); row.appendChild(open); row.appendChild(close);
+      row.addEventListener("click", () => { if (s.id !== cur) switchTo(s.id); else closeDrawer(); });
+      list.appendChild(row);
+    }
+    const nrow = document.createElement("div"); nrow.className = "ct-draw-row ct-draw-new";
+    const plus = document.createElement("span");
+    plus.textContent = "+";
+    plus.style.cssText = "width:9px;display:flex;justify-content:center;font-size:17px;flex:0 0 auto";
+    const nl = document.createElement("span"); nl.className = "lbl"; nl.textContent = "New session";
+    nrow.appendChild(plus); nrow.appendChild(nl);
+    nrow.addEventListener("click", () => { closeDrawer(); newSession(); });
+    list.appendChild(nrow);
+    panel.appendChild(head); panel.appendChild(list); drawerEl.appendChild(panel);
+    drawerEl.addEventListener("click", (e) => { if (e.target === drawerEl) closeDrawer(); });
+    document.body.appendChild(drawerEl);
+    drawerEsc = (e) => { if (e.key === "Escape") closeDrawer(); };
+    document.addEventListener("keydown", drawerEsc, true);
+  }
+  hamBtn.addEventListener("click", openDrawer);
   // #endregion
 
   newBtn.addEventListener("click", newSession);

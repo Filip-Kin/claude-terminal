@@ -6,6 +6,7 @@
   "usagePage": true,
   "subscriptionUsd": 0,
   "collectSeconds": 60,
+  "historyHide": ["/path/to/an/automation/cwd"],
   "extraUsers": {
     "some-bot": ["/path/to/another/.claude/projects"]
   },
