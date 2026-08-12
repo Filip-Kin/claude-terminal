@@ -22,5 +22,14 @@
   "vapidSubject": "mailto:you@example.com",
 
   "spawnCwd": "/home/me/projects",
-  "spawnHelper": "/home/me/.local/bin/claude-spawn"
+  "spawnHelper": "/home/me/.local/bin/claude-spawn",
+  "cloudHost": "root@203.0.113.10",
+  "cloudCostDb": "/var/lib/claude-terminal/cloud_cost.db",
+  "dropletMonthlyUsd": 56,
+  "dropletDesc": "DigitalOcean s-4vcpu-8gb-amd (4 vCPU / 8 GB / 160 GB NVMe)",
+  "dropletNote": "Premium AMD droplet; monthly price set by hand (no doctl/DO API token on the box).",
+  "costRamWeight": 0.5,
+  "costCpuWeight": 0.5,
+  "costOwnerTeam": 0,
+  "costColors": { "proj:2": "#38bdf8", "guest:2": "#f59e0b", "guest:3": "#ec4899", "system": "#64748b" }
 }
