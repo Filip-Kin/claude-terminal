@@ -38,8 +38,8 @@
   "dropletMonthlyUsd": 56,
   "dropletDesc": "DigitalOcean s-4vcpu-8gb-amd (4 vCPU / 8 GB / 160 GB NVMe)",
   "dropletNote": "Premium AMD droplet; monthly price set by hand (no doctl/DO API token on the box).",
-  "costRamWeight": 0.5,
-  "costCpuWeight": 0.5,
+  "costRamWeight": 0.8,
+  "costCpuWeight": 0.2,
   "costOwnerTeam": 0,
   "costSeparateProjects": [
     2,
