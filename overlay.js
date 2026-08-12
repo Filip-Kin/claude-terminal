@@ -142,7 +142,7 @@
   async function uploadImage(blob, filename) {
     const fd = new FormData();
     fd.append("image", blob, filename || "paste.png");
-    const r = await fetch("/_paste/upload", { method: "POST", body: fd });
+    const r = await fetch("/_ct/upload", { method: "POST", body: fd });
     if (!r.ok) {
       const body = await r.text().catch(() => "");
       throw new Error(`${r.status} ${body || r.statusText}`);
@@ -256,6 +256,10 @@
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
   const SVG_HAM =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>';
+  const SVG_BELL =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>';
+  const SVG_BELL_OFF =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.73 21a1.94 1.94 0 0 1-3.46 0"/><path d="M18.63 13A17.9 17.9 0 0 1 18 8"/><path d="M6.26 6.26A6 6 0 0 0 6 8c0 7-3 9-3 9h14"/><path d="M18 8a6 6 0 0 0-9.33-5"/><path d="m2 2 20 20"/></svg>';
 
   const barStyle = document.createElement("style");
   barStyle.textContent = [
@@ -289,6 +293,20 @@
     "#claude-tabbar .ctab-new{font-size:18px;line-height:1}",
     "#claude-tabbar .ctab-usage{width:auto;padding:0 9px;gap:5px}",
     "#claude-tabbar .ctab-usage .ctab-usage-fig{font-size:11px;font-variant-numeric:tabular-nums}",
+    // notification bell (green glow when on)
+    "#claude-tabbar .ctab-bell.on{color:#22c55e;border-color:#2f6f43}",
+    "body.theme-light #claude-tabbar .ctab-bell.on{color:#16a34a;border-color:#8fd0a6}",
+    // install prompt banner (mobile)
+    "#ct-install{position:fixed;left:12px;right:12px;bottom:14px;z-index:70;display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;background:#201b18;border:1px solid #3a2f28;color:#f0e9e4;box-shadow:0 10px 34px rgba(0,0,0,.5);font:13px/1.35 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-install img{width:40px;height:40px;flex:0 0 auto}",
+    "#ct-install .ct-inst-txt{flex:1;min-width:0}",
+    "#ct-install .ct-inst-txt b{display:block;font-size:14px;margin-bottom:2px}",
+    "#ct-install .ct-inst-txt span{opacity:.75;font-size:12px}",
+    "#ct-install .ct-inst-go{flex:0 0 auto;padding:8px 14px;border-radius:9px;background:#D97757;color:#1a1108;font-weight:600;border:none;cursor:pointer;font-size:13px}",
+    "#ct-install .ct-inst-go:active{filter:brightness(.92)}",
+    "#ct-install .ct-inst-x{flex:0 0 auto;cursor:pointer;opacity:.55;font-size:20px;line-height:1;padding:2px 4px}",
+    "#ct-install .ct-inst-x:hover{opacity:1}",
+    "#ct-install.ios{align-items:flex-start}",
     // history dialog (resume a past conversation)
     "#ct-histmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5)}",
     "#ct-histmodal .ct-hist{margin-top:" + (BAR_H + 12) + "px;width:min(640px,92vw);max-height:78vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
@@ -375,12 +393,17 @@
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
   hamBtn.innerHTML = SVG_HAM;
+  const bellBtn = document.createElement("div");
+  bellBtn.className = "ctab-btn ctab-bell";
+  bellBtn.title = "Enable notifications";
+  bellBtn.innerHTML = SVG_BELL_OFF;
   // tabs, then + right after them (left-aligned), spacer pushes the rest right;
   // history sits all the way on the right end.
   bar.appendChild(hamBtn); // mobile-only, leftmost
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
+  bar.appendChild(bellBtn);
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn);
   bar.appendChild(usageBtn);
@@ -398,7 +421,7 @@
   }
 
   async function api(path, opts) {
-    return fetch("/_paste/" + path, Object.assign({ credentials: "same-origin" }, opts));
+    return fetch("/_ct/" + path, Object.assign({ credentials: "same-origin" }, opts));
   }
 
   let lastSessions = [];
@@ -445,7 +468,9 @@
   const STATES = ["thinking", "waiting", "done", "seen"];
   function renderChip(s, active) {
     const state = STATES.includes(s.state) ? s.state : "seen";
-    const displayLabel = s.id === MAIN_ID && s.title === s.id ? "main" : s.title;
+    // Server standard: ai-title once the conversation has one, else "New Tab" for a
+    // numeric tab (main "1" or a freshly-opened one), else the named session's name.
+    const displayLabel = s.title;
 
     const chip = document.createElement("div");
     chip.className = "ctab" + (active ? " active" : "");
@@ -528,7 +553,7 @@
     bar.style.display = "";
     // guarantee a pinned main chip even if no one is attached to it yet
     if (!sessions.some((s) => s.id === MAIN_ID)) {
-      sessions.unshift({ id: MAIN_ID, title: "main", created: 0, attached: false, state: "seen" });
+      sessions.unshift({ id: MAIN_ID, title: "New Tab", created: 0, attached: false, state: "seen" });
     }
     mountBar();
     lastSessions = sessions;
@@ -755,7 +780,7 @@
     const cur = curId();
     for (const s of lastSessions) {
       const state = STATES.includes(s.state) ? s.state : "seen";
-      const label = s.id === MAIN_ID && s.title === s.id ? "main" : s.title;
+      const label = s.title;
       const row = document.createElement("div"); row.className = "ct-draw-row" + (s.id === cur ? " active" : "");
       const dot = document.createElement("span"); dot.className = "dot " + state;
       const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = label;
@@ -787,6 +812,177 @@
   // #endregion
 
   newBtn.addEventListener("click", newSession);
+
+  // #region PWA install + Web Push notifications
+  const isStandalone = () =>
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.matchMedia("(display-mode: fullscreen)").matches ||
+    window.navigator.standalone === true;
+  const isIOS = () =>
+    /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isMobile = () =>
+    isIOS() || /Android/i.test(navigator.userAgent) || window.matchMedia("(max-width: 820px)").matches;
+
+  // Make the terminal installable: manifest + apple/mobile meta tags in <head>.
+  (function injectPwaHead() {
+    const head = document.head || document.documentElement;
+    const add = (tag, attrs) => { const el = document.createElement(tag); for (const k in attrs) el.setAttribute(k, attrs[k]); head.appendChild(el); };
+    if (!document.querySelector('link[rel="manifest"]')) add("link", { rel: "manifest", href: "/_ct/manifest.webmanifest", crossorigin: "use-credentials" });
+    if (!document.querySelector('meta[name="theme-color"]')) add("meta", { name: "theme-color", content: "#181818" });
+    add("meta", { name: "apple-mobile-web-app-capable", content: "yes" });
+    add("meta", { name: "mobile-web-app-capable", content: "yes" });
+    add("meta", { name: "apple-mobile-web-app-status-bar-style", content: "black-translucent" });
+    add("meta", { name: "apple-mobile-web-app-title", content: "Claude" });
+    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png" });
+  })();
+
+  // Service worker (root scope) — drives push + installability. Served from /_ct/sw.js
+  // with Service-Worker-Allowed: / so it can control the whole terminal.
+  let swReg = null;
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/_ct/sw.js", { scope: "/" })
+      .then((reg) => { swReg = reg; log("sw registered", reg.scope); })
+      .catch((e) => log("sw register failed", e));
+    navigator.serviceWorker.addEventListener("message", (ev) => {
+      const d = ev.data || {};
+      if (d.type === "ct-notification-click" && d.sessionId && d.sessionId !== curId()) switchTo(d.sessionId);
+    });
+  }
+
+  // #region notification bell (enable/disable Web Push)
+  function b64ToUint8(base64) {
+    const pad = "=".repeat((4 - (base64.length % 4)) % 4);
+    const b = (base64 + pad).replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(b); const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  function paintBell(on) {
+    bellBtn.innerHTML = on ? SVG_BELL : SVG_BELL_OFF;
+    bellBtn.title = on ? "Notifications on — click to turn off" : "Enable notifications (prompt done / waiting)";
+    bellBtn.classList.toggle("on", !!on);
+  }
+  async function currentSub() {
+    try { const reg = swReg || (await navigator.serviceWorker.ready); return await reg.pushManager.getSubscription(); }
+    catch { return null; }
+  }
+  async function enableNotifications() {
+    if (!pushSupported()) {
+      showToast(isIOS() ? "On iOS: install to Home Screen first, then enable" : "Notifications not supported here", "error");
+      return;
+    }
+    let perm = Notification.permission;
+    if (perm !== "granted") perm = await Notification.requestPermission();
+    if (perm !== "granted") { showToast("Notifications blocked in browser settings", "error"); return; }
+    try {
+      const reg = swReg || (await navigator.serviceWorker.ready);
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        const kr = await api("vapidPublicKey");
+        const { key } = await kr.json();
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) });
+      }
+      await api("subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub) });
+      paintBell(true);
+      showToast("Notifications enabled 🦆", "success");
+    } catch (e) {
+      log("subscribe failed", e);
+      showToast("Could not enable notifications", "error");
+    }
+  }
+  async function disableNotifications() {
+    const sub = await currentSub();
+    if (sub) {
+      await api("unsubscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => {});
+      try { await sub.unsubscribe(); } catch {}
+    }
+    paintBell(false);
+    showToast("Notifications off", "info");
+  }
+  bellBtn.addEventListener("click", async () => {
+    const sub = await currentSub();
+    if (sub && Notification.permission === "granted") disableNotifications();
+    else enableNotifications();
+  });
+  (async () => {
+    if (!pushSupported()) { bellBtn.style.display = "none"; return; }
+    paintBell(!!(await currentSub()) && Notification.permission === "granted");
+  })();
+  // #endregion
+
+  // #region focus heartbeat (suppress pushes for the tab you're actively watching)
+  function sendActive() {
+    const watching = document.visibilityState === "visible" && document.hasFocus();
+    api("active", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: watching ? curId() : null }) }).catch(() => {});
+  }
+  sendActive();
+  setInterval(sendActive, 15000);
+  document.addEventListener("visibilitychange", sendActive);
+  window.addEventListener("focus", sendActive);
+  window.addEventListener("blur", sendActive);
+  // #endregion
+
+  // #region mobile install prompt
+  let deferredPrompt = null;
+  let installBanner = null;
+  const installDismissed = () => { try { return localStorage.getItem("ct-install-dismissed") === "1"; } catch { return false; } };
+  const dismissInstall = () => { try { localStorage.setItem("ct-install-dismissed", "1"); } catch {} hideInstallBanner(); };
+  function hideInstallBanner() { if (installBanner) { installBanner.remove(); installBanner = null; } }
+  function showInstallBanner(opts) {
+    opts = opts || {};
+    if (installBanner || isStandalone()) return;
+    if (!opts.force && installDismissed()) return;
+    installBanner = document.createElement("div");
+    installBanner.id = "ct-install";
+    installBanner.className = opts.ios ? "ios" : "";
+    const icon = document.createElement("img");
+    icon.src = "/_ct/pwa/icon-192.png";
+    icon.alt = "";
+    const txt = document.createElement("div");
+    txt.className = "ct-inst-txt";
+    if (opts.ios) {
+      txt.innerHTML = "<b>Install Claude Terminal</b><span>Tap the Share button, then “Add to Home Screen” for fullscreen + notifications.</span>";
+    } else {
+      txt.innerHTML = "<b>Install Claude Terminal</b><span>Add it to your home screen for fullscreen and push notifications.</span>";
+    }
+    installBanner.appendChild(icon);
+    installBanner.appendChild(txt);
+    if (!opts.ios) {
+      const go = document.createElement("button");
+      go.className = "ct-inst-go";
+      go.textContent = "Install";
+      go.addEventListener("click", async () => {
+        if (!deferredPrompt) { hideInstallBanner(); return; }
+        deferredPrompt.prompt();
+        try { await deferredPrompt.userChoice; } catch {}
+        deferredPrompt = null;
+        hideInstallBanner();
+      });
+      installBanner.appendChild(go);
+    }
+    const x = document.createElement("span");
+    x.className = "ct-inst-x";
+    x.textContent = "×";
+    x.title = "Dismiss";
+    x.addEventListener("click", dismissInstall);
+    installBanner.appendChild(x);
+    document.body.appendChild(installBanner);
+  }
+  // Android/Chromium: the browser offers a real install prompt we can trigger.
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+    if (isMobile() && !isStandalone()) showInstallBanner();
+  });
+  window.addEventListener("appinstalled", () => { deferredPrompt = null; hideInstallBanner(); showToast("Installed 🦆", "success"); });
+  // iOS Safari has no beforeinstallprompt — show the add-to-home-screen hint instead.
+  if (isIOS() && isMobile() && !isStandalone() && !installDismissed()) {
+    setTimeout(() => showInstallBanner({ ios: true }), 1600);
+  }
+  // #endregion
+  // #endregion
 
   if (document.body) mountBar();
   else document.addEventListener("DOMContentLoaded", mountBar);

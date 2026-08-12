@@ -6,11 +6,12 @@
 // Config-driven via config.json. Reads usage.db (written by collector.ts); never scrapes
 // transcripts itself. HOME-relative for the per-instance terminal bits (tab-registry, settings,
 // tmux), so the same binary runs for the host owner and inside each guest container.
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { watch, readdirSync, statSync } from "node:fs";
 import { Database } from "bun:sqlite";
+import webpush from "web-push";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -33,6 +34,22 @@ const UPLOAD_DIR = "/tmp/claude-paste";
 const MAX_BYTES = 20 * 1024 * 1024;
 const PUBLIC_DIR = join(import.meta.dir, "public");
 const overlayPath = join(import.meta.dir, "overlay.js");
+
+// #region PWA + Web Push config
+const APP_NAME: string = cfg.appName || "Claude Terminal";
+const APP_SHORT: string = cfg.appShort || "Claude";
+const THEME_COLOR: string = cfg.themeColor || "#D97757";
+const BG_COLOR: string = cfg.bgColor || "#1a1613";
+const VAPID_SUBJECT: string = cfg.vapidSubject || "mailto:admin@localhost";
+// runtime state (VAPID keypair + push subscriptions) lives OUTSIDE the repo,
+// HOME-relative so the same binary works on the host and inside a guest container.
+const STATE_DIR: string = cfg.stateDir || join(HOME, ".claude");
+const VAPID_FILE = join(STATE_DIR, "claude-terminal-vapid.json");
+const SUBS_FILE = join(STATE_DIR, "claude-terminal-push.json");
+const PWA_DIR = join(import.meta.dir, "pwa");
+const swPath = join(import.meta.dir, "sw.js");
+const PWA_MIME: Record<string, string> = { ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
+// #endregion
 
 const MIME_EXT: Record<string, string> = {
   "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
@@ -189,6 +206,55 @@ if (USAGE_PAGE) {
     // WAL writes land in usage.db-wal, so watch the whole DB directory, debounced.
     watch(dirname(DB_PATH), () => { clearTimeout(watchTimer); watchTimer = setTimeout(broadcast, 300); });
   } catch (e) { console.error("db watch failed", e); }
+}
+// #endregion
+
+// #region Web Push (VAPID) — generic notification path for the owner + local services
+// Load or mint a VAPID keypair (persisted; regenerating would orphan every device).
+let vapid: { publicKey: string; privateKey: string };
+try {
+  vapid = JSON.parse(await Bun.file(VAPID_FILE).text());
+  if (!vapid?.publicKey || !vapid?.privateKey) throw new Error("bad vapid file");
+} catch {
+  vapid = webpush.generateVAPIDKeys();
+  await Bun.write(VAPID_FILE, JSON.stringify(vapid, null, 2));
+  try { await chmod(VAPID_FILE, 0o600); } catch {}
+  console.log("generated VAPID keypair ->", VAPID_FILE);
+}
+webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
+
+type PushSub = { endpoint: string; keys?: { p256dh: string; auth: string } };
+let subs: PushSub[] = [];
+try { const s = JSON.parse(await Bun.file(SUBS_FILE).text()); if (Array.isArray(s)) subs = s; } catch {}
+let subsSaveTimer: any = null;
+function saveSubs() { clearTimeout(subsSaveTimer); subsSaveTimer = setTimeout(() => { Bun.write(SUBS_FILE, JSON.stringify(subs)).catch(() => {}); }, 200); }
+function addSub(s: PushSub) { if (!s?.endpoint) return; if (!subs.some((x) => x.endpoint === s.endpoint)) { subs.push(s); saveSubs(); } }
+function removeSub(endpoint: string) { const n = subs.length; subs = subs.filter((x) => x.endpoint !== endpoint); if (subs.length !== n) saveSubs(); }
+
+type NotifPayload = { title: string; body?: string; url?: string; tag?: string; icon?: string; requireInteraction?: boolean; sessionId?: string };
+async function pushAll(payload: NotifPayload): Promise<{ sent: number; pruned: number }> {
+  const data = JSON.stringify(payload);
+  const dead: string[] = [];
+  await Promise.all(subs.map(async (s) => {
+    try { await webpush.sendNotification(s as any, data, { TTL: 120 }); }
+    catch (e: any) { const c = e?.statusCode; if (c === 404 || c === 410) dead.push(s.endpoint); }
+  }));
+  for (const d of dead) removeSub(d);
+  return { sent: subs.length, pruned: dead.length };
+}
+
+// Focus heartbeat: the overlay POSTs the session it is actively watching so we can
+// suppress a redundant prompt-finished push for the tab already on your screen.
+let activeId: string | null = null;
+let activeAt = 0;
+const ACTIVE_WINDOW_MS = 40000;
+
+// Local services (loopback, no Remote-User header) and the authenticated owner may
+// trigger notifications; a different authenticated user (guest via nginx) may not.
+function notifyAllowed(req: Request): boolean {
+  if (!GATE) return true;
+  const hdr = req.headers.get("remote-user");
+  return !hdr || hdr === OWNER;
 }
 // #endregion
 
@@ -377,6 +443,106 @@ const server = Bun.serve({
     if (req.method === "GET" && path === "/overlay.js") {
       return new Response(Bun.file(overlayPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" } });
     }
+
+    // #region PWA (installable app) — manifest, service worker, icons. Ungated
+    // (non-sensitive static assets; the vhost is already behind Authelia).
+    if (req.method === "GET" && path === "/manifest.webmanifest") {
+      return Response.json({
+        name: APP_NAME, short_name: APP_SHORT, id: "/",
+        start_url: "/", scope: "/",
+        display: "standalone", display_override: ["standalone", "fullscreen", "minimal-ui"],
+        orientation: "any", background_color: BG_COLOR, theme_color: THEME_COLOR,
+        icons: [
+          { src: "/_ct/pwa/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-maskable-192.png", sizes: "192x192", type: "image/png", purpose: "maskable" },
+          { src: "/_ct/pwa/icon-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+        ],
+      }, { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "no-cache" } });
+    }
+    if (req.method === "GET" && path === "/sw.js") {
+      // Registered at scope "/", so it must advertise the wider scope. nginx passes
+      // this response header through unchanged.
+      return new Response(Bun.file(swPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache" } });
+    }
+    if (req.method === "GET" && path.startsWith("/pwa/")) {
+      const rel = path.slice("/pwa/".length);
+      if (rel && !rel.includes("..") && !rel.includes("/")) {
+        const f = Bun.file(join(PWA_DIR, rel));
+        if (await f.exists()) {
+          const dot = rel.lastIndexOf(".");
+          const mime = PWA_MIME[rel.slice(dot).toLowerCase()] || "application/octet-stream";
+          return new Response(f, { headers: { "Content-Type": mime, "Cache-Control": "public, max-age=86400" } });
+        }
+      }
+      return new Response("Not Found", { status: 404 });
+    }
+    // #endregion
+
+    // #region Web Push subscription + notification endpoints
+    if (req.method === "GET" && path === "/vapidPublicKey") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      return Response.json({ key: vapid.publicKey }, { headers: cors(req) });
+    }
+    if (req.method === "POST" && path === "/subscribe") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      let body: any = {}; try { body = await req.json(); } catch {}
+      if (!body?.endpoint) return new Response("Bad subscription", { status: 400 });
+      addSub(body);
+      return Response.json({ ok: true, subscribed: subs.length }, { headers: cors(req) });
+    }
+    if (req.method === "POST" && path === "/unsubscribe") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      let body: any = {}; try { body = await req.json(); } catch {}
+      if (body?.endpoint) removeSub(String(body.endpoint));
+      return Response.json({ ok: true, subscribed: subs.length }, { headers: cors(req) });
+    }
+    if (req.method === "POST" && path === "/active") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      let body: any = {}; try { body = await req.json(); } catch {}
+      activeId = body?.id != null ? String(body.id) : null;
+      activeAt = Date.now();
+      return Response.json({ ok: true }, { headers: cors(req) });
+    }
+    // Generic: anything the owner (or a local service like stonkbot) wants to push.
+    // { title, body?, url?, tag?, icon?, requireInteraction?, sessionId? }
+    if (req.method === "POST" && path === "/notify") {
+      if (!notifyAllowed(req)) return new Response("Forbidden", { status: 403 });
+      let body: any = {}; try { body = await req.json(); } catch {}
+      const title = String(body.title ?? body.message ?? "").slice(0, 120) || "Claude";
+      const payload: NotifPayload = {
+        title,
+        body: body.body != null ? String(body.body).slice(0, 500) : "",
+        url: body.url ? String(body.url) : "/",
+        tag: body.tag ? String(body.tag) : undefined,
+        icon: body.icon ? String(body.icon) : undefined,
+        requireInteraction: !!body.requireInteraction,
+        sessionId: body.sessionId ? String(body.sessionId) : undefined,
+      };
+      const res = await pushAll(payload);
+      return Response.json({ ok: true, ...res }, { headers: cors(req) });
+    }
+    // Hook-driven prompt-finished / waiting-for-input push. Suppressed when you are
+    // actively watching that exact tab (focus heartbeat), so you only get pinged
+    // when you're away or looking at a different session.
+    if (req.method === "POST" && path === "/notify/session") {
+      if (!notifyAllowed(req)) return new Response("Forbidden", { status: 403 });
+      let body: any = {}; try { body = await req.json(); } catch {}
+      const id = String(body.id || "");
+      const kind = String(body.kind || "done");
+      if (!id) return new Response("Missing id", { status: 400 });
+      if (activeId === id && Date.now() - activeAt < ACTIVE_WINDOW_MS) {
+        return Response.json({ ok: true, suppressed: true });
+      }
+      const t = (await titleForSession(id)) || `Session ${id}`;
+      const title = kind === "waiting" ? "⏳ Waiting for input" : "✅ Turn finished";
+      const res = await pushAll({
+        title, body: t, url: "/?arg=" + encodeURIComponent(id),
+        tag: "sess-" + id, sessionId: id, requireInteraction: kind === "waiting",
+      });
+      return Response.json({ ok: true, ...res });
+    }
+    // #endregion
     if (req.method === "POST" && path === "/upload") {
       const ct = req.headers.get("content-type") || "";
       if (!ct.startsWith("multipart/form-data")) return new Response("Expected multipart/form-data", { status: 400 });
@@ -401,9 +567,14 @@ const server = Bun.serve({
         if (liveIds.has(pid) || (nowSec - created) * 1000 > PENDING_TTL_MS) { pending.delete(pid); continue; }
         rows.push({ id: pid, created, attached: false });
       }
-      const withTitles = await Promise.all(rows.map(async (r) => ({
-        id: r.id, title: (await titleForSession(r.id)) || r.id, state: await stateForSession(r.id), created: r.created, attached: r.attached,
-      })));
+      // Title standard: use Claude's ai-title once the conversation has one; until
+      // then a numeric tab (main "1" or a freshly-opened one) reads "New Tab", and a
+      // named session falls back to its name.
+      const withTitles = await Promise.all(rows.map(async (r) => {
+        const ai = await titleForSession(r.id);
+        const title = ai || (/^\d+$/.test(r.id) ? "New Tab" : r.id);
+        return { id: r.id, title, state: await stateForSession(r.id), created: r.created, attached: r.attached };
+      }));
       withTitles.sort((a, b) => a.created - b.created);
       withTitles.sort((a, b) => (a.id === "1" ? -1 : b.id === "1" ? 1 : 0));
       return Response.json(withTitles, { headers: cors(req) });

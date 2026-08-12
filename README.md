@@ -10,6 +10,11 @@ A companion for running [Claude Code](https://claude.com/claude-code) in the bro
 2. **Usage tracking.** A collector tails your Claude Code transcripts into a SQLite database and a
    live dashboard shows output tokens over time, a 5-hour rolling window, and (optionally) a
    monthly cost split across several tracked users.
+3. **An installable app (PWA) with notifications.** The terminal ships a web manifest, a service
+   worker, and an icon, so you can install it to your home screen / desktop for a fullscreen
+   window. A bell in the tab bar turns on Web Push (VAPID, no third-party service), and you get a
+   notification when a prompt finishes or is waiting for your input — even when the app is closed.
+   The same push channel is a generic notification path any of your own tools can post to.
 
 It is config-driven: a single-person install is a few lines of JSON. You can also track extra
 "users" (separate agents, bots, or sandboxed guests) so their usage shows as its own row.
@@ -63,6 +68,12 @@ Minimal `config.json`:
 | `extraUsers` | `{ name: [transcriptDir, ...] }` — extra tracked "users" (bots, agents, guests) |
 | `names` / `hosts` / `colors` | display name, host-vs-sandbox badge, and fixed dot color per user |
 | `corsOrigins` | origins allowed to read the usage API cross-site (e.g. a homepage that lists sessions) |
+| `appName` / `appShort` | PWA name / short name (default "Claude Terminal" / "Claude") |
+| `themeColor` / `bgColor` | PWA theme + background colors |
+| `vapidSubject` | `mailto:` contact for the VAPID keypair (push identification) |
+| `stateDir` | where the VAPID keypair + push subscriptions are stored (default `~/.claude`) |
+
+VAPID keys are generated on first run into `stateDir/claude-terminal-vapid.json` (keep this — regenerating orphans every subscribed device). Push subscriptions live in `stateDir/claude-terminal-push.json`. Neither belongs in the repo.
 
 Transcript dirs nested inside another tracked user's dir are automatically excluded from that
 outer user, so an agent that runs under your tree counts as itself, not you.
@@ -75,6 +86,31 @@ See your reverse proxy for specifics; the key pieces are a `sub_filter` that add
 (`/sessions`, `/theme`, `/upload`, `/overlay.js`) with the authenticated user in a `Remote-User`
 header, and a public location that proxies `/usage/` (with `proxy_buffering off` for the SSE
 stream).
+
+## Notifications & the app notification path
+
+Once you install the app and click the bell to enable notifications, two things push to you:
+
+- **Prompt finished / waiting for input.** Claude Code hooks (`Stop` → "done", `Notification` →
+  "waiting") post the session to `POST /notify/session {id, kind}`. The server suppresses the push
+  when you're actively watching that exact tab (the page sends a focus heartbeat to `POST /active`),
+  so you're only pinged when you're away or looking at a different session.
+- **Anything you build.** Any local tool can send you a notification by posting JSON to the
+  server (loopback needs no auth):
+
+  ```bash
+  curl -s -X POST http://127.0.0.1:7682/notify \
+    -H 'content-type: application/json' \
+    -d '{"title":"Deploy finished","body":"stonkbot is live","url":"/"}'
+  ```
+
+  Fields: `title` (required), `body`, `url` (opened on click), `tag` (a later push with the same
+  tag replaces the earlier one), `requireInteraction`. A tiny wrapper makes it a one-liner:
+  `claude-notify "build done" "42 tests passed"`.
+
+Endpoints (all under the terminal prefix; owner-gated except where noted): `GET /manifest.webmanifest`,
+`GET /sw.js`, `GET /pwa/<icon>`, `GET /vapidPublicKey`, `POST /subscribe`, `POST /unsubscribe`,
+`POST /active`, `POST /notify` (owner **or** loopback), `POST /notify/session` (owner or loopback).
 
 ## Importing from a previous setup
 

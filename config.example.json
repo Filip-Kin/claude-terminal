@@ -13,5 +13,11 @@
   "names": { "me": "Me" },
   "hosts": ["me"],
   "colors": { "me": "#3b82f6" },
-  "corsOrigins": ["https://home.example.com"]
+  "corsOrigins": ["https://home.example.com"],
+
+  "appName": "Claude Terminal",
+  "appShort": "Claude",
+  "themeColor": "#D97757",
+  "bgColor": "#1a1613",
+  "vapidSubject": "mailto:you@example.com"
 }

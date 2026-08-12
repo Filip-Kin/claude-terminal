@@ -8,5 +8,8 @@
     "collect": "bun run collector.ts",
     "migrate": "bun run migrate-state.ts"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "web-push": "^3.6.7"
+  }
 }
