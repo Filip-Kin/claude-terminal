@@ -1,0 +1,17 @@
+[Unit]
+Description=ttyd - Claude Code web terminal
+After=network.target media-nas.mount
+Requires=media-nas.mount
+
+[Service]
+Type=simple
+User=filip
+WorkingDirectory=/home/filip
+Environment="HOME=/home/filip"
+Environment="PATH=/home/filip/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/local/bin/ttyd --port 7681 --interface 127.0.0.1 --url-arg --writable -t rendererType=webgl -t disableResizeOverlay=true -P 30 -I /media/nas/filip/ncdata/filip/files/Projects/claude-terminal/ttyd/index.html /home/filip/.local/bin/ttyd-claude
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

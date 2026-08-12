@@ -80,12 +80,38 @@ outer user, so an agent that runs under your tree counts as itself, not you.
 
 ## nginx
 
-Inject the overlay into the ttyd page and route the endpoints to the server (`127.0.0.1:7682`).
-See your reverse proxy for specifics; the key pieces are a `sub_filter` that adds
-`<script src="…/overlay.js">` before `</head>`, a location that proxies the terminal endpoints
-(`/sessions`, `/theme`, `/upload`, `/overlay.js`) with the authenticated user in a `Remote-User`
+Route the terminal endpoints to the server (`127.0.0.1:7682`): a location that proxies
+`/sessions`, `/theme`, `/upload`, `/overlay.js` with the authenticated user in a `Remote-User`
 header, and a public location that proxies `/usage/` (with `proxy_buffering off` for the SSE
-stream).
+stream). See your reverse proxy for specifics.
+
+Getting the overlay `<script>` tag into ttyd's page itself is handled by `ttyd/` (below) now,
+not by nginx — no `sub_filter`/response-rewrite needed at the proxy layer at all. If your proxy
+can't do the `ttyd/index.html` approach for some reason, the fallback is a `sub_filter` that
+inserts `<script src="…/overlay.js"></script>` before `</head>` (that's how this project did it
+originally; any reverse proxy with response-body rewriting can reproduce it).
+
+## ttyd overlay injection (`ttyd/index.html`)
+
+ttyd has a native `-I`/`--index` flag: point it at a custom `index.html` and it serves that
+instead of its built-in page. `ttyd/index.html` here is ttyd's pristine page (captured via a
+loopback `curl` against a real ttyd instance) with one line added — the overlay `<script>` tag
+inserted right before `</head>`:
+
+```
+<script src="/_ct/overlay.js?v=NN"></script></head>
+```
+
+Wire it in with `-I /path/to/ttyd/index.html` on the `ttyd` command line (systemd `ExecStart=`,
+or a container `entrypoint.sh`). **Bump the `?v=` query string in this file** (not anywhere
+else) whenever `overlay.js` changes, so browsers can't serve a stale cached copy.
+
+Verified empirically (ttyd 1.7.7): `-I` is **read fresh from disk on every request**, not
+cached once at process start. On a host where `ttyd/index.html` is live on disk (e.g. mounted
+straight from this repo), a version bump takes effect on the next page load — **no ttyd
+restart needed**. In a container image where the file is `COPY`'d in at build time, a version
+bump still needs an image rebuild + recreate to reach the running container, same as any other
+baked-in file.
 
 ## Notifications & the app notification path
 
