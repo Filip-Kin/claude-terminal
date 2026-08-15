@@ -175,7 +175,7 @@
         "box-shadow:0 2px 8px rgba(0,0,0,.3)", "pointer-events:none",
         "transition:opacity .2s", "opacity:0", "max-width:60vw",
       ].join(";");
-      document.body.appendChild(toastEl);
+      (document.documentElement || document.body).appendChild(toastEl);
     }
     const colors = { info: "#3b82f6", success: "#16a34a", error: "#dc2626" };
     toastEl.style.background = colors[kind] || colors.info;
@@ -461,10 +461,27 @@
   bar.appendChild(usageBtn);
 
   function mountBar() {
-    if (!document.body) return;
-    if (!bar.isConnected) document.body.appendChild(bar);
+    // Mount the bar OUTSIDE <body>, as a direct child of <html>. This is THE fix for
+    // "the tab bar disappears once ttyd loads": ttyd's client calls
+    // render(h(App), document.body), and Preact's reconciler removes any DOM in <body>
+    // it doesn't own as "excess" on EVERY (re)render — initial connect, reconnect,
+    // title change, resize-overlay toggle. So the bar painted on load was silently
+    // evicted the moment ttyd finished mounting, taking the keyboard-shift target with
+    // it. document.documentElement is never a Preact render root here, so a
+    // fixed-position bar parked there survives every ttyd render. (Both injected <style>
+    // blocks already live in <head> for exactly this reason.)
+    const root = document.documentElement;
+    if (!root) return;
+    if (bar.parentNode !== root) root.appendChild(bar);
     setTimeout(reflow, 50);
   }
+  // Insurance: if the bar is ever detached from <html> (a future full-document rewrite,
+  // some other script), re-mount it on the next tick. childList on documentElement only
+  // (no subtree), so this fires on the rare add/remove of a direct child of <html> —
+  // never on ttyd's terminal output — keeping it effectively free.
+  new MutationObserver(() => {
+    if (!bar.isConnected) mountBar();
+  }).observe(document.documentElement, { childList: true });
 
   function switchTo(id) {
     const p = new URLSearchParams(location.search);
@@ -601,13 +618,25 @@
     let sessions;
     try {
       const r = await api("sessions");
-      // A real 403 means "no sidecar for you" (guest) -> hide the bar for good.
-      // ANY other failure (transient network blip on a mobile wake, a 5xx, or an
-      // expired auth cookie that 302s us to an HTML login page so .json() throws)
-      // is temporary: keep the last-known tabs on screen rather than wiping the bar.
-      // Rebuilding the bar from every poll used to make it vanish on mobile whenever
-      // a single poll failed, which on a long-lived PWA is constant.
-      if (r.status === 403) { hideBar(); return; }
+      // A 403 = the server's allowed() said "you're not the owner". Two very
+      // different things produce it: a genuine guest with no sidecar (hide the bar
+      // for good), OR — on a long-idle mobile PWA — a transient moment where the
+      // Authelia session is renewing and a single poll reaches the sidecar without
+      // the owner's Remote-User header. A genuine guest NEVER gets a successful
+      // poll, so their tab cache stays empty; the owner always has cached tabs. So
+      // only hide when we've never seen owner tabs in this browser; otherwise treat
+      // the 403 as a transient blip and keep the bar (it self-heals on the next OK
+      // poll). This was the residual "tabs still disappear on mobile" cause: an
+      // owner session hiccup was being misread as "guest" and the bar hidden until
+      // a full reload + reauth.
+      // ANY other failure (network blip on a mobile wake, a 5xx, or an expired auth
+      // cookie that 302s us to an HTML login page so .json() throws) is likewise
+      // temporary: keep the last-known tabs rather than wiping the bar.
+      if (r.status === 403) {
+        if (!localStorage.getItem(CACHE_KEY)) { hideBar(); return; }
+        log("sessions 403 but owner tabs are cached -> transient auth blip, keeping bar");
+        return;
+      }
       if (!r.ok) throw new Error(String(r.status));
       sessions = await r.json();
     } catch (e) {
@@ -617,6 +646,20 @@
       log("sessions poll failed, keeping last bar", e);
       return;
     }
+    // A 200 is not enough to trust the body. Two transient shapes must NOT be allowed
+    // to wipe the bar or poison the cache:
+    //   1. A non-array (an auth 302 to a login page that still parsed, a proxy hiccup).
+    //   2. An EMPTY list. The page you're viewing is itself backed by a live tmux
+    //      session, so a real steady state is never zero sessions — an empty list means
+    //      tmux was momentarily unqueryable, which is exactly what happens while the
+    //      ttyd websocket re-attaches during the reload a tab switch triggers. This was
+    //      the residual "tabs disappear when I switch tabs" cause: one contended poll
+    //      returned [], we cached [] and repainted to just the main chip, and every
+    //      later reload then seeded from that poisoned empty cache.
+    // In both cases: keep the last-known bar and the last-known cache; self-heals on
+    // the next good poll.
+    if (!Array.isArray(sessions)) { log("sessions poll gave non-array -> transient, keeping bar"); return; }
+    if (sessions.length === 0) { log("sessions poll empty -> transient tmux blip, keeping bar"); return; }
     // Persist the live tab set so the NEXT page load (every tab switch is a full
     // reload) can paint the bar instantly from cache, before this poll's replacement
     // returns. Without this the bar flashes empty on every switch — the "tabs
@@ -635,9 +678,25 @@
     if (!sessions.some((s) => s.id === MAIN_ID)) {
       sessions.unshift({ id: MAIN_ID, title: "New Tab", created: 0, attached: false, state: "seen" });
     }
+    // Never let the tab you're actually on vanish. If the current ?arg isn't in this
+    // list yet — a just-switched-to or just-spawned tab a slow first poll hasn't caught
+    // up to, or a stale cache seed — synthesize a chip for it, reusing the last-known
+    // title if we have one. Critical on mobile, where CSS shows ONLY the active chip:
+    // without this you'd switch to a tab and see the main chip instead until the poll
+    // lands. The next poll replaces this with the authoritative row.
+    const curArg = curId();
+    if (curArg !== MAIN_ID && !sessions.some((s) => s.id === curArg)) {
+      const prev = lastSessions.find((s) => s.id === curArg);
+      sessions.push(prev || { id: curArg, title: /^\d+$/.test(curArg) ? "New Tab" : curArg, created: 0, attached: true, state: "seen" });
+    }
     mountBar();
     lastSessions = sessions;
-    const cur = curId();
+    // On mobile the CSS hides every non-active chip (only the current tab shows,
+    // the rest live in the drawer). If the current ?arg session isn't in this list
+    // — a just-spawned tab not yet in the poll, or a stale cache seed — nothing
+    // matches and the whole list blanks on phones. Fall back to the always-present
+    // main chip so the bar never looks empty; the next poll corrects the highlight.
+    const cur = sessions.some((s) => s.id === curId()) ? curId() : MAIN_ID;
     // You're looking at this tab, so a finished-and-unseen "done" (green) becomes
     // "seen" (gray) — you've laid eyes on it. A real "waiting" ask stays purple even
     // while viewed (cleared only when it's answered). Only affects the current tab.
@@ -844,7 +903,7 @@
     panel.appendChild(list);
     histEl.appendChild(panel);
     histEl.addEventListener("click", (e) => { if (e.target === histEl) closeHistory(); });
-    document.body.appendChild(histEl);
+    (document.documentElement || document.body).appendChild(histEl);
     search.focus();
     histEsc = (e) => { if (e.key === "Escape") closeHistory(); };
     document.addEventListener("keydown", histEsc, true);
@@ -923,7 +982,7 @@
 
     panel.appendChild(head); panel.appendChild(list); drawerEl.appendChild(panel);
     drawerEl.addEventListener("click", (e) => { if (e.target === drawerEl) closeDrawer(); });
-    document.body.appendChild(drawerEl);
+    (document.documentElement || document.body).appendChild(drawerEl);
     drawerEsc = (e) => { if (e.key === "Escape") closeDrawer(); };
     document.addEventListener("keydown", drawerEsc, true);
   }
@@ -1107,7 +1166,7 @@
     x.title = "Dismiss";
     x.addEventListener("click", dismissInstall);
     installBanner.appendChild(x);
-    document.body.appendChild(installBanner);
+    (document.documentElement || document.body).appendChild(installBanner);
   }
   // Android/Chromium: the browser offers a real install prompt we can trigger.
   window.addEventListener("beforeinstallprompt", (e) => {
@@ -1161,8 +1220,8 @@
   // #endregion
   // #endregion
 
-  if (document.body) mountBar();
-  else document.addEventListener("DOMContentLoaded", mountBar);
+  mountBar(); // <html> always exists, so mount now — no DOMContentLoaded wait (that
+              // fired AFTER ttyd's render, which is precisely when the bar got wiped).
   seedFromCache(); // show cached tabs immediately so a switch never blanks the bar
   refresh();
   setInterval(refresh, 3000);

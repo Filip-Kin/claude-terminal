@@ -280,10 +280,7 @@ async function runTmux(args: string[]): Promise<string> {
   await proc.exited;
   return out;
 }
-async function tmuxSessions(): Promise<SessionRow[]> {
-  let out = "";
-  try { out = await runTmux(["list-sessions", "-F", "#{session_name}\t#{session_created}\t#{session_attached}"]); }
-  catch { return []; }
+function parseTmuxList(out: string): SessionRow[] {
   const rows: SessionRow[] = [];
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
@@ -291,6 +288,21 @@ async function tmuxSessions(): Promise<SessionRow[]> {
     rows.push({ id: name, created: parseInt(created, 10) || 0, attached: attached === "1" });
   }
   return rows;
+}
+async function tmuxSessions(): Promise<SessionRow[]> {
+  // list-sessions can transiently fail or come back empty while the tmux server is
+  // contended (e.g. a pane spawning/attaching as the browser reloads on a tab switch).
+  // A spuriously-empty list, handed to the overlay, used to wipe the whole tab bar. So
+  // retry once on empty/failure before believing there are genuinely no sessions.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let out = "";
+    try { out = await runTmux(["list-sessions", "-F", "#{session_name}\t#{session_created}\t#{session_attached}"]); }
+    catch { out = ""; }
+    const rows = parseTmuxList(out);
+    if (rows.length || attempt === 1) return rows;
+    await new Promise((r) => setTimeout(r, 75)); // brief backoff, then re-query
+  }
+  return [];
 }
 async function lastAiTitle(tp: string): Promise<string | null> {
   try {
