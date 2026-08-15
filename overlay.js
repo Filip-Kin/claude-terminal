@@ -50,6 +50,53 @@
   }, true);
   // #endregion
 
+  // #region auto-reconnect
+  // ttyd only auto-reconnects when the socket closes abnormally AND no WebSocket
+  // 'error' fired first — but it disables its own reconnect on ANY error, which is
+  // exactly the common sleep/wake and mobile-network-blip case. It then parks on a
+  // "Press ⏎ to Reconnect" overlay and waits for a keypress. Watch for that overlay
+  // and synthesize the Enter ourselves so it reconnects without user action. ttyd's
+  // reconnect handler is a terminal.onKey(Enter) listener, so a keydown dispatched on
+  // xterm's hidden textarea drives it. A short backoff means we retry every ~1.5s
+  // while offline instead of hammering, and it re-fires each time the overlay
+  // reappears after a failed attempt.
+  const RECONNECT_RETRY_MS = 1500;
+  let reconnectPending = false;
+  function waitingToReconnect() {
+    // ttyd's overlay is an unclassed absolutely-positioned div appended to .xterm.
+    const nodes = document.querySelectorAll(".xterm > div");
+    for (const n of nodes) {
+      if (/Press\b.*\bReconnect/.test(n.textContent || "")) return true;
+    }
+    return false;
+  }
+  function pressEnterInTerminal() {
+    const ta = document.querySelector(".xterm-helper-textarea");
+    if (!ta) return;
+    const opts = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    ta.dispatchEvent(new KeyboardEvent("keydown", opts));
+    ta.dispatchEvent(new KeyboardEvent("keyup", opts));
+  }
+  function checkReconnect() {
+    if (reconnectPending || !waitingToReconnect()) return;
+    reconnectPending = true;
+    log("auto-reconnect: parked on 'Press Enter to Reconnect', retrying in", RECONNECT_RETRY_MS, "ms");
+    setTimeout(() => {
+      reconnectPending = false;
+      if (waitingToReconnect()) {
+        log("auto-reconnect: sending Enter");
+        pressEnterInTerminal();
+      }
+    }, RECONNECT_RETRY_MS);
+  }
+  new MutationObserver(checkReconnect).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+  checkReconnect();
+  // #endregion
+
   // #region layout fixes (right gutter + mobile scroll)
   // ttyd defaults leave a wide right gap (5px padding + a permanent overflow:scroll
   // gutter). Trim the right padding, make the scrollbar thin/auto, and keep the
@@ -431,6 +478,7 @@
 
   let lastSessions = [];
   let lastScrolledId = null;
+  const CACHE_KEY = "ct-last-sessions";
   async function closeSession(id) {
     const wasCurrent = id === curId();
     // pick where to land: the previous tab in order, else the next, else main
@@ -538,23 +586,50 @@
     if (lockedTitle && document.title !== lockedTitle) document.title = lockedTitle;
   }).observe(document.querySelector("title") || document.head, { childList: true });
 
+  function hideBar() {
+    // guests get 403 / no sidecar -> hide the bar and give the terminal its space back
+    bar.style.display = "none";
+    const tc = document.getElementById("terminal-container");
+    if (tc) {
+      tc.style.top = "0px";
+      tc.style.height = "100%";
+    }
+    reflow();
+  }
+
   async function refresh() {
     let sessions;
     try {
       const r = await api("sessions");
+      // A real 403 means "no sidecar for you" (guest) -> hide the bar for good.
+      // ANY other failure (transient network blip on a mobile wake, a 5xx, or an
+      // expired auth cookie that 302s us to an HTML login page so .json() throws)
+      // is temporary: keep the last-known tabs on screen rather than wiping the bar.
+      // Rebuilding the bar from every poll used to make it vanish on mobile whenever
+      // a single poll failed, which on a long-lived PWA is constant.
+      if (r.status === 403) { hideBar(); return; }
       if (!r.ok) throw new Error(String(r.status));
       sessions = await r.json();
     } catch (e) {
-      // guests get 403 / no sidecar -> hide the bar and give the terminal its space back
-      bar.style.display = "none";
-      const tc = document.getElementById("terminal-container");
-      if (tc) {
-        tc.style.top = "0px";
-        tc.style.height = "100%";
-      }
-      reflow();
+      // transient: don't touch the DOM. If we've never rendered tabs, leave the bar
+      // as-is (hidden by default); otherwise the existing chips stay put until the
+      // next successful poll re-syncs them.
+      log("sessions poll failed, keeping last bar", e);
       return;
     }
+    // Persist the live tab set so the NEXT page load (every tab switch is a full
+    // reload) can paint the bar instantly from cache, before this poll's replacement
+    // returns. Without this the bar flashes empty on every switch — the "tabs
+    // disappear when I switch tabs" symptom on mobile, where the reload + first poll
+    // is slowest.
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(sessions)); } catch (e) {}
+    paintBar(sessions, true);
+  }
+
+  // Render the bar from a sessions array. live=true means this came from a fresh
+  // poll (fold in the pinned main chip, mark the current "done" tab seen); live=false
+  // is a cache seed painted on load and must not send any state-changing request.
+  function paintBar(sessions, live) {
     bar.style.display = "";
     // guarantee a pinned main chip even if no one is attached to it yet
     if (!sessions.some((s) => s.id === MAIN_ID)) {
@@ -569,7 +644,7 @@
     const curSess = sessions.find((s) => s.id === cur);
     if (curSess && curSess.state === "done") {
       curSess.state = "seen";
-      api("sessions/seen", {
+      if (live) api("sessions/seen", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: cur }),
@@ -595,6 +670,18 @@
       });
     }
     setTitle(sessions);
+  }
+
+  // Paint the last-known tabs from cache the instant the overlay loads, so a tab
+  // switch (which reloads the whole page) never shows an empty bar while the first
+  // /sessions poll is in flight. The poll then replaces this with live state.
+  function seedFromCache() {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return;
+      const cached = JSON.parse(raw);
+      if (Array.isArray(cached) && cached.length) paintBar(cached, false);
+    } catch (e) {}
   }
 
   // #region theme toggle (folds ttyd's native toggle + flips Claude Code's theme)
@@ -1076,6 +1163,7 @@
 
   if (document.body) mountBar();
   else document.addEventListener("DOMContentLoaded", mountBar);
+  seedFromCache(); // show cached tabs immediately so a switch never blanks the bar
   refresh();
   setInterval(refresh, 3000);
   // #endregion
