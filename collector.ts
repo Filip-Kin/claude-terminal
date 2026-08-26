@@ -12,6 +12,7 @@ import { openSync, fstatSync, readSync, closeSync, readdirSync, statSync } from 
 import { join } from "node:path";
 import { openDb } from "./db.ts";
 import { sampleCloudCost } from "./cost-collector.ts";
+import { sampleExternalPeers } from "./external-collector.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -184,6 +185,16 @@ for (const user of trackedUsers) {
   }
 }
 db.close();
+
+// Pull usage from any configured external peers (other claude-terminal instances) into
+// the external_* tables. Runs BEFORE the tick so the SSE push reflects fresh peer data.
+// Non-fatal: an unreachable peer must never disturb local collection. No-ops unless
+// externalPeers is configured.
+try {
+  await sampleExternalPeers(CONFIG_PATH);
+} catch (e) {
+  console.error("external peers sample failed:", e);
+}
 
 // Nudge the server to push a live SSE update to any open dashboard.
 const notifyPort = cfg.port || 7682;

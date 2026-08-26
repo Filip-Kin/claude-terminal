@@ -53,6 +53,7 @@
   .name { font-weight:700; font-size:18px; letter-spacing:-.01em; }
   .badge { font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
   .badge.host { color:var(--grad-b); border-color:color-mix(in srgb,var(--grad-b) 45%,transparent); }
+  .badge.external { color:#a855f7; border-color:color-mix(in srgb,#a855f7 45%,transparent); }
   .now { color:#22c55e; font-size:11px; font-weight:600; display:inline-flex; align-items:center; gap:5px; }
   .big { grid-column:3; grid-row:1/3; text-align:right; }
   .big b { font-size:24px; font-weight:750; font-variant-numeric:tabular-nums; letter-spacing:-.02em; display:block; line-height:1.1; }
@@ -250,14 +251,17 @@ function mainOpts(d){
   };
 }
 
-const monthlySeries = (d) => d.users.map(u => ({ name:u.name,
+// External peers are excluded here: this chart pairs with the money split, and peers
+// are not in the split. Their activity still shows on the hourly chart and their card.
+const splitUsers = (d) => d.users.filter(u => !u.external);
+const monthlySeries = (d) => splitUsers(d).map(u => ({ name:u.name,
   data: d.months.map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? r.output : 0; }) }));
 function monthlyOpts(d){
   return {
     chart:{ type:"bar", height:300, stacked:true, fontFamily:"inherit", background:"transparent",
       toolbar:{show:false}, animations:{ enabled:true, easing:"easeinout", speed:800 } },
     theme:{ mode: isDark()?"dark":"light" },
-    colors: d.users.map(u=>colorFor(u.user)),
+    colors: splitUsers(d).map(u=>colorFor(u.user)),
     series: monthlySeries(d),
     plotOptions:{ bar:{ columnWidth: d.months.length<=2 ? "42%" : "62%",
       borderRadius:4, borderRadiusApplication:"end", borderRadiusWhenStacked:"last" } },
@@ -322,7 +326,8 @@ function build(d){
       <div class="who">
         <span class="swatch" style="background:${c}"></span>
         <span class="name">${u.name}</span>
-        ${u.host ? '<span class="badge host">host</span>' : '<span class="badge">sandbox</span>'}
+        ${u.external ? `<span class="badge external">external${u.peer?` · ${u.peer}`:''}</span>`
+          : u.host ? '<span class="badge host">host</span>' : '<span class="badge">sandbox</span>'}
         ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>
       <div class="spark" id="spark-${u.user}"></div>

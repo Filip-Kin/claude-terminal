@@ -26,6 +26,15 @@
   "corsOrigins": [
     "https://home.example.com"
   ],
+  "exportToken": "set-a-long-random-secret-to-let-peers-pull-your-usage",
+  "exportName": "Me",
+  "externalPeers": [
+    {
+      "name": "Friend",
+      "url": "https://usage.friend.example.com/usage/export",
+      "token": "the-exportToken-from-their-config"
+    }
+  ],
   "appName": "Claude Terminal",
   "appShort": "Claude",
   "themeColor": "#D97757",

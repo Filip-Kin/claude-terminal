@@ -32,6 +32,41 @@ CREATE TABLE IF NOT EXISTS meta (
   models        TEXT NOT NULL DEFAULT '[]',
   last_activity TEXT
 );
+
+-- External peers: usage pulled from ANOTHER claude-terminal instance (a friend who
+-- runs their own copy and exposes /usage/export). These are snapshots, not deltas:
+-- the external collector REPLACEs a peer's rows each pull, so they hold absolute
+-- values and never double-count. Kept in their own tables so they never touch the
+-- local collector's offset/delta bookkeeping, and so they can be shown on the board
+-- while being excluded from the money split. peer = the label from config.
+CREATE TABLE IF NOT EXISTS external_cum (
+  peer           TEXT NOT NULL,
+  user           TEXT NOT NULL,
+  name           TEXT NOT NULL DEFAULT '',
+  input          INTEGER NOT NULL DEFAULT 0,
+  output         INTEGER NOT NULL DEFAULT 0,
+  cache_creation INTEGER NOT NULL DEFAULT 0,
+  cache_read     INTEGER NOT NULL DEFAULT 0,
+  total          INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (peer, user)
+);
+CREATE TABLE IF NOT EXISTS external_hourly (
+  peer     TEXT NOT NULL,
+  user     TEXT NOT NULL,
+  hour_utc TEXT NOT NULL,
+  total    INTEGER NOT NULL DEFAULT 0,
+  output   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (peer, user, hour_utc)
+);
+CREATE TABLE IF NOT EXISTS external_meta (
+  peer          TEXT NOT NULL,
+  user          TEXT NOT NULL,
+  sessions      INTEGER NOT NULL DEFAULT 0,
+  models        TEXT NOT NULL DEFAULT '[]',
+  last_activity TEXT,
+  fetched_at    TEXT,
+  PRIMARY KEY (peer, user)
+);
 `;
 
 export function openDb(path: string): Database {

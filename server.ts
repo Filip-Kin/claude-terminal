@@ -111,6 +111,55 @@ const qHours = db?.query("SELECT hour_utc, total, output FROM hourly WHERE user 
 const qCum = db?.query("SELECT * FROM cumulative WHERE user = ?") as any;
 const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 
+// External-peer queries are prepared lazily: the external_* tables only exist once a
+// collector that carries the newer schema has run. A vanilla DB (or a fresh deploy
+// before the first collector tick) simply has no external users. Memoised once the
+// tables appear so we don't re-check sqlite_master on every build.
+let extQ: { users: any; cum: any; hours: any; meta: any } | null = null;
+function ensureExt() {
+  if (extQ || !db) return extQ;
+  try {
+    const t = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='external_cum'").get();
+    if (!t) return null;
+    extQ = {
+      users: db.query("SELECT DISTINCT peer, user FROM external_cum ORDER BY peer, user"),
+      cum: db.query("SELECT * FROM external_cum WHERE peer = ? AND user = ?"),
+      hours: db.query("SELECT hour_utc, total, output FROM external_hourly WHERE peer = ? AND user = ?"),
+      meta: db.query("SELECT * FROM external_meta WHERE peer = ? AND user = ?"),
+    };
+  } catch { extQ = null; }
+  return extQ;
+}
+const extKey = (peer: string, user: string) => "ext_" + `${peer}_${user}`.replace(/[^A-Za-z0-9_]/g, "_");
+
+// A portable snapshot of THIS instance's usage for a trusted peer to pull. Raw hourly
+// buckets (last 45 days) + cumulative + meta per local user, so the puller reconstructs
+// the same gauges against its own clock. Only local users are exported (external users
+// are read from other tables), so peers never chain each other's data.
+function buildExport() {
+  if (!db) return { peer: OWNER, generated_at: new Date().toISOString(), users: [] };
+  const cutoff = hourKeyOf(new Date(Date.now() - 45 * 24 * 3600e3));
+  const users: any[] = [];
+  for (const { user } of qUsers.all() as any[]) {
+    const cum = (qCum.get(user) as any) || { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 };
+    const meta = (qMeta.get(user) as any) || {};
+    const hourly = (qHours.all(user) as any[])
+      .filter((r) => r.hour_utc >= cutoff)
+      .map((r) => ({ hour_utc: r.hour_utc, total: r.total, output: r.output }));
+    users.push({
+      user,
+      name: cfg.names?.[user] || titleCase(user),
+      cumulative: {
+        input: cum.input, output: cum.output,
+        cache_creation: cum.cache_creation, cache_read: cum.cache_read, total: cum.total,
+      },
+      meta: { sessions: meta.sessions || 0, models: meta.models || "[]", last_activity: meta.last_activity || null },
+      hourly,
+    });
+  }
+  return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(), users };
+}
+
 function buildLeaderboard() {
   const now = new Date();
   const monthPrefix = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}`;
@@ -177,6 +226,44 @@ function buildLeaderboard() {
     u.share_usd = curCents[u.user] / 100;
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0;
   }
+
+  // External peers: shown on the board but deliberately NOT in the split above. They
+  // carry an `external` flag (rendered as an "external" chip) and no share_usd, so the
+  // fixed subscription bill stays divided only across the local users.
+  const eq = ensureExt();
+  if (eq) {
+    for (const { peer, user } of eq.users.all() as any[]) {
+      const hours = new Map<string, any>();
+      for (const r of eq.hours.all(peer, user) as any[]) hours.set(r.hour_utc, { total: r.total, output: r.output });
+      const cum = (eq.cum.get(peer, user) as any) || { output: 0, total: 0, name: user };
+      const meta = (eq.meta.get(peer, user) as any) || {};
+      const last = meta.last_activity || null;
+      let active = false;
+      if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
+      let monthOutput = 0;
+      for (const [hk, b] of hours) if (hk.slice(0, 7) === monthPrefix) monthOutput += b.output;
+      users.push({
+        user: extKey(peer, user),
+        name: cum.name || user,
+        host: false,
+        external: true,
+        peer,
+        output_5h: rolling(hours, "output", now),
+        output_total: cum.output,
+        tokens_total: cum.total,
+        sessions: meta.sessions || 0,
+        models: JSON.parse(meta.models || "[]").filter((m: string) => !String(m).startsWith("<")),
+        last_used: last,
+        active,
+        spark: sparkSeries(hours, now, SPARK_HOURS),
+        hourly: sparkSeries(hours, now, HOURLY_HOURS),
+        month_output: monthOutput,
+        share_usd: null,
+        month_pct: null,
+      });
+    }
+  }
+
   users.sort((a, b) => b.month_output - a.month_output || b.output_total - a.output_total);
 
   return {
@@ -473,6 +560,19 @@ const server = Bun.serve({
       if (req.method === "POST" && path === "/internal/tick") { broadcast(); return new Response("ok"); }
       if (req.method === "GET" && path === "/usage/api") {
         return Response.json(buildLeaderboard(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
+      }
+      // Read-only usage export for a trusted peer to pull (another claude-terminal
+      // instance). Disabled (404) unless cfg.exportToken is set; then gated by that
+      // token via Authorization: Bearer <token> or ?token=<token>. Served under the
+      // already-public /usage/ path, so the token is the only thing protecting it.
+      if (req.method === "GET" && path === "/usage/export") {
+        const tok = cfg.exportToken;
+        if (!tok) return new Response("export disabled", { status: 404 });
+        const auth = req.headers.get("authorization") || "";
+        const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+        const qtok = new URL(req.url).searchParams.get("token") || "";
+        if (bearer !== tok && qtok !== tok) return new Response("unauthorized", { status: 401 });
+        return Response.json(buildExport(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
       }
       // Cloud cost split (second dashboard section). Reads cloud_cost.db via its own
       // module; answers { available:false, ... } gracefully until the collector has samples.
