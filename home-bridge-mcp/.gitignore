@@ -1,0 +1,9 @@
+node_modules/
+data/*.json
+data/secret.*
+data/bridge.db-shm
+data/bridge.db-wal
+data/jobs/
+src.bak.*
+.env
+*.log

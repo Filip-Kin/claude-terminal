@@ -1,0 +1,22 @@
+{
+  "name": "home-bridge-mcp",
+  "version": "0.1.0",
+  "description": "Private HTTP MCP bridge to the home server: memory tree, Nextcloud files, and delegated Claude tasks. OAuth 2.1 via Authelia.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "BRIDGE_DEV_NO_AUTH=1 bun run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "jose": "^5.9.6",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
