@@ -213,9 +213,19 @@ into `server.ts` in one line), and the React front-end in `app/` built to `publi
 
 Deploy (front door): the sidecar serves `/app*`, but your reverse proxy must route `/app*` to the
 sidecar (the built assets fetch absolute `/app/...` paths). For the claude.filipkin.com setup that
-is a `claude-router` rule sending `/app` and `/app/*` to the sidecar port; then rebuild the bundle
-(`bun run build:app`) and restart the service. Guests never get an `/app` route, and the tab-bar
-chat button hides itself unless the owner-gated `/app/api/models` probe returns 200.
+is a one-time `claude-router` rule sending `/app` and `/app/*` to the sidecar port. Guests never
+get an `/app` route, and the tab-bar chat button hides itself unless the owner-gated
+`/app/api/models` probe returns 200.
+
+Shipping updates (the PWA-doesn't-go-stale part): `bun run app/build.ts` (aka `bun run build:app`)
+builds `main-<hash>.js` + `styles-<hash>.css`, writes `public/app/version.txt` (the JS content
+hash), and regenerates `index.html` pointing at the hashed files. Hashed assets are served
+`immutable` (a new deploy is a new URL, so no cache can serve stale JS); `index.html` and
+`/app/api/version` are `no-store`. `/app/api/version` reads `version.txt` fresh on each request, so
+**a rebuild alone ships the update — no service restart needed**. Any fresh load gets the new
+bundle; an already-open tab or installed PWA polls `/app/api/version` every 60s and shows a "Reload"
+toast (which clears Cache Storage and reloads — it does not touch the shared push service worker).
+This is FTA-Buddy's version-poll + reload-toast pattern, without its cache-first shell precache.
 
 ## Importing from a previous setup
 
