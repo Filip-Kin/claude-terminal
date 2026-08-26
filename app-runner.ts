@@ -56,6 +56,7 @@ export class Conversation {
   private closed = false;
   private subs = new Set<Sub>();
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
+  private seqCounter = 0; // stable per-conversation sequence so a reconnect can dedupe
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -71,6 +72,7 @@ export class Conversation {
   }
 
   private emit(e: AppEvent) {
+    (e as any)._seq = this.seqCounter++;
     this.log.push(e);
     if (this.log.length > 5000) this.log.splice(0, this.log.length - 5000);
     for (const s of this.subs) {
