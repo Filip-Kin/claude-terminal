@@ -303,6 +303,8 @@
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
   const SVG_HAM =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>';
+  const SVG_CHAT =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.38 8.38 0 0 1 3.5 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5z"/></svg>';
   const SVG_NET =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z"/></svg>';
   const SVG_BELL =
@@ -491,6 +493,12 @@
   historyBtn.className = "ctab-btn ctab-history";
   historyBtn.title = "Conversation history (resume a past chat)";
   historyBtn.innerHTML = SVG_HISTORY;
+  const chatBtn = document.createElement("a"); // open the Claude-app-style chat UI (/app)
+  chatBtn.className = "ctab-btn ctab-chat";
+  chatBtn.title = "Open chat app";
+  chatBtn.href = "/app";
+  chatBtn.innerHTML = SVG_CHAT;
+  chatBtn.style.display = "none"; // shown only for the owner (guests get 403 on the probe)
   const hamBtn = document.createElement("div");
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
@@ -512,6 +520,7 @@
   bar.appendChild(spacer);
   bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(netBtn);
+  bar.appendChild(chatBtn); // link out to the /app chat UI
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
@@ -1179,6 +1188,10 @@
   // reveal the button only when the server reports the feature is enabled
   (async () => {
     try { const r = await api("connections"); const d = await r.json(); if (d && d.enabled) netBtn.style.display = ""; } catch {}
+  })();
+  // reveal the chat-app button only for the owner (the /app routes are owner-gated)
+  (async () => {
+    try { const r = await api("app/api/models"); if (r.ok) chatBtn.style.display = ""; } catch {}
   })();
   // #endregion
 
