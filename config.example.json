@@ -39,6 +39,11 @@
   "appShort": "Claude",
   "themeColor": "#D97757",
   "bgColor": "#1a1613",
+  "appModels": [
+    { "id": "opus", "label": "Opus" },
+    { "id": "sonnet", "label": "Sonnet" },
+    { "id": "haiku", "label": "Haiku" }
+  ],
   "vapidSubject": "mailto:you@example.com",
   "spawnCwd": "/home/me/projects",
   "spawnHelper": "/home/me/.local/bin/claude-spawn",
