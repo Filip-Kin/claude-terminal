@@ -42,6 +42,7 @@
   "vapidSubject": "mailto:you@example.com",
   "spawnCwd": "/home/me/projects",
   "spawnHelper": "/home/me/.local/bin/claude-spawn",
+  "netApplyHelper": "/path/to/net-sidecar/net-apply.sh",
   "cloudHost": "root@203.0.113.10",
   "cloudCostDb": "/var/lib/claude-terminal/cloud_cost.db",
   "dropletMonthlyUsd": 56,

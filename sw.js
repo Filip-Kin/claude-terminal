@@ -7,7 +7,7 @@
 // set a large `icon` by default (that produced a duplicate icon on the right). Only
 // a payload that explicitly passes `icon` gets a large image. The badge is the small
 // monochrome status-bar glyph (white sunburst on transparent).
-const BADGE = "/_ct/pwa/badge-96.png?v=3";
+const BADGE = "/_ct/pwa/badge-96.png?v=4";
 
 self.addEventListener("install", () => {
   self.skipWaiting();

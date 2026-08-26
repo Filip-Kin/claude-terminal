@@ -13,6 +13,7 @@ import { watch, readdirSync, statSync, existsSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
+import { Connections } from "./connections.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -541,6 +542,10 @@ async function spawnWorker(name: string | undefined, cwd: string, prompt: string
 }
 // #endregion
 
+// External network connections (OpenVPN + Tailscale). Inert unless cfg.netApplyHelper
+// is set -> the overlay hides the whole Connections UI on a vanilla install.
+const conns = new Connections(STATE_DIR, cfg.netApplyHelper);
+
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
@@ -620,10 +625,10 @@ const server = Bun.serve({
         display: "standalone", display_override: ["standalone", "fullscreen", "minimal-ui"],
         orientation: "any", background_color: BG_COLOR, theme_color: THEME_COLOR,
         icons: [
-          { src: "/_ct/pwa/icon-192.png?v=3", sizes: "192x192", type: "image/png", purpose: "any" },
-          { src: "/_ct/pwa/icon-512.png?v=3", sizes: "512x512", type: "image/png", purpose: "any" },
-          { src: "/_ct/pwa/icon-maskable-192.png?v=3", sizes: "192x192", type: "image/png", purpose: "maskable" },
-          { src: "/_ct/pwa/icon-maskable-512.png?v=3", sizes: "512x512", type: "image/png", purpose: "maskable" },
+          { src: "/_ct/pwa/icon-192.png?v=4", sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-512.png?v=4", sizes: "512x512", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-maskable-192.png?v=4", sizes: "192x192", type: "image/png", purpose: "maskable" },
+          { src: "/_ct/pwa/icon-maskable-512.png?v=4", sizes: "512x512", type: "image/png", purpose: "maskable" },
         ],
       }, { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "no-cache" } });
     }
@@ -815,6 +820,43 @@ const server = Bun.serve({
       if (theme !== "dark" && theme !== "light") return new Response("Bad theme", { status: 400 });
       await writeTheme(theme);
       return Response.json({ ok: true, theme });
+    }
+    // #endregion
+
+    // #region external network connections (OpenVPN + Tailscale) — owner-gated
+    // The overlay only shows the UI when GET /connections reports enabled:true.
+    if (path === "/connections" || path.startsWith("/connections/")) {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      if (!conns.enabled()) return Response.json({ enabled: false }, { headers: cors(req) });
+      try {
+        if (req.method === "GET" && path === "/connections")
+          return Response.json({ enabled: true, ...(await conns.list()) }, { headers: { "Cache-Control": "no-store", ...cors(req) } });
+        if (req.method === "GET" && path === "/connections/status")
+          return Response.json(await conns.status(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
+        if (req.method === "POST" && path === "/connections/openvpn") {
+          const b: any = await req.json();
+          return Response.json(await conns.addOpenvpn({
+            name: String(b.name || ""), ovpn: String(b.ovpn || ""), creds: b.creds ? String(b.creds) : "",
+            subnets: Array.isArray(b.subnets) ? b.subnets.map(String) : [], hosts: Array.isArray(b.hosts) ? b.hosts : [],
+          }), { headers: cors(req) });
+        }
+        if (req.method === "POST" && path === "/connections/tailscale") {
+          const b: any = await req.json().catch(() => ({}));
+          return Response.json(await conns.addTailscale({ name: String(b.name || "") }), { headers: cors(req) });
+        }
+        const m = /^\/connections\/([A-Za-z0-9_]+)(\/enable)?$/.exec(path);
+        if (m) {
+          const id = m[1];
+          if (req.method === "DELETE") return Response.json(await conns.remove(id), { headers: cors(req) });
+          if (req.method === "POST" && m[2]) {
+            const b: any = await req.json().catch(() => ({}));
+            return Response.json(await conns.setEnabled(id, !!b.on), { headers: cors(req) });
+          }
+        }
+        return new Response("Not Found", { status: 404 });
+      } catch (e: any) {
+        return new Response(String(e?.message || e), { status: 400 });
+      }
     }
     // #endregion
 

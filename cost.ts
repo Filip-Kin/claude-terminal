@@ -116,10 +116,15 @@ export function buildCostReport(cfg: any): any {
       });
     }
 
-    // "Right now" totals from the most recent sample (current month only).
-    const cur = months.find((m) => m.key === curMonth);
-    const liveRam = cur ? cur.buckets.reduce((a: number, b: any) => a + b.last_ram_bytes, 0) : 0;
-    const liveCpu = cur ? cur.buckets.reduce((a: number, b: any) => a + b.last_cpu_cores, 0) : 0;
+    // "Right now" totals: only resources present in the freshest sample. Summing every
+    // current-month resource's last_* folds in containers that have since stopped (their
+    // stale last-known RAM/CPU lingers in the row), which pushed the totals past 100%
+    // (e.g. RAM 112%, CPU 154%). Every resource written by the same accumulate() call
+    // shares the host's last_seen timestamp; anything older stopped before it, so match
+    // on last_seen to keep just the live set.
+    const live = lastSeen ? rows.filter((r) => r.month === curMonth && r.last_seen === lastSeen) : [];
+    const liveRam = live.reduce((a: number, r: any) => a + r.last_ram_bytes, 0);
+    const liveCpu = live.reduce((a: number, r: any) => a + r.last_cpu_cores, 0);
 
     return {
       available: months.length > 0,

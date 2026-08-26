@@ -125,7 +125,7 @@
   const NOTCH = 20; // px of finger travel per wheel notch
   // don't hijack touches inside our own UI (the history dialog + the tab bar) — they
   // need native scrolling.
-  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-drawer, #claude-tabbar"));
+  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-connmodal, #ct-drawer, #claude-tabbar"));
   let tStartX = 0, tStartY = 0, tLastY = 0, tAccum = 0, tScroll = false;
   document.addEventListener("touchstart", (e) => {
     tScroll = false; tAccum = 0;
@@ -303,6 +303,8 @@
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
   const SVG_HAM =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>';
+  const SVG_NET =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z"/></svg>';
   const SVG_BELL =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>';
   const SVG_BELL_OFF =
@@ -372,6 +374,54 @@
     "body.theme-light #ct-histmodal .ct-hist-head{border-color:#ececec}",
     "body.theme-light #ct-histmodal .ct-hist-row:hover{background:#f0f0f0}",
     "body.theme-light #ct-histmodal .ct-hist-sub{color:#777}",
+    // external-networks modal (shares the histmodal card look)
+    "#ct-connmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px)}",
+    // applying overlay: covers the dialog with a spinner while a change is being applied
+    // (the terminal reconnects behind it, so the list would otherwise flicker/empty out)
+    "#ct-connmodal .ct-conn{position:relative}",
+    "#ct-connmodal .ct-applying{position:absolute;inset:0;z-index:2;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(30,30,30,.82);backdrop-filter:blur(2px);border-radius:10px;text-align:center;padding:20px}",
+    "#ct-connmodal.applying .ct-applying{display:flex}",
+    "#ct-connmodal .ct-applying .sp{width:34px;height:34px;border-radius:50%;border:3px solid #4a4a4a;border-top-color:#7C3AED;animation:ct-spin .8s linear infinite}",
+    "#ct-connmodal .ct-applying .msg{font-size:13px;color:#d6d6d6;max-width:80%}",
+    "@keyframes ct-spin{to{transform:rotate(360deg)}}",
+    "@media (prefers-reduced-motion: reduce){#ct-connmodal .ct-applying .sp{animation-duration:2s}}",
+    "body.theme-light #ct-connmodal .ct-applying{background:rgba(255,255,255,.85)}",
+    "body.theme-light #ct-connmodal .ct-applying .msg{color:#333}",
+    "#ct-connmodal .ct-conn{margin-top:" + (BAR_H + 12) + "px;width:min(640px,94vw);max-height:82vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-connmodal .ct-conn-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-connmodal .ct-conn-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
+    "#ct-connmodal .ct-conn-close:hover{opacity:1}",
+    "#ct-connmodal .ct-conn-body{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 12px}",
+    "#ct-connmodal .ct-conn-note{font-size:11px;color:#9a9a9a;margin:0 0 8px}",
+    "#ct-connmodal .ct-tun{border:1px solid #333;border-radius:8px;padding:9px 10px;margin-bottom:8px}",
+    "#ct-connmodal .ct-tun-top{display:flex;align-items:center;gap:8px}",
+    "#ct-connmodal .ct-tun-name{font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    "#ct-connmodal .ct-badge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:2px 6px;border-radius:5px;background:#2b2b2b;color:#bbb}",
+    "#ct-connmodal .ct-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:#6b7280}",
+    "#ct-connmodal .ct-dot.up{background:#22c55e}",
+    "#ct-connmodal .ct-dot.down{background:#ef4444}",
+    "#ct-connmodal .ct-dot.wait{background:#f59e0b}",
+    "#ct-connmodal .ct-tun-sub{font-size:11px;color:#9a9a9a;margin-top:5px;word-break:break-word}",
+    "#ct-connmodal .ct-tun-sub code{color:#cfcfcf}",
+    "#ct-connmodal .ct-ic{cursor:pointer;opacity:.6;padding:3px 6px;border-radius:5px;font-size:12px}",
+    "#ct-connmodal .ct-ic:hover{opacity:1;background:rgba(255,255,255,.12)}",
+    "#ct-connmodal .ct-login{display:inline-block;margin-top:6px;padding:5px 10px;border-radius:6px;background:#7C3AED;color:#fff;text-decoration:none;font-weight:600}",
+    "#ct-connmodal .ct-add-row{display:flex;gap:8px;margin:6px 0 12px}",
+    "#ct-connmodal .ct-btn{cursor:pointer;padding:7px 11px;border-radius:7px;border:1px solid #3a3a3a;background:#262626;color:#e6e6e6;font:13px system-ui,sans-serif;font-weight:600}",
+    "#ct-connmodal .ct-btn:hover{background:#2f2f2f}",
+    "#ct-connmodal .ct-btn.primary{background:#7C3AED;border-color:#7C3AED;color:#fff}",
+    "#ct-connmodal .ct-form{border:1px dashed #3a3a3a;border-radius:8px;padding:10px;margin-bottom:12px;display:none}",
+    "#ct-connmodal .ct-form.open{display:block}",
+    "#ct-connmodal .ct-form label{display:block;font-size:11px;color:#9a9a9a;margin:8px 0 3px}",
+    "#ct-connmodal .ct-form input,#ct-connmodal .ct-form textarea{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:6px;border:1px solid #3a3a3a;background:#161616;color:#e6e6e6;font:12px ui-monospace,Menlo,Consolas,monospace;outline:none}",
+    "#ct-connmodal .ct-form input:focus,#ct-connmodal .ct-form textarea:focus{border-color:#7C3AED}",
+    "#ct-connmodal .ct-form textarea{resize:vertical;min-height:90px}",
+    "body.theme-light #ct-connmodal .ct-conn{background:#fff;color:#1f1f1f;border-color:#dcdcdc}",
+    "body.theme-light #ct-connmodal .ct-conn-head{border-color:#ececec}",
+    "body.theme-light #ct-connmodal .ct-tun{border-color:#e2e2e2}",
+    "body.theme-light #ct-connmodal .ct-badge{background:#eee;color:#555}",
+    "body.theme-light #ct-connmodal .ct-btn{background:#f2f2f2;border-color:#dcdcdc;color:#1f1f1f}",
+    "body.theme-light #ct-connmodal .ct-form input,body.theme-light #ct-connmodal .ct-form textarea{background:#f6f6f6;border-color:#dcdcdc;color:#1f1f1f}",
     // hamburger (mobile only) + left drawer with the full tab list
     "#claude-tabbar .ctab-ham{display:none}",
     "@media (max-width:600px){#claude-tabbar .ctab-ham{display:flex}#claude-tabbar .ctab-list .ctab:not(.active){display:none}#claude-tabbar .ctab{max-width:60vw}#claude-tabbar .ctab .ctab-label{max-width:44vw}}",
@@ -445,6 +495,11 @@
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
   hamBtn.innerHTML = SVG_HAM;
+  const netBtn = document.createElement("div"); // external networks (VPN / Tailscale)
+  netBtn.className = "ctab-btn ctab-net";
+  netBtn.title = "External networks (VPN / Tailscale)";
+  netBtn.innerHTML = SVG_NET;
+  netBtn.style.display = "none"; // shown only if the server reports the feature enabled
   const bellBtn = document.createElement("div"); // desktop only (mobile uses the drawer)
   bellBtn.className = "ctab-btn ctab-bell";
   bellBtn.title = "Enable notifications";
@@ -456,6 +511,7 @@
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
   bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
+  bar.appendChild(netBtn);
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
@@ -911,6 +967,221 @@
   historyBtn.addEventListener("click", openHistory);
   // #endregion
 
+  // #region external networks (VPN / Tailscale) modal
+  let connEl = null, connEsc = null, connPoll = null;
+  let connData = { tunnels: [] };   // latest /connections payload
+  let connApply = null;             // {msg, check(data), started} while a change applies
+  let connMsgEl = null;             // spinner message element
+  function closeConn() {
+    if (connPoll) { clearInterval(connPoll); connPoll = null; }
+    if (connEl) { connEl.remove(); connEl = null; }
+    if (connEsc) { document.removeEventListener("keydown", connEsc, true); connEsc = null; }
+    connApply = null;
+  }
+  // A change (add / toggle / remove) recouples the guest onto the network hub, which
+  // restarts the terminal + this sidecar — so the request's response is unreliable and
+  // the list would momentarily empty out. Cover the dialog with a spinner and hold it
+  // until the polled state actually reflects the change (or a safety timeout).
+  function beginApply(msg, check) {
+    connApply = { msg, check, started: Date.now() };
+    if (connEl) connEl.classList.add("applying");
+    if (connMsgEl) connMsgEl.textContent = msg;
+  }
+  function resolveApply() {
+    if (!connApply) return;
+    const done = connApply.check(connData) || (Date.now() - connApply.started > 60000);
+    if (done) { connApply = null; if (connEl) connEl.classList.remove("applying"); }
+  }
+  // fire a mutating request but tolerate a dropped response (the recouple kills us mid-flight)
+  function fireMutation(method, path, body) {
+    api(path, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    }).catch(() => {});
+  }
+  function dotFor(t) {
+    if (t.type === "tailscale") {
+      if (t.needsLogin) return ["wait", "needs login"];
+      if (t.up) return ["up", "connected" + (t.ip ? " · " + t.ip : "")];
+      return ["down", t.state || "off"];
+    }
+    if (t.enabled === false) return ["down", "disabled"];
+    return t.up ? ["up", "up"] : ["down", t.error || "down"];
+  }
+  function renderTunnels(listEl, data) {
+    const st = {};
+    for (const s of (data.status && data.status.tunnels) || []) st[s.id] = s;
+    listEl.innerHTML = "";
+    const tuns = data.tunnels || [];
+    if (!tuns.length) {
+      const e = document.createElement("div");
+      e.className = "ct-conn-note";
+      e.textContent = "No connections yet. Add an OpenVPN config or connect Tailscale below.";
+      listEl.appendChild(e);
+      return;
+    }
+    for (const t of tuns) {
+      const s = st[t.id] || {};
+      const merged = Object.assign({}, t, s);
+      const [cls, txt] = dotFor(merged);
+      const row = document.createElement("div");
+      row.className = "ct-tun";
+      const top = document.createElement("div");
+      top.className = "ct-tun-top";
+      const dot = document.createElement("span"); dot.className = "ct-dot " + cls;
+      const name = document.createElement("span"); name.className = "ct-tun-name"; name.textContent = t.name;
+      const badge = document.createElement("span"); badge.className = "ct-badge"; badge.textContent = t.type === "tailscale" ? "tailscale" : "openvpn";
+      const status = document.createElement("span"); status.style.cssText = "font-size:11px;color:#9a9a9a"; status.textContent = txt;
+      top.appendChild(dot); top.appendChild(name); top.appendChild(badge); top.appendChild(status);
+      if (t.type === "openvpn") {
+        const tog = document.createElement("span"); tog.className = "ct-ic";
+        tog.textContent = t.enabled ? "disable" : "enable";
+        tog.addEventListener("click", () => { beginApply("Updating " + t.name + "…", (d) => { const x = d.tunnels.find((y) => y.id === t.id); return x && x.enabled === !t.enabled; }); fireMutation("POST", "connections/" + t.id + "/enable", { on: !t.enabled }); });
+        top.appendChild(tog);
+      }
+      const del = document.createElement("span"); del.className = "ct-ic"; del.textContent = "×"; del.style.fontSize = "16px";
+      del.title = "Remove";
+      del.addEventListener("click", () => { if (confirm("Remove " + t.name + "?")) { beginApply("Removing " + t.name + "…", (d) => !d.tunnels.some((y) => y.id === t.id)); fireMutation("DELETE", "connections/" + t.id); } });
+      top.appendChild(del);
+      row.appendChild(top);
+      // detail line: remaps for openvpn, login link for tailscale
+      if (merged.needsLogin && merged.loginUrl) {
+        const a = document.createElement("a");
+        a.className = "ct-login"; a.href = merged.loginUrl; a.target = "_blank"; a.rel = "noopener";
+        a.textContent = "Log in to Tailscale ↗";
+        row.appendChild(a);
+      } else if (t.type === "openvpn") {
+        // prefer live remaps from status (auto-detected ones are allocated at connect time)
+        const rm = (merged.remaps && merged.remaps.length ? merged.remaps : t.remaps) || [];
+        if (rm.length) {
+          const sub = document.createElement("div");
+          sub.className = "ct-tun-sub";
+          sub.innerHTML = "reach via " + rm.map((r) => "<code>" + r.fake + "</code> → " + r.real).join(", ");
+          row.appendChild(sub);
+        } else if (merged.detected && merged.detected.length) {
+          const sub = document.createElement("div"); sub.className = "ct-tun-sub";
+          sub.textContent = "detected " + merged.detected.join(", ") + " — mapping…";
+          row.appendChild(sub);
+        } else if (merged.up) {
+          const sub = document.createElement("div"); sub.className = "ct-tun-sub";
+          sub.textContent = "up — detecting reachable subnets…";
+          row.appendChild(sub);
+        }
+      }
+      listEl.appendChild(row);
+    }
+  }
+  let connListEl = null;
+  async function openConnections() {
+    if (connEl) { closeConn(); return; }
+    try {
+      const r = await api("connections");
+      connData = await r.json();
+      if (!connData.enabled) { showToast("Network connections are not enabled here", "error"); return; }
+    } catch (e) { showToast("Could not load connections", "error"); return; }
+
+    connEl = document.createElement("div"); connEl.id = "ct-connmodal";
+    const panel = document.createElement("div"); panel.className = "ct-conn";
+    const head = document.createElement("div"); head.className = "ct-conn-head";
+    const h = document.createElement("span"); h.textContent = "External networks";
+    const x = document.createElement("span"); x.className = "ct-conn-close"; x.textContent = "×"; x.addEventListener("click", closeConn);
+    head.appendChild(h); head.appendChild(x);
+    // spinner overlay shown while a change applies (terminal reconnects behind the blur)
+    const applying = document.createElement("div"); applying.className = "ct-applying";
+    const sp = document.createElement("div"); sp.className = "sp";
+    connMsgEl = document.createElement("div"); connMsgEl.className = "msg"; connMsgEl.textContent = "Applying…";
+    applying.appendChild(sp); applying.appendChild(connMsgEl);
+    const body = document.createElement("div"); body.className = "ct-conn-body";
+    const note = document.createElement("div"); note.className = "ct-conn-note";
+    note.textContent = "Reach a remote LAN over your own VPN or Tailscale. Overlapping subnets get a unique local range automatically.";
+    connListEl = document.createElement("div");
+    renderTunnels(connListEl, connData);
+
+    // add buttons
+    const addRow = document.createElement("div"); addRow.className = "ct-add-row";
+    const addVpn = document.createElement("button"); addVpn.className = "ct-btn"; addVpn.textContent = "+ OpenVPN";
+    const addTs = document.createElement("button"); addTs.className = "ct-btn"; addTs.textContent = "+ Tailscale";
+    addRow.appendChild(addVpn); addRow.appendChild(addTs);
+
+    // OpenVPN form. Subnets optional: blank -> auto-detect the routes the server pushes.
+    const vf = document.createElement("div"); vf.className = "ct-form";
+    vf.innerHTML =
+      '<label>Name</label><input class="c-name" placeholder="work vpn">' +
+      '<label>Target subnet(s) to reach — comma separated, or leave blank to auto-detect</label><input class="c-subnets" placeholder="auto-detect (or e.g. 192.168.2.0/24, 10.10.0.0/24)">' +
+      '<label>.ovpn config (paste, or load a file)</label><input type="file" class="c-file" accept=".ovpn,.conf,text/plain"><textarea class="c-ovpn" placeholder="dev tun\\nremote vpn.example.com 1194\\n..."></textarea>' +
+      '<label>Username (if the VPN needs one)</label><input class="c-user" placeholder="optional">' +
+      '<label>Password</label><input class="c-pass" type="password" placeholder="optional">';
+    const vfAdd = document.createElement("button"); vfAdd.className = "ct-btn primary"; vfAdd.textContent = "Add & connect"; vfAdd.style.marginTop = "10px";
+    vf.appendChild(vfAdd);
+    vf.querySelector(".c-file").addEventListener("change", (e) => {
+      const f = e.target.files && e.target.files[0]; if (!f) return;
+      const rd = new FileReader(); rd.onload = () => { vf.querySelector(".c-ovpn").value = rd.result; }; rd.readAsText(f);
+    });
+    vfAdd.addEventListener("click", () => {
+      const name = vf.querySelector(".c-name").value.trim();
+      const subnets = vf.querySelector(".c-subnets").value.split(",").map((s) => s.trim()).filter(Boolean);
+      const ovpn = vf.querySelector(".c-ovpn").value;
+      const user = vf.querySelector(".c-user").value.trim();
+      const pass = vf.querySelector(".c-pass").value;
+      const creds = user ? user + "\n" + pass : "";
+      if (!ovpn.trim()) { showToast("Paste or load a .ovpn config", "error"); return; }
+      const pre = connData.tunnels.length;
+      vf.classList.remove("open"); vf.querySelectorAll("input,textarea").forEach((el) => (el.value = ""));
+      beginApply("Connecting " + (name || "VPN") + "… the terminal will reconnect.", (d) => d.tunnels.length > pre);
+      fireMutation("POST", "connections/openvpn", { name, subnets, ovpn, creds });
+    });
+
+    // Tailscale form. Single "name" = how THIS Claude server appears on your tailnet;
+    // the tailnet hostname is auto-generated from it (ct-<slug>).
+    const tf = document.createElement("div"); tf.className = "ct-form";
+    tf.innerHTML =
+      '<label>Name for this Claude sandbox on YOUR Tailscale</label>' +
+      '<input class="c-tsname" placeholder="claude-sandbox">' +
+      '<div class="ct-tun-sub">This names the Claude server as a device in your own Tailscale account (it appears as <code>ct-&lt;name&gt;</code>). It is not one of your existing devices — you are adding this sandbox to your tailnet.</div>';
+    const tfAdd = document.createElement("button"); tfAdd.className = "ct-btn primary"; tfAdd.textContent = "Connect Tailscale"; tfAdd.style.marginTop = "10px";
+    tf.appendChild(tfAdd);
+    tfAdd.addEventListener("click", () => {
+      const name = tf.querySelector(".c-tsname").value.trim();
+      const pre = connData.tunnels.length;
+      tf.classList.remove("open"); tf.querySelector(".c-tsname").value = "";
+      beginApply("Starting Tailscale… a login link will appear once it's up.", (d) => d.tunnels.length > pre);
+      fireMutation("POST", "connections/tailscale", { name });
+    });
+
+    addVpn.addEventListener("click", () => { tf.classList.remove("open"); vf.classList.toggle("open"); });
+    addTs.addEventListener("click", () => { vf.classList.remove("open"); tf.classList.toggle("open"); });
+
+    body.appendChild(note);
+    body.appendChild(connListEl);
+    body.appendChild(addRow);
+    body.appendChild(vf);
+    body.appendChild(tf);
+    panel.appendChild(head); panel.appendChild(applying); panel.appendChild(body); connEl.appendChild(panel);
+    connEl.addEventListener("click", (e) => { if (e.target === connEl && !connApply) closeConn(); });
+    (document.documentElement || document.body).appendChild(connEl);
+    connEsc = (e) => { if (e.key === "Escape" && !connApply) closeConn(); };
+    document.addEventListener("keydown", connEsc, true);
+
+    // live refresh: pull the full state (list + embedded status), re-render, and clear
+    // the applying spinner once the change is reflected. Failures (mid-reconnect) are
+    // ignored so the spinner holds instead of flashing an empty list.
+    async function refresh() {
+      try {
+        const r = await api("connections");
+        const d = await r.json();
+        if (d && d.enabled) { connData = d; renderTunnels(connListEl, connData); resolveApply(); }
+      } catch {}
+    }
+    connPoll = setInterval(refresh, 2000);
+  }
+  netBtn.addEventListener("click", openConnections);
+  // reveal the button only when the server reports the feature is enabled
+  (async () => {
+    try { const r = await api("connections"); const d = await r.json(); if (d && d.enabled) netBtn.style.display = ""; } catch {}
+  })();
+  // #endregion
+
   // #region mobile tab drawer (hamburger)
   let drawerEl = null, drawerEsc = null;
   function closeDrawer() {
@@ -1012,7 +1283,7 @@
     add("meta", { name: "mobile-web-app-capable", content: "yes" });
     add("meta", { name: "apple-mobile-web-app-status-bar-style", content: "black-translucent" });
     add("meta", { name: "apple-mobile-web-app-title", content: "Claude" });
-    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png?v=3" });
+    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png?v=4" });
   })();
 
   // Service worker (root scope) — drives push + installability. Served from /_ct/sw.js
@@ -1136,7 +1407,7 @@
     installBanner.id = "ct-install";
     installBanner.className = opts.ios ? "ios" : "";
     const icon = document.createElement("img");
-    icon.src = "/_ct/pwa/icon-192.png?v=3";
+    icon.src = "/_ct/pwa/icon-192.png?v=4";
     icon.alt = "";
     const txt = document.createElement("div");
     txt.className = "ct-inst-txt";
