@@ -7,7 +7,7 @@
     "server": "bun run server.ts",
     "collect": "bun run collector.ts",
     "migrate": "bun run migrate-state.ts",
-    "build:app": "bun build app/main.tsx --outdir public/app/assets --minify && cp app/index.html public/app/index.html && cp app/styles.css public/app/assets/styles.css"
+    "build:app": "bun run app/build.ts"
   },
   "license": "MIT",
   "dependencies": {

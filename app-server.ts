@@ -129,9 +129,18 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const f = Bun.file(join(ctx.publicDir, "app", "assets", rel));
     if (await f.exists()) {
       const dot = rel.lastIndexOf(".");
-      return new Response(f, { headers: { "Content-Type": MIME[rel.slice(dot).toLowerCase()] || "application/octet-stream", "Cache-Control": "public, max-age=3600" } });
+      // filenames are content-hashed by app/build.ts, so a given URL never changes content
+      return new Response(f, { headers: { "Content-Type": MIME[rel.slice(dot).toLowerCase()] || "application/octet-stream", "Cache-Control": "public, max-age=31536000, immutable" } });
     }
     return new Response("Not Found", { status: 404 });
+  }
+
+  // Build id the client polls to detect a new deploy (read fresh each call, so a rebuild
+  // alone ships an update — no service restart needed).
+  if (req.method === "GET" && path === "/app/api/version") {
+    let v = "dev";
+    try { v = (await Bun.file(join(ctx.publicDir, "app", "version.txt")).text()).trim() || "dev"; } catch {}
+    return new Response(v, { headers: { ...ctx.cors(req), "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
   }
 
   // --- API ---

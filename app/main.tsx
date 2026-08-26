@@ -148,6 +148,7 @@ function App() {
   const [attachments, setAttachments] = useState<{ name: string; path: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [updateAvail, setUpdateAvail] = useState(false);
 
   const esRef = useRef<EventSource | null>(null);
   const esOpen = useRef(false);
@@ -165,6 +166,32 @@ function App() {
     if (c) void loadConv(c);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // PWA update check: poll the server build id; if it changed since load, offer a reload.
+  // Content-hashed assets + no-store index mean the reload gets everything fresh.
+  useEffect(() => {
+    let baseline: string | null = null;
+    let stop = false;
+    const check = async () => {
+      try {
+        const v = (await (await fetch("/app/api/version", { cache: "no-store" })).text()).trim();
+        if (!v) return;
+        if (baseline === null) baseline = v;
+        else if (v !== baseline) setUpdateAvail(true);
+      } catch { /* offline / transient — ignore */ }
+    };
+    check();
+    const iv = setInterval(() => { if (!stop) check(); }, 60_000);
+    return () => { stop = true; clearInterval(iv); };
+  }, []);
+
+  // Force the freshest assets. We do NOT unregister the service worker (it's the shared
+  // push worker for the whole PWA); clearing Cache Storage + reloading the no-store shell
+  // is what actually pulls the new hashed bundle.
+  const hardRefresh = async () => {
+    try { const keys = await caches.keys(); await Promise.all(keys.map((k) => caches.delete(k))); } catch {}
+    location.reload();
+  };
 
   // autoscroll if near the bottom
   useEffect(() => {
@@ -253,6 +280,13 @@ function App() {
 
   return (
     <div className={"app" + (drawer ? " drawer-open" : "")}>
+      {updateAvail && (
+        <div className="update-toast" role="status">
+          <span>A new version is available.</span>
+          <button className="ut-reload" onClick={hardRefresh}>Reload</button>
+          <button className="ut-dismiss" onClick={() => setUpdateAvail(false)} aria-label="Dismiss">×</button>
+        </div>
+      )}
       <div className="scrim" onClick={() => setDrawer(false)} />
       <aside className="sidebar">
         <div className="sb-head"><span className="brand">Claude</span></div>

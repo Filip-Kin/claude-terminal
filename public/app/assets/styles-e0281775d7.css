@@ -175,6 +175,18 @@ a { color: var(--accent-2); }
 
 .scrim { display: none; }
 
+/* PWA update toast */
+.update-toast {
+  position: fixed; z-index: 60; left: 50%; bottom: 22px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 12px; max-width: calc(100vw - 28px);
+  background: var(--bg-3); border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px 12px 10px 16px; box-shadow: 0 14px 40px rgba(0,0,0,.55); font-size: 14px; color: var(--text);
+}
+.update-toast .ut-reload { background: var(--accent); color: #1a1613; border: none; border-radius: 8px; padding: 7px 13px; font-weight: 600; font-size: 13px; }
+.update-toast .ut-reload:hover { background: var(--accent-2); }
+.update-toast .ut-dismiss { background: transparent; border: none; color: var(--text-3); font-size: 18px; line-height: 1; padding: 0 2px; }
+.update-toast .ut-dismiss:hover { color: var(--text); }
+
 /* ---------- mobile ---------- */
 @media (max-width: 820px) {
   .icon-btn { display: inline-flex; }
