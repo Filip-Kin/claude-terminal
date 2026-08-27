@@ -125,6 +125,8 @@ export class Conversation {
   }
 
   hasSubscribers(): boolean { return this.subs.size > 0; }
+  // Live status for the conversation-list indicators: generating vs waiting on a tappable question.
+  statusInfo(): { busy: boolean; waiting: boolean } { return { busy: this.busy && !this.closed, waiting: this.pendingAsks.size > 0 }; }
 
   send(text: string) {
     if (this.closed) return;
@@ -352,6 +354,13 @@ export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
 }
 
 export function get(key: string): Conversation | undefined { return conversations.get(key); }
+
+// Live status for every in-memory conversation, keyed by session id (for the list indicators).
+export function liveStatuses(): Record<string, { busy: boolean; waiting: boolean }> {
+  const out: Record<string, { busy: boolean; waiting: boolean }> = {};
+  for (const c of new Set(conversations.values())) out[c.id] = c.statusInfo();
+  return out;
+}
 
 function reapIfIdle(c: Conversation) {
   if (c.hasSubscribers()) return;

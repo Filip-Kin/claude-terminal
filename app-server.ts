@@ -7,7 +7,7 @@
 
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
-import { getOrCreate, get, replayTranscript, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, type AppEvent, type AskNotifier } from "./app-runner";
 
 export interface AppCtx {
   allowed: (req: Request) => boolean;
@@ -246,6 +246,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!conv) return jsonRes({ error: "no live conversation to compact" }, ctx, req, 400);
     conv.compact();
     return jsonRes({ ok: true }, ctx, req);
+  }
+  // Live per-conversation status (thinking / waiting-for-input) for the sidebar indicators.
+  if (req.method === "GET" && path === "/app/api/statuses") {
+    return jsonRes({ statuses: liveStatuses() }, ctx, req);
   }
   // Owner's rolling 5-hour output tokens + a link to the full usage page (terminal-side dashboard).
   if (req.method === "GET" && path === "/app/api/usage") {

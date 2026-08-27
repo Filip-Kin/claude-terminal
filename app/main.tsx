@@ -13,6 +13,22 @@ marked.setOptions({ gfm: true, breaks: true });
 // Coarse pointer + no hover ≈ phone/tablet. Drives the Enter-to-send vs Enter-newline behaviour.
 const IS_TOUCH = typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
 
+// Favorites are server-stored, but cache them locally so they show offline and survive a reload,
+// and queue offline toggles (id -> desired fav) to replay on reconnect. Fixes favourites vanishing
+// or not sticking when offline.
+const FAV_LS = "ct-app-favorites", FAV_PENDING_LS = "ct-app-fav-pending";
+const loadFavsLocal = (): Set<string> => { try { const a = JSON.parse(localStorage.getItem(FAV_LS) || "[]"); return new Set(Array.isArray(a) ? a.map(String) : []); } catch { return new Set(); } };
+const saveFavsLocal = (s: Set<string>) => { try { localStorage.setItem(FAV_LS, JSON.stringify([...s])); } catch { /* */ } };
+const loadFavPending = (): Record<string, boolean> => { try { const o = JSON.parse(localStorage.getItem(FAV_PENDING_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };
+const saveFavPending = (m: Record<string, boolean>) => { try { localStorage.setItem(FAV_PENDING_LS, JSON.stringify(m)); } catch { /* */ } };
+
+// Per-conversation "last read" timestamps (local) — a conversation whose mtime later exceeds this
+// shows an unread indicator. Only conversations you've opened get an entry, so the backlog doesn't
+// all light up as unread.
+const LASTREAD_LS = "ct-app-lastread";
+const loadLastRead = (): Record<string, number> => { try { const o = JSON.parse(localStorage.getItem(LASTREAD_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };
+const saveLastRead = (m: Record<string, number>) => { try { localStorage.setItem(LASTREAD_LS, JSON.stringify(m)); } catch { /* */ } };
+
 // Long-press (touch, ~500ms, cancelled on scroll) or right-click (desktop) → open a context menu at
 // (x, y). Returns handlers to spread onto the target element.
 function longPressBind(open: (x: number, y: number) => void) {
@@ -88,6 +104,7 @@ const api = {
   context: (id: string) => fetch(`/app/api/context?id=${encodeURIComponent(id)}`).then(J),
   compact: (id: string) => fetch("/app/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
   usage: () => fetch("/app/api/usage").then(J),
+  statuses: () => fetch("/app/api/statuses").then(J),
   search: (q: string) => fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J),
   answerAsk: (id: string, askId: string, answer: string) =>
     fetch("/app/api/ask-answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, askId, answer }) }).then(J),
@@ -363,12 +380,17 @@ function App() {
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [updateAvail, setUpdateAvail] = useState(false);
-  const [favorites, setFavorites] = useState<Set<string>>(new Set());
+  const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [context, setContext] = useState<{ percentage: number; total: number; max: number } | null>(null);
   const [compacting, setCompacting] = useState(false);
+  const [loadingConv, setLoadingConv] = useState(false);
   const [usage5h, setUsage5h] = useState<{ output5h: number; url: string } | null>(null);
+  const [statuses, setStatuses] = useState<Record<string, { busy: boolean; waiting: boolean }>>({});
+  const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
+  const lastReadRef = useRef<Record<string, number>>(loadLastRead());
+  const [readTick, setReadTick] = useState(0); // bump to re-render unread dots after marking read
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant" } | null>(null);
   const [convMenu, setConvMenu] = useState<{ x: number; y: number; id: string; title: string; fav: boolean } | null>(null);
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
@@ -427,7 +449,17 @@ function App() {
       .catch(() => {})
       .finally(() => { loadingMoreRef.current = false; });
   }, [hasMore]);
-  const refreshFavs = useCallback(() => { api.favorites().then((d) => setFavorites(new Set(d.favorites || []))).catch(() => {}); }, []);
+  const refreshFavs = useCallback(() => {
+    api.favorites().then((d) => {
+      const srv = new Set<string>((d.favorites || []).map((x: any) => String(x)));
+      const pend = loadFavPending();
+      const ids = Object.keys(pend);
+      // apply not-yet-synced offline toggles on top of the server truth, then push them
+      for (const id of ids) { if (pend[id]) srv.add(id); else srv.delete(id); }
+      setFavorites(srv); saveFavsLocal(srv);
+      for (const id of ids) api.toggleFav(id, pend[id]).then(() => { const p = loadFavPending(); delete p[id]; saveFavPending(p); }).catch(() => { /* still offline */ });
+    }).catch(() => { setFavorites(loadFavsLocal()); }); // offline: keep the cached set
+  }, []);
   const refreshContext = useCallback((id: string | null) => {
     if (!id) { setContext(null); return; }
     api.context(id).then((d) => setContext(d?.available ? { percentage: d.percentage, total: d.total, max: d.max } : null)).catch(() => {});
@@ -438,8 +470,30 @@ function App() {
     try { await api.compact(activeIdRef.current); } catch { /* */ }
     setTimeout(() => { setCompacting(false); refreshContext(activeIdRef.current); }, 2000);
   }, [compacting, refreshContext]);
+  // Which conversations have an offline message queued (resume target) — drives the queued indicator
+  // on EXISTING conversations, not just brand-new offline chats.
+  const refreshQueue = useCallback(async () => {
+    const q = await offline.getQueue();
+    setQueued(q.length);
+    setQueuedIds(new Set(q.map((it: any) => it.body?.resume).filter(Boolean)));
+  }, []);
+  // Mark a conversation read (its unread dot clears until new activity bumps mtime past this).
+  const markRead = useCallback((id: string | null) => {
+    if (!id || id.startsWith("pending-")) return;
+    lastReadRef.current[id] = Date.now(); saveLastRead(lastReadRef.current); setReadTick((t) => t + 1);
+  }, []);
   const toggleFav = useCallback((id: string) => {
-    setFavorites((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); void api.toggleFav(id, !s.has(id)).then((d) => { if (d?.favorites) setFavorites(new Set(d.favorites)); }).catch(() => {}); return n; });
+    setFavorites((s) => {
+      const fav = !s.has(id);
+      const n = new Set(s); if (fav) n.add(id); else n.delete(id);
+      saveFavsLocal(n); // durable immediately, so a reload/offline keeps it
+      const pend = loadFavPending(); pend[id] = fav; saveFavPending(pend); // remember intent until the server acks
+      api.toggleFav(id, fav).then((d) => {
+        if (d?.favorites) { const srv = new Set<string>((d.favorites as any[]).map(String)); setFavorites(srv); saveFavsLocal(srv); }
+        const p = loadFavPending(); if (p[id] === fav) { delete p[id]; saveFavPending(p); } // acked
+      }).catch(() => { /* offline: stays in pending, replayed by refreshFavs on reconnect */ });
+      return n;
+    });
   }, []);
 
   useEffect(() => {
@@ -459,23 +513,37 @@ function App() {
     const pull = () => api.usage().then((d) => setUsage5h(d?.available ? { output5h: d.output5h, url: d.url } : null)).catch(() => {});
     pull(); const t = setInterval(pull, 120000); return () => clearInterval(t);
   }, []);
+  // Live conversation statuses (thinking / waiting) for the list indicators + queued-message set.
+  useEffect(() => {
+    const pull = () => { if (navigator.onLine) api.statuses().then((d) => setStatuses(d?.statuses || {})).catch(() => {}); void refreshQueue(); };
+    pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
+  }, [refreshQueue]);
+  // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
+  useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, markRead]);
 
   // PWA update check: poll the server build id; if it changed since load, offer a reload.
   // Content-hashed assets + no-store index mean the reload gets everything fresh.
   useEffect(() => {
     let baseline: string | null = null;
     let stop = false;
-    const check = async () => {
+    const check = async (foreground = false) => {
       try {
         const v = (await (await fetch("/app/api/version", { cache: "no-store" })).text()).trim();
         if (!v) return;
-        if (baseline === null) baseline = v;
-        else if (v !== baseline) setUpdateAvail(true);
+        if (baseline === null) { baseline = v; return; }
+        if (v !== baseline) {
+          // On returning to the foreground (app was backgrounded/asleep), auto-update immediately —
+          // unless there's an unsent draft, in which case just offer the reload toast.
+          if (foreground && !(taRef.current?.value || "").trim()) { void hardRefresh(); return; }
+          setUpdateAvail(true);
+        }
       } catch { /* offline / transient — ignore */ }
     };
     check();
     const iv = setInterval(() => { if (!stop) check(); }, 60_000);
-    return () => { stop = true; clearInterval(iv); };
+    const onVis = () => { if (document.visibilityState === "visible") void check(true); }; // check the moment it's reopened
+    document.addEventListener("visibilitychange", onVis);
+    return () => { stop = true; clearInterval(iv); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
   // Register the shared service worker from the app too — the terminal overlay is the only
@@ -498,6 +566,19 @@ function App() {
     location.reload();
   };
 
+  // Edge-swipe to open the sidebar (right from the left edge) and swipe-left to close it. Only
+  // horizontal gestures act; vertical scrolls and stationary long-presses are ignored.
+  const swipe = useRef<{ x: number; y: number; edge: boolean } | null>(null);
+  const onAppTouchStart = (e: React.TouchEvent) => { const t = e.touches[0]; if (!t) return; swipe.current = { x: t.clientX, y: t.clientY, edge: t.clientX <= 30 }; };
+  const onAppTouchMove = (e: React.TouchEvent) => {
+    const s = swipe.current, t = e.touches[0]; if (!s || !t) return;
+    const dx = t.clientX - s.x, dy = t.clientY - s.y;
+    if (Math.abs(dy) > 45) { swipe.current = null; return; } // vertical scroll — not a drawer gesture
+    if (!drawer && s.edge && dx > 55) { setDrawer(true); swipe.current = null; }
+    else if (drawer && dx < -55) { setDrawer(false); swipe.current = null; }
+  };
+  const onAppTouchEnd = () => { swipe.current = null; };
+
   // autoscroll: jump to the end when a conversation is opened, else follow only if near bottom
   useEffect(() => {
     const el = scrollRef.current; if (!el) return;
@@ -519,10 +600,16 @@ function App() {
   const handleEvent = useCallback((e: AppEvent) => {
     for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode (streaming text, result, error)
     if (e.t === "init") { setActiveId(e.sessionId); activeIdRef.current = e.sessionId; history.replaceState(null, "", `/app?c=${e.sessionId}`); setTimeout(refreshConvs, 400); return; }
-    // user echo: if we already rendered this turn optimistically, drop the echo
-    if (e.t === "user") { if (pendingUser.current[0] === e.text) { pendingUser.current.shift(); return; } setItems((it) => applyEvent(it, e)); return; }
+    // user echo: drop it if we already rendered this turn optimistically (match by value, any
+    // position), and guard against a stream reopen replaying a turn already at the tail.
+    if (e.t === "user") {
+      const idx = pendingUser.current.indexOf(e.text);
+      if (idx !== -1) { pendingUser.current.splice(idx, 1); return; }
+      setItems((it) => { const last = it[it.length - 1]; return last && last.kind === "user" && last.text === e.text ? it : applyEvent(it, e); });
+      return;
+    }
     if (e.t === "busy") { setBusy(e.busy); return; }
-    if (e.t === "result") { setBusy(false); setTimeout(refreshConvs, 500); return; }
+    if (e.t === "result") { setBusy(false); setItems((it) => applyEvent(it, e)); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage
     if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
     if (e.t === "closed") { return; }
     setItems((it) => applyEvent(it, e));
@@ -541,13 +628,8 @@ function App() {
     es.onerror = () => { /* EventSource auto-reconnects; buffer + _seq dedupe keeps us consistent */ };
   }, [handleEvent]);
 
-  const loadConv = useCallback(async (id: string, highlight?: string) => {
-    closeStream();
-    setDrawer(false); setBusy(false);
-    let d: any = null;
-    try { d = await api.conversation(id); offline.cacheConversation(id, d); } // cache for offline
-    catch { d = await offline.getCachedConversation(id); } // offline: serve from cache
-    if (!d) { setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); setActiveId(id); history.replaceState(null, "", `/app?c=${id}`); return; }
+  // Render one conversation payload (from network or cache) into the view.
+  const applyConv = useCallback((id: string, d: any, highlight?: string) => {
     let built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
     // Reopening a LIVE conversation (e.g. one blocked on an ask_user while you were away):
     // drop any unanswered ask rebuilt from the transcript (its id can't unblock the tool) and
@@ -560,13 +642,32 @@ function App() {
         for (const a of pending) built.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
       }
     }
-    if (highlight) highlightRef.current = highlight; else forceBottom.current = true; // jump to the match, else to the end
-    setItems(built); setActiveId(id); activeIdRef.current = id;
-    setBusy(!!d.busy);
-    cwdRef.current = d.cwd || defaultCwd;
-    history.replaceState(null, "", `/app?c=${id}`);
+    if (highlight) highlightRef.current = highlight; else forceBottom.current = true;
+    setItems(built); setBusy(!!d.busy); cwdRef.current = d.cwd || defaultCwd;
     if (d.live) openStream(id, true); // reconnect to a live conversation (streams follow-up + ask answers)
   }, [defaultCwd, openStream]);
+
+  const loadConv = useCallback(async (id: string, highlight?: string) => {
+    closeStream();
+    setDrawer(false); setBusy(false);
+    // Switch INSTANTLY: set active + paint the cached copy right away, then refresh from the network
+    // in the background and show a loader until it lands. On a weak link this avoids the long block
+    // that made switching feel frozen.
+    setActiveId(id); activeIdRef.current = id;
+    history.replaceState(null, "", `/app?c=${id}`);
+    const cached = await offline.getCachedConversation(id).catch(() => null);
+    if (cached) applyConv(id, cached, highlight);
+    else setItems([]);
+    if (!navigator.onLine) { if (!cached) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
+    setLoadingConv(true);
+    try {
+      const d = await api.conversation(id);
+      offline.cacheConversation(id, d);
+      if (activeIdRef.current === id) applyConv(id, d, highlight); // ignore if the user already switched away
+    } catch {
+      if (!cached && activeIdRef.current === id) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
+    } finally { if (activeIdRef.current === id) setLoadingConv(false); }
+  }, [applyConv]);
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
@@ -583,17 +684,19 @@ function App() {
         if (r?.id) lastId = r.id;
       } catch { break; } // dropped offline again — leave the rest queued
     }
-    offline.queueCount().then(setQueued);
+    await refreshQueue();
     refreshConvs();
     // reconnect the active conversation's stream so a drained message's reply streams in live
     if (lastId && (lastId === activeIdRef.current || activeIdRef.current === null)) { setActiveId(lastId); activeIdRef.current = lastId; openStream(lastId); }
-  }, [openStream, refreshConvs]);
+  }, [openStream, refreshConvs, refreshQueue]);
 
+  const drainingRef = useRef(false);
   useEffect(() => {
     const goOnline = () => {
       setOnline(true);
       void (async () => {
         await drainQueueUI();
+        refreshFavs(); // flush favourite toggles made while offline
         // Reload the open conversation: while offline it may have shown a partial/uncached view,
         // and a fresh server fetch pulls the full history now that we're back.
         const id = activeIdRef.current;
@@ -603,10 +706,14 @@ function App() {
     const goOffline = () => setOnline(false);
     window.addEventListener("online", goOnline);
     window.addEventListener("offline", goOffline);
-    offline.queueCount().then(setQueued);
+    void refreshQueue();
     if (navigator.onLine) void drainQueueUI(); // send anything left queued from a previous session
-    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
-  }, [drainQueueUI, loadConv]);
+    // Keep trying to drain while ONLINE too: on a weak-but-connected link a send can fail and queue
+    // without an offline->online transition ever firing, which used to strand the queue (and the
+    // "sending N queued" banner) forever. Retry every 8s until it's empty.
+    const t = setInterval(() => { if (navigator.onLine && !drainingRef.current) { drainingRef.current = true; void drainQueueUI().finally(() => { drainingRef.current = false; }); } }, 8000);
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); clearInterval(t); };
+  }, [drainQueueUI, loadConv, refreshFavs, refreshQueue]);
   // #endregion
 
   // #region search: debounced content search (title filtering is instant + client-side below)
@@ -756,8 +863,21 @@ function App() {
     return g;
   }, [convs, favorites]);
 
+  // Per-conversation status for the sidebar dot: queued > thinking > waiting-for-input > unread.
+  const convStatus = (c: Conv): "queued" | "thinking" | "waiting" | "unread" | null => {
+    if (c.pending || queuedIds.has(c.sessionId)) return "queued";
+    const st = statuses[c.sessionId];
+    if (st?.busy) return "thinking";
+    if (st?.waiting) return "waiting";
+    void readTick; // re-read lastRead when it bumps
+    const lr = lastReadRef.current[c.sessionId];
+    if (c.sessionId !== activeId && lr != null && c.mtime > lr) return "unread";
+    return null;
+  };
+  const STATUS_LABEL: Record<string, string> = { queued: "Queued — will send", thinking: "Thinking…", waiting: "Waiting for your input", unread: "Unread activity" };
   const renderConv = (c: Conv) => {
     const fav = favorites.has(c.sessionId);
+    const status = convStatus(c);
     if (c.pending) {
       // Started offline, not sent yet: clock icon + muted, not openable until it drains.
       return (
@@ -770,8 +890,10 @@ function App() {
     }
     return (
       <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId, search.trim() || undefined)} {...longPressBind((x, y) => setConvMenu({ x, y, id: c.sessionId, title: c.title, fav }))}>
-        <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
-        <span className="conv-title">{c.title}</span>
+        {status
+          ? <span className={"conv-status " + status} title={STATUS_LABEL[status]} aria-label={STATUS_LABEL[status]} />
+          : <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+        <span className={"conv-title" + (status === "unread" ? " unread" : "")}>{c.title}</span>
         <button className={"conv-star" + (fav ? " on" : "")} onClick={(e) => { e.stopPropagation(); toggleFav(c.sessionId); }} aria-label={fav ? "Unfavorite" : "Favorite"} title={fav ? "Unfavorite" : "Favorite"}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill={fav ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26" /></svg>
         </button>
@@ -786,7 +908,7 @@ function App() {
   const contentMatches = searchHits.filter((h) => !titleIds.has(h.sessionId));
 
   return (
-    <div className={"app" + (drawer ? " drawer-open" : "")}>
+    <div className={"app" + (drawer ? " drawer-open" : "")} onTouchStart={onAppTouchStart} onTouchMove={onAppTouchMove} onTouchEnd={onAppTouchEnd}>
       {updateAvail && (
         <div className="update-toast" role="status">
           <span>A new version is available.</span>
@@ -915,12 +1037,13 @@ function App() {
             </div>
           )}
         </div>
+        {loadingConv && <div className="load-bar" aria-label="Loading conversation" />}
 
         {(!online || queued > 0) && (
           <div className={"net-banner" + (online ? " sending" : "")}>
             {!online
               ? (queued > 0 ? `Offline — ${queued} message${queued > 1 ? "s" : ""} queued, will send when you reconnect` : "You're offline — cached conversations available")
-              : `Back online — sending ${queued} queued message${queued > 1 ? "s" : ""}…`}
+              : `Sending ${queued} queued message${queued > 1 ? "s" : ""}…`}
           </div>
         )}
         <div className="scroll" ref={scrollRef}>

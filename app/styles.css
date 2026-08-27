@@ -87,6 +87,17 @@ a { color: var(--accent-2); }
 /* Names aren't selectable: a long-press opens the menu instead of grabbing the title text.
    (Messages are deliberately left selectable so you can copy part of one.) */
 .conv-item, .conv-group-label { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+/* Conversation status dot (occupies the icon slot): thinking pulses, waiting/unread solid, queued a ring. */
+.conv-status { flex: 0 0 15px; width: 15px; height: 15px; position: relative; display: inline-block; }
+.conv-status::after { content: ""; position: absolute; top: 50%; left: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; }
+.conv-status.thinking::after { background: var(--accent); animation: ctpulse 1.2s ease-in-out infinite; }
+.conv-status.waiting::after { background: var(--warning, #F59E0B); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning, #F59E0B) 25%, transparent); }
+.conv-status.unread::after { background: var(--accent); }
+.conv-status.queued::after { background: transparent; width: 9px; height: 9px; margin: -4.5px 0 0 -4.5px; border: 2px solid var(--warning, #F59E0B); }
+.conv-title.unread { font-weight: 600; color: var(--text); }
+@keyframes ctpulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.65); } }
+.load-bar { height: 2px; background: linear-gradient(90deg, transparent, var(--accent), transparent); background-size: 40% 100%; background-repeat: no-repeat; animation: loadslide 1.1s ease-in-out infinite; }
+@keyframes loadslide { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
 .conv-item.pending { cursor: default; opacity: .7; }
 .conv-item.pending:hover { background: transparent; color: var(--text-2); }
 .conv-item.pending .conv-ic { color: var(--warning, #F59E0B); }
