@@ -10,9 +10,12 @@ import * as offline from "./offline";
 
 marked.setOptions({ gfm: true, breaks: true });
 
+// Coarse pointer + no hover ≈ phone/tablet. Drives the Enter-to-send vs Enter-newline behaviour.
+const IS_TOUCH = typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+
 // #region types
 type Model = { id: string; label: string };
-type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number };
+type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean };
 type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
   | { t: "text"; text: string; _seq?: number }
@@ -34,7 +37,7 @@ type AppEvent =
 type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
-  | { kind: "thinking"; text: string; tokens?: number }
+  | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "compact" };
@@ -44,7 +47,7 @@ type Item =
 const J = (r: Response) => r.json();
 const api = {
   models: () => fetch("/app/api/models").then(J),
-  convs: () => fetch("/app/api/conversations").then(J),
+  convs: (offset = 0) => fetch(`/app/api/conversations?offset=${offset}`).then(J),
   conversation: (id: string) => fetch(`/app/api/conversation/${encodeURIComponent(id)}`).then(J),
   start: (b: { text: string; resume?: string; model?: string; cwd?: string }) =>
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
@@ -73,6 +76,14 @@ type SearchHit = { sessionId: string; title: string; snippet: string; count: num
 // #endregion
 
 function applyEvent(items: Item[], e: AppEvent): Item[] {
+  // Freeze a live "thinking" block's duration the instant the first non-thinking event lands, so
+  // "Thought for Ns" is fixed once the model stops reasoning (and survives reconnects in state).
+  if (e.t !== "thinking" && e.t !== "thinking_delta" && e.t !== "thinking_progress") {
+    const l = items[items.length - 1];
+    if (l && l.kind === "thinking" && l.started && l.elapsed == null) {
+      items = items.slice(); items[items.length - 1] = { ...l, elapsed: Date.now() - l.started };
+    }
+  }
   const last = items[items.length - 1];
   switch (e.t) {
     case "user": return [...items, { kind: "user", text: e.text }];
@@ -82,10 +93,10 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       return [...items, { kind: "assistant", text: e.text }];
     case "thinking_delta":
       if (last && last.kind === "thinking") { const c = items.slice(); c[c.length - 1] = { ...last, text: last.text + e.text }; return c; }
-      return [...items, { kind: "thinking", text: e.text }];
+      return [...items, { kind: "thinking", text: e.text, started: Date.now() }];
     case "thinking_progress":
       if (last && last.kind === "thinking") { const c = items.slice(); c[c.length - 1] = { ...last, tokens: e.tokens }; return c; }
-      return [...items, { kind: "thinking", text: "", tokens: e.tokens }];
+      return [...items, { kind: "thinking", text: "", tokens: e.tokens, started: Date.now() }];
     case "thinking": return [...items, { kind: "thinking", text: e.text }];
     case "tool_use": return [...items, { kind: "tool", id: e.id, name: e.name, input: e.input }];
     case "tool_result": {
@@ -149,23 +160,39 @@ function Assistant({ text }: { text: string }) {
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+// Thinking indicator. Live: "Thinking… 12s" ticking every second (+ token estimate when the
+// platform sends one). Done: "Thought for 12s · ~340 tokens". Reasoning text, when the platform
+// exposes it (subscription auth usually redacts it), renders below.
+function ThinkingCard({ it, isLast }: { it: Extract<Item, { kind: "thinking" }>; isLast: boolean }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!isLast) return; // only the live block ticks
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [isLast]);
+  const secs = it.started
+    ? (isLast ? Math.max(0, Math.round((now - it.started) / 1000)) : it.elapsed != null ? Math.round(it.elapsed / 1000) : null)
+    : null;
+  const dur = secs == null ? "" : secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+  const tok = it.tokens ? `~${it.tokens} tokens` : "";
+  const label = isLast ? "Thinking" : "Thought";
+  const meta = [isLast ? dur : dur && `for ${dur}`, tok].filter(Boolean).join(" · ");
+  return (
+    <div className={"thinking think-progress" + (isLast ? " live" : "")}>
+      <span className="think-label">{label}</span>
+      {isLast && <span className="think-ellipsis">…</span>}
+      {meta && <span className="think-tok">{meta}</span>}
+      {it.text && <div className="think-text">{it.text}</div>}
+    </div>
+  );
+}
+
 function MessageBlock({ items, i, onAnswer }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void }) {
   const it = items[i];
   if (it.kind === "user") return (<div className="msg"><div className="bubble-user">{it.text}</div></div>);
   if (it.kind === "compact") return <div className="compact-div">conversation compacted</div>;
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
-  if (it.kind === "thinking") {
-    const isLast = i === items.length - 1;
-    if (it.text) return (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>);
-    // subscription auth redacts the reasoning text; show a live indicator with token progress
-    return (
-      <div className={"thinking think-progress" + (isLast ? " live" : "")}>
-        <span className="think-label">{isLast ? "Thinking" : "Thought"}</span>
-        {isLast && <span className="think-ellipsis">…</span>}
-        {it.tokens ? <span className="think-tok">~{it.tokens} tokens</span> : null}
-      </div>
-    );
-  }
+  if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
   if (it.kind === "tool") return <ToolCard it={it} />;
   // assistant — show a role label only when it opens an assistant run
   const prev = items[i - 1];
@@ -198,11 +225,15 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
   const [input, setInput] = useState("");
-  const [attachments, setAttachments] = useState<{ name: string; path: string }[]>([]);
+  const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
+  const [hasMore, setHasMore] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
+  const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
   const [voiceAvail, setVoiceAvail] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -226,11 +257,36 @@ function App() {
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { modelRef.current = model; }, [model]);
 
+  const nextOffsetRef = useRef(0);
+  const loadingMoreRef = useRef(false);
+  // Merge conversation pages, keeping the first row seen per session id (favorites, prepended on
+  // page 0, win over a later recency-page duplicate).
+  const dedupeConvs = (list: Conv[]) => { const seen = new Set<string>(); const out: Conv[] = []; for (const c of list) { if (seen.has(c.sessionId)) continue; seen.add(c.sessionId); out.push(c); } return out; };
   const refreshConvs = useCallback(() => {
-    api.convs()
-      .then((d) => { const list: Conv[] = d.conversations || []; setConvs(list); offline.cacheList(list); })
+    api.convs(0)
+      .then((d) => {
+        const list: Conv[] = d.conversations || [];
+        const favs: Conv[] = d.favorites || [];
+        const merged = dedupeConvs([...favs, ...list]); // favorites always present, even if aged out
+        setConvs(merged); offline.cacheList(merged);
+        nextOffsetRef.current = typeof d.nextOffset === "number" ? d.nextOffset : list.length;
+        setHasMore(!!d.hasMore);
+      })
       .catch(async () => { const cached = await offline.getCachedList<Conv[]>(); if (cached) setConvs(cached); }); // offline: serve the last cached list
   }, []);
+  const loadMoreConvs = useCallback(() => {
+    if (loadingMoreRef.current || !hasMore) return;
+    loadingMoreRef.current = true;
+    api.convs(nextOffsetRef.current)
+      .then((d) => {
+        const more: Conv[] = d.conversations || [];
+        setConvs((prev) => dedupeConvs([...prev, ...more]));
+        nextOffsetRef.current = typeof d.nextOffset === "number" ? d.nextOffset : nextOffsetRef.current;
+        setHasMore(!!d.hasMore);
+      })
+      .catch(() => {})
+      .finally(() => { loadingMoreRef.current = false; });
+  }, [hasMore]);
   const refreshFavs = useCallback(() => { api.favorites().then((d) => setFavorites(new Set(d.favorites || []))).catch(() => {}); }, []);
   const toggleFav = useCallback((id: string) => {
     setFavorites((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); void api.toggleFav(id, !s.has(id)).then((d) => { if (d?.favorites) setFavorites(new Set(d.favorites)); }).catch(() => {}); return n; });
@@ -374,14 +430,23 @@ function App() {
   }, [openStream, refreshConvs]);
 
   useEffect(() => {
-    const goOnline = () => { setOnline(true); void drainQueueUI(); };
+    const goOnline = () => {
+      setOnline(true);
+      void (async () => {
+        await drainQueueUI();
+        // Reload the open conversation: while offline it may have shown a partial/uncached view,
+        // and a fresh server fetch pulls the full history now that we're back.
+        const id = activeIdRef.current;
+        if (id && !id.startsWith("pending-")) void loadConv(id);
+      })();
+    };
     const goOffline = () => setOnline(false);
     window.addEventListener("online", goOnline);
     window.addEventListener("offline", goOffline);
     offline.queueCount().then(setQueued);
     if (navigator.onLine) void drainQueueUI(); // send anything left queued from a previous session
     return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
-  }, [drainQueueUI]);
+  }, [drainQueueUI, loadConv]);
   // #endregion
 
   // #region search: debounced content search (title filtering is instant + client-side below)
@@ -406,7 +471,19 @@ function App() {
     pendingUser.current.push(text);
     setItems((it) => applyEvent(it, { t: "user", text }));
     const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
-    const queue = async () => { await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued); setBusy(false); };
+    const isNewChat = !activeIdRef.current;
+    const queue = async () => {
+      await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued);
+      // A chat STARTED offline has no server id yet, so it wouldn't show anywhere. Drop a local
+      // placeholder into the sidebar, flagged pending, so it's visible + clearly "waiting to send".
+      // refreshConvs() on reconnect (after the queue drains) replaces it with the real conversation.
+      if (isNewChat) {
+        const firstLine = text.replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
+        const pid = "pending-" + Date.now();
+        setConvs((cs) => [{ sessionId: pid, title: firstLine, cwd: cwdRef.current || null, mtime: Date.now(), pending: true }, ...cs]);
+      }
+      setBusy(false);
+    };
     if (typeof navigator !== "undefined" && !navigator.onLine) { await queue(); return null; } // offline: hold it, send on reconnect
     try {
       if (esOpen.current && activeIdRef.current) { await api.send({ id: activeIdRef.current, text }); return activeIdRef.current; }
@@ -472,11 +549,18 @@ function App() {
   };
 
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0]; e.target.value = ""; if (!f) return;
-    try { const r = await api.upload(activeId, f); if (r?.path) setAttachments((a) => [...a, { name: f.name, path: r.path }]); } catch { /* */ }
+    const files = Array.from(e.target.files || []); e.target.value = ""; if (!files.length) return;
+    for (const f of files) {
+      const isImage = f.type.startsWith("image/");
+      const preview = isImage ? URL.createObjectURL(f) : undefined; // local thumbnail, no server round-trip
+      try { const r = await api.upload(activeId, f); if (r?.path) setAttachments((a) => [...a, { name: f.name, path: r.path, isImage, preview }]); }
+      catch { if (preview) URL.revokeObjectURL(preview); }
+    }
   };
 
-  const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void doSend(); } };
+  // Desktop: Enter sends, Shift+Enter is a newline. Touch devices (phone/tablet): Enter is always a
+  // newline — sending is the dedicated send button, so the on-screen keyboard's return key composes.
+  const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey && !IS_TOUCH) { e.preventDefault(); void doSend(); } };
   const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => { setInput(e.target.value); const ta = e.target; ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; };
 
   const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || model || "Model";
@@ -494,6 +578,16 @@ function App() {
 
   const renderConv = (c: Conv) => {
     const fav = favorites.has(c.sessionId);
+    if (c.pending) {
+      // Started offline, not sent yet: clock icon + muted, not openable until it drains.
+      return (
+        <div key={c.sessionId} className="conv-item pending" title={"Waiting to send — " + c.title}>
+          <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.7" /><path d="M12 7v5l3 2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+          <span className="conv-title">{c.title}</span>
+          <span className="conv-pending-tag">Queued</span>
+        </div>
+      );
+    }
     return (
       <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId, search.trim() || undefined)}>
         <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
@@ -536,9 +630,31 @@ function App() {
           </div>
         </div>
       )}
+      {settingsOpen && (
+        <div className="modal-scrim" onClick={() => setSettingsOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">Settings<button className="modal-x" onClick={() => setSettingsOpen(false)} aria-label="Close">×</button></div>
+            <div className="settings-body">
+              <div className="settings-section">Voice</div>
+              <label className="settings-row">
+                <span className="settings-row-main">
+                  <span className="settings-row-title">Speak only the final response</span>
+                  <span className="settings-row-desc">In voice mode, stay quiet while Claude works and read back just the finished answer, not the running commentary.</span>
+                </span>
+                <button role="switch" aria-checked={speakFinalOnly} className={"toggle" + (speakFinalOnly ? " on" : "")} onClick={() => setSpeakFinal(!speakFinalOnly)}><span className="knob" /></button>
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="scrim" onClick={() => setDrawer(false)} />
       <aside className="sidebar">
-        <div className="sb-head"><span className="brand">Claude</span></div>
+        <div className="sb-head">
+          <span className="brand">Claude</span>
+          <button className="sb-gear" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
+          </button>
+        </div>
         <button className="new-chat" onClick={newChat}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
           New chat
@@ -548,7 +664,11 @@ function App() {
           <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search chats & messages" />
           {search && <button className="sb-search-x" onClick={() => setSearch("")} aria-label="Clear search">×</button>}
         </div>
-        <div className="conv-list">
+        <div className="conv-list" onScroll={(e) => {
+          if (q) return; // search view isn't paginated
+          const el = e.currentTarget;
+          if (el.scrollHeight - el.scrollTop - el.clientHeight < 320) loadMoreConvs();
+        }}>
           {q ? (
             <div>
               {titleMatches.length > 0 && (<><div className="conv-group-label">Conversations</div>{titleMatches.map(renderConv)}</>)}
@@ -576,6 +696,7 @@ function App() {
                 </div>
               ))}
               {!convs.length && <div className="conv-group-label">No conversations yet</div>}
+              {hasMore && <div className="conv-group-label conv-more" onClick={loadMoreConvs}>Load more…</div>}
             </>
           )}
         </div>
@@ -648,14 +769,26 @@ function App() {
           <div className="composer">
             {attachments.length > 0 && (
               <div className="attach-row">
-                {attachments.map((a, i) => (<span key={i} className="chip">📎 {a.name}<button onClick={() => setAttachments((x) => x.filter((_, j) => j !== i))}>×</button></span>))}
+                {attachments.map((a, i) => (
+                  <span key={i} className={"chip" + (a.isImage ? " chip-img" : "")}>
+                    {a.isImage && a.preview ? <img className="chip-thumb" src={a.preview} alt={a.name} /> : "📎 "}
+                    <span className="chip-name">{a.name}</span>
+                    <button onClick={() => { const rem = attachments[i]; if (rem?.preview) URL.revokeObjectURL(rem.preview); setAttachments((x) => x.filter((_, j) => j !== i)); }}>×</button>
+                  </span>
+                ))}
               </div>
             )}
             <textarea ref={taRef} value={input} onChange={onInput} onKeyDown={onKey} rows={1} placeholder="Reply to Claude..." />
             <div className="composer-actions">
+              {/* Photo/gallery picker: accept=image/* makes Android/iOS open the photo library (with a
+                  camera option), not the file browser. The paperclip stays for any-file attachments. */}
+              <label className="act-btn" title="Add photo">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" strokeWidth="1.7" /><circle cx="8.5" cy="10" r="1.6" fill="currentColor" /><path d="M4 17l5-4 4 3 3-2 4 3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                <input type="file" accept="image/*" multiple style={{ display: "none" }} onChange={onFile} />
+              </label>
               <label className="act-btn" title="Attach file">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 12.5l-8.5 8.5a5 5 0 01-7-7L14 5.5a3.3 3.3 0 014.7 4.7l-9.2 9.2a1.6 1.6 0 01-2.3-2.3l8.5-8.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                <input type="file" style={{ display: "none" }} onChange={onFile} />
+                <input type="file" multiple style={{ display: "none" }} onChange={onFile} />
               </label>
               <div className="spacer" />
               {voiceAvail && (
@@ -673,10 +806,9 @@ function App() {
               </button>
             </div>
           </div>
-          <div className="hint">Claude runs with tools enabled in {cwdRef.current || "the default folder"}. Enter to send, Shift+Enter for a new line.</div>
         </div>
       </main>
-      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} />
+      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} />
     </div>
   );
 }

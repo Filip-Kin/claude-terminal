@@ -53,6 +53,17 @@ self.addEventListener("fetch", (event) => {
     })());
     return;
   }
+  // Root navigation (the terminal) while OFFLINE: ttyd's shell + WebSocket can't load without the
+  // network and nothing caches them, so a cold PWA launch would just error. Redirect to /app, which
+  // the SW serves from cache. Only fires when the network fetch actually fails (i.e. offline); when
+  // online this passes straight through to the terminal.
+  if ((p === "/" || p === "/index.html") && req.mode === "navigate") {
+    event.respondWith((async () => {
+      try { return await fetch(req); }
+      catch { return Response.redirect("/app", 302); }
+    })());
+    return;
+  }
   // everything else: not ours — leave the network alone
 });
 

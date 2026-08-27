@@ -71,6 +71,23 @@ a { color: var(--accent-2); }
 .conv-star:hover { background: var(--bg-3); color: var(--accent); }
 @media (hover: none) { .conv-star { opacity: .5; } .conv-star.on { opacity: 1; } } /* touch: always tappable */
 .conv-item.active { background: var(--bg-3); color: var(--text); }
+.sb-head { display: flex; align-items: center; gap: 8px; }
+.sb-gear { flex: 0 0 auto; background: none; border: 0; color: var(--text-3); cursor: pointer; padding: 4px; border-radius: 7px; display: inline-flex; }
+.sb-gear:hover { color: var(--text); background: var(--bg-2); }
+.settings-body { padding: 6px 4px 4px; }
+.settings-section { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; padding: 8px 8px 6px; }
+.settings-row { display: flex; align-items: center; gap: 14px; padding: 10px 8px; }
+.settings-row-main { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+.settings-row-title { font-size: 14px; font-weight: 500; color: var(--text); }
+.settings-row-desc { font-size: 12px; color: var(--text-3); line-height: 1.4; }
+.toggle { flex: 0 0 auto; width: 40px; height: 24px; border-radius: 999px; border: 0; background: var(--bg-3); position: relative; cursor: pointer; transition: background .15s; }
+.toggle.on { background: var(--accent); }
+.toggle .knob { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.toggle.on .knob { transform: translateX(16px); }
+.conv-item.pending { cursor: default; opacity: .7; }
+.conv-item.pending:hover { background: transparent; color: var(--text-2); }
+.conv-item.pending .conv-ic { color: var(--warning, #F59E0B); }
+.conv-pending-tag { flex: 0 0 auto; font-size: 10px; font-weight: 600; letter-spacing: .04em; color: var(--warning, #F59E0B); border: 1px solid var(--warning, #F59E0B); border-radius: 5px; padding: 1px 5px; opacity: .85; }
 .sb-foot { padding: 10px 12px; border-top: 1px solid var(--line-2); }
 .term-link {
   display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%;
@@ -174,8 +191,9 @@ a { color: var(--accent-2); }
 .tool-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-top: 10px; }
 
 .thinking { color: var(--text-3); font-style: italic; font-size: 13.5px; border-left: 2px solid var(--line); padding-left: 12px; margin: 0 0 12px; white-space: pre-wrap; }
-.think-label { font-style: normal; font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-3); font-weight: 600; margin-bottom: 3px; opacity: .8; }
-.think-progress { display: flex; align-items: center; gap: 8px; font-style: normal; }
+.think-label { font-style: normal; font-size: 12px; letter-spacing: 0; color: var(--text-3); font-weight: 600; margin-bottom: 3px; opacity: .9; }
+.think-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-style: normal; }
+.think-text { flex-basis: 100%; font-style: italic; font-size: 13px; margin-top: 4px; white-space: pre-wrap; color: var(--text-3); }
 .think-progress .think-label { margin-bottom: 0; }
 .think-progress.live .think-label { color: var(--accent); opacity: 1; }
 .think-progress .think-ellipsis { color: var(--accent); animation: blink 1.2s infinite both; }
@@ -202,6 +220,10 @@ a { color: var(--accent-2); }
 .attach-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; padding: 3px 8px; font-size: 12px; color: var(--text-2); }
 .chip button { background: none; border: none; color: var(--text-3); padding: 0; line-height: 1; font-size: 14px; }
+.chip-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-img { padding: 3px 8px 3px 3px; }
+.chip-thumb { width: 28px; height: 28px; object-fit: cover; border-radius: 5px; flex: 0 0 auto; }
+.msg-img { max-width: min(260px, 70%); max-height: 260px; border-radius: 10px; margin: 4px 0; display: block; border: 1px solid var(--line); }
 .composer textarea {
   resize: none; border: none; outline: none; background: transparent; color: var(--text);
   font-family: inherit; font-size: 15px; line-height: 1.5; max-height: 220px; padding: 6px 0; width: 100%;

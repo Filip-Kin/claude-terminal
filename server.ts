@@ -575,6 +575,9 @@ const appCtx: AppCtx = {
   publicDir: PUBLIC_DIR,
   dataDir: cfg.dataDir,
   historyHide: cfg.historyHide || [],
+  // Agent/automation project dirs (billed to a non-owner extraUser, e.g. stonkbot/sleeper): hide
+  // them wholesale from the chat-app list, same as listTranscripts() does for the terminal drawer.
+  hideProjectDirs: (() => { const a: string[] = []; for (const dirs of Object.values(cfg.extraUsers || {})) for (const d of dirs as string[]) a.push(d); return a; })(),
   defaultCwd: SPAWN_CWD,
   models: APP_MODELS,
   moreModels: APP_MORE_MODELS,

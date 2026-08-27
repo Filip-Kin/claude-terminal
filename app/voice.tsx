@@ -122,7 +122,7 @@ async function pickMime(): Promise<string> {
   return ""; // let the browser choose (iOS often returns "" -> audio/mp4)
 }
 
-export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer }: { bridge: VoiceBridge; open: boolean; onClose: () => void; pendingAsk?: AskItem; onAnswer?: (askId: string, answer: string) => void }) {
+export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFinalOnly }: { bridge: VoiceBridge; open: boolean; onClose: () => void; pendingAsk?: AskItem; onAnswer?: (askId: string, answer: string) => void; speakFinalOnly?: boolean }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [heard, setHeard] = useState(""); // last user transcript
   const [caption, setCaption] = useState(""); // live assistant caption (what's being said)
@@ -131,6 +131,8 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer }: { bri
 
   const phaseRef = useRef<Phase>("idle");
   const setPhaseR = (p: Phase) => { phaseRef.current = p; setPhase(p); };
+  const speakFinalRef = useRef(!!speakFinalOnly); // read latest inside the stable subscribe closure
+  useEffect(() => { speakFinalRef.current = !!speakFinalOnly; }, [speakFinalOnly]);
 
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -276,15 +278,23 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer }: { bri
         if (!t) return;
         setCaption((c) => (c + t).slice(-600));
         sentBufRef.current += t;
+        // "Speak only the final response" mode: buffer the whole reply silently (still shown as a
+        // caption), and speak nothing until the turn completes — no interim/tool-narration chatter.
+        if (speakFinalRef.current) return;
         const [sents, rest] = takeSentences(sentBufRef.current);
         sentBufRef.current = rest;
         for (const s of sents) speakSentence(s);
       } else if (e.t === "result" || (e.t === "busy" && (e as any).busy === false)) {
-        // turn complete: flush any trailing partial sentence
+        // turn complete: speak the buffered final reply (final-only mode), else flush the trailing partial
         if (!turnDoneRef.current) {
           turnDoneRef.current = true;
-          const tail = sentBufRef.current.trim(); sentBufRef.current = "";
-          if (tail) speakSentence(tail);
+          const buf = sentBufRef.current.trim(); sentBufRef.current = "";
+          if (!buf) { /* nothing to say */ }
+          else if (speakFinalRef.current) {
+            const [sents, rest] = takeSentences(buf + " "); // chunk the whole reply for ordered playback
+            for (const s of sents) speakSentence(s);
+            const last = rest.trim(); if (last) speakSentence(last);
+          } else speakSentence(buf);
         }
       } else if (e.t === "error") {
         setErr((e as any).message || "error");

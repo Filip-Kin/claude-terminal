@@ -8,11 +8,22 @@
   // surface, jump there (its default view, NOT a specific conversation). Otherwise stay here.
   try {
     var _sp = new URLSearchParams(location.search);
-    if (_sp.get("home") === "1") {
-      var _last = null; try { _last = localStorage.getItem("ct-last-surface"); } catch (e) {}
-      if (_last === "/app") { location.replace("/app"); return; }
-      try { history.replaceState(null, "", location.pathname); } catch (e) {} // drop the marker
-    }
+    var _last = null; try { _last = localStorage.getItem("ct-last-surface"); } catch (e) {}
+    var _standalone = false;
+    try { _standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true; } catch (e) {}
+    var _navType = "";
+    try { var _nav = performance.getEntriesByType("navigation")[0]; _navType = _nav ? _nav.type : ""; } catch (e) {}
+    // Treat this as a cold PWA launch (so honour "reopen last surface") on EITHER signal:
+    //  - the start_url marker "?home=1" (a correctly-updated install), or
+    //  - a standalone top-level launch with no same-app referrer and not a reload. This covers
+    //    OLD installs whose baked start_url predates the marker — Android WebAPK / iOS bake the
+    //    start_url at install and rarely refresh it, so the marker alone would miss them. A later
+    //    in-app hop to the terminal carries a referrer, and a manual reload reports type "reload",
+    //    so neither trips the fallback. (last-surface is also rewritten to "/" below, so once you
+    //    are on the terminal a reload can't bounce you away.)
+    var _cold = _sp.get("home") === "1" || (_standalone && !document.referrer && _navType !== "reload");
+    if (_cold && _last === "/app") { location.replace("/app"); return; }
+    if (_sp.get("home") === "1") { try { history.replaceState(null, "", location.pathname); } catch (e) {} } // drop the marker
     try { localStorage.setItem("ct-last-surface", "/"); } catch (e) {} // we're on the terminal now
   } catch (e) {}
   // #endregion

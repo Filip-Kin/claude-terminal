@@ -15,6 +15,9 @@ export interface AppCtx {
   publicDir: string; // PUBLIC_DIR; SPA lives in <publicDir>/app
   dataDir: string; // ~/.claude/projects
   historyHide: string[]; // cwds to hide (from cfg.historyHide)
+  hideProjectDirs: string[]; // absolute project-dir paths to exclude wholesale (agents billed to
+  // extraUsers, e.g. stonkbot/sleeper). Matched on the DIR, not the transcript, so their thousands
+  // of automated runs never even get read — cheap, and they can't swamp the recent window.
   defaultCwd: string; // cwd for a brand-new chat (cfg.spawnCwd || HOME)
   models: { id: string; label: string }[]; // quick picks
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
@@ -63,6 +66,9 @@ function listConversations(ctx: AppCtx): ConvRow[] {
   for (const project of projects) {
     if (project.startsWith("-tmp-")) continue; // scratch/ephemeral cwds
     const pdir = join(ctx.dataDir, project);
+    // Skip whole agent/automation project dirs (billed to a non-owner extraUser). This is the same
+    // exclusion the terminal /history drawer already applies, mirrored here for the chat app.
+    if (ctx.hideProjectDirs.some((d) => pdir === d || pdir.startsWith(d + "/"))) continue;
     let files: string[] = [];
     try { files = readdirSync(pdir); } catch { continue; }
     for (const f of files) {
@@ -237,18 +243,43 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   if (req.method === "GET" && path === "/app/api/conversations") {
+    // Paginated (infinite scroll). ?offset=N walks the mtime-sorted row list; ?limit caps the
+    // page. Rows without a usable title are skipped, so nextOffset tracks rows CONSUMED (not
+    // items emitted) and the client feeds it straight back for the next page.
+    const url = new URL(req.url);
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 40, 1), 100);
+    const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
     const rows = listConversations(ctx);
     const titles = await loadTitles(ctx.titlesFile);
     const out: ConvRow[] = [];
-    for (const r of rows.slice(0, 200)) {
+    let i = offset;
+    for (; i < rows.length && out.length < limit; i++) {
+      const r = rows[i];
       const meta = await convMeta(r.path);
       if (ctx.historyHide.some((h) => (meta.cwd || "").startsWith(h))) continue;
       const title = titles[r.sessionId] || meta.title; // user rename wins
       if (!title) continue;
       out.push({ sessionId: r.sessionId, title, cwd: meta.cwd, mtime: r.mtime, project: r.project });
-      if (out.length >= 100) break;
     }
-    return jsonRes({ conversations: out }, ctx, req);
+    const hasMore = i < rows.length;
+    // First page always carries the favorited conversations too — even if a starred chat has aged
+    // out of the recent window it must never vanish from the Favorites section.
+    let favorites: ConvRow[] = [];
+    if (offset === 0) {
+      const favIds = await loadFavs(ctx.favoritesFile);
+      const present = new Set(out.map((o) => o.sessionId));
+      for (const id of favIds) {
+        if (present.has(id)) continue;
+        const t = findTranscript(ctx, id);
+        if (!t) continue;
+        const meta = await convMeta(t.path);
+        const title = titles[id] || meta.title;
+        if (!title) continue;
+        let mtime = 0; try { mtime = statSync(t.path).mtimeMs; } catch {}
+        favorites.push({ sessionId: id, title, cwd: meta.cwd, mtime, project: t.project });
+      }
+    }
+    return jsonRes({ conversations: out, favorites, nextOffset: i, hasMore }, ctx, req);
   }
 
   // Full-text message search across conversations. Title matching is done client-side
