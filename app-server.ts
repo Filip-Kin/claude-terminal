@@ -250,6 +250,41 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     return jsonRes({ conversations: out }, ctx, req);
   }
 
+  // Full-text message search across conversations. Title matching is done client-side
+  // (instant, offline-friendly); this searches message CONTENT and returns a snippet +
+  // match count per conversation so you can find a specific message.
+  if (req.method === "GET" && path === "/app/api/search") {
+    const q = (new URL(req.url).searchParams.get("q") || "").trim().toLowerCase();
+    if (q.length < 2) return jsonRes({ results: [], q }, ctx, req);
+    const titles = await loadTitles(ctx.titlesFile);
+    const rows = listConversations(ctx).slice(0, 200); // recent-first
+    const results: { sessionId: string; title: string; cwd: string | null; mtime: number; snippet: string; count: number }[] = [];
+    for (const r of rows) {
+      let text: string;
+      try { text = await Bun.file(r.path).text(); } catch { continue; }
+      if (!text.toLowerCase().includes(q)) continue; // cheap reject before per-line parse
+      let count = 0, snippet = "";
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        let o: any; try { o = JSON.parse(line); } catch { continue; }
+        if (o.type !== "user" && o.type !== "assistant") continue;
+        const c = o.message?.content;
+        const msg = typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join(" ") : "";
+        if (!msg) continue;
+        const idx = msg.toLowerCase().indexOf(q);
+        if (idx < 0) continue;
+        count++;
+        if (!snippet) { const s = Math.max(0, idx - 40); snippet = (s > 0 ? "…" : "") + msg.slice(s, idx + q.length + 70).replace(/\s+/g, " ").trim() + "…"; }
+      }
+      if (!count) continue; // matched only in system/metadata lines
+      const meta = await convMeta(r.path);
+      if (ctx.historyHide.some((h) => (meta.cwd || "").startsWith(h))) continue;
+      results.push({ sessionId: r.sessionId, title: titles[r.sessionId] || meta.title || "(untitled)", cwd: meta.cwd, mtime: r.mtime, snippet, count });
+      if (results.length >= 40) break;
+    }
+    return jsonRes({ results, q }, ctx, req);
+  }
+
   // Replay a past conversation into the normalized event list the UI renders.
   if (req.method === "GET" && path.startsWith("/app/api/conversation/")) {
     const id = decodeURIComponent(path.slice("/app/api/conversation/".length));
