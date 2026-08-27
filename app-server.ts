@@ -8,6 +8,8 @@
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { getOrCreate, get, replayTranscript, type AppEvent, type AskNotifier } from "./app-runner";
+import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
+import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 
 export interface AppCtx {
   allowed: (req: Request) => boolean;
@@ -23,6 +25,8 @@ export interface AppCtx {
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
   favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
   titlesFile: string; // JSON map {sessionId: customTitle} — user-renamed conversations
+  mcpFile: string; // JSON map {name: McpServerConfig} — MCP servers the SDK connects for /app chats
+  claudeDir: string; // ~/.claude — for memory (CLAUDE.md) + skills management
   sttUrl?: string; // local Whisper service base URL (loopback); enables hands-free voice in
   ttsUrl?: string; // local Kokoro service base URL (loopback); enables voice out
   notifyAsk?: AskNotifier; // push a PWA notification when Claude asks and no client is watching
@@ -179,6 +183,89 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
 
   // --- API ---
   if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, moreModels: ctx.moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl) }, ctx, req);
+
+  // --- MCP server management (the tools the LLM can call in /app chats) ---
+  // List persisted servers; if ?id=<session> names a LIVE conversation, also return its live
+  // per-server status (connected / failed / needs-auth / pending / disabled) + tools.
+  if (req.method === "GET" && path === "/app/api/mcp") {
+    const servers = await loadMcp(ctx.mcpFile);
+    const id = new URL(req.url).searchParams.get("id") || "";
+    const live = id ? get(id) : undefined;
+    const status = live ? await live.mcpStatus() : [];
+    return jsonRes({ servers, status, live: !!live }, ctx, req);
+  }
+  // Add or update a server: { name, config, applyTo? }. Takes effect on the next new chat; pass
+  // applyTo=<id> to also push it live into that running conversation via setMcpServers.
+  if (req.method === "POST" && path === "/app/api/mcp") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const res = await upsertServer(ctx.mcpFile, String(b.name || ""), b.config);
+    if (!res.ok) return jsonRes({ error: res.error }, ctx, req, 400);
+    let applied: unknown = null;
+    if (b.applyTo) { const live = get(String(b.applyTo)); if (live) applied = await live.applyMcpServers(await mcpServersForQuery(ctx.mcpFile)); }
+    return jsonRes({ ok: true, servers: res.servers, applied }, ctx, req);
+  }
+  // Remove a server by name: { name, applyTo? }.
+  if (req.method === "POST" && path === "/app/api/mcp/delete") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const name = String(b.name || "");
+    if (!name) return jsonRes({ error: "name required" }, ctx, req, 400);
+    const servers = await removeServer(ctx.mcpFile, name);
+    let applied: unknown = null;
+    if (b.applyTo) { const live = get(String(b.applyTo)); if (live) applied = await live.applyMcpServers(await mcpServersForQuery(ctx.mcpFile)); }
+    return jsonRes({ ok: true, servers, applied }, ctx, req);
+  }
+  // Push the current persisted set live into a running conversation without restarting it.
+  if (req.method === "POST" && path === "/app/api/mcp/apply") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const live = b.id ? get(String(b.id)) : undefined;
+    if (!live) return jsonRes({ error: "no live conversation for id" }, ctx, req, 409);
+    const applied = await live.applyMcpServers(await mcpServersForQuery(ctx.mcpFile));
+    return jsonRes({ ok: true, applied }, ctx, req);
+  }
+
+  // --- Memory management (~/.claude memory files) — all paths guarded to ~/.claude ---
+  const msCtx: MemSkillCtx = { dataDir: ctx.dataDir, claudeDir: ctx.claudeDir };
+  if (req.method === "GET" && path === "/app/api/memory") {
+    return jsonRes({ projects: listMemory(msCtx) }, ctx, req);
+  }
+  if (req.method === "GET" && path === "/app/api/memory/file") {
+    const p = new URL(req.url).searchParams.get("path") || "";
+    try { return jsonRes(await readMemory(msCtx, p), ctx, req); }
+    catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
+  }
+  if (req.method === "POST" && path === "/app/api/memory/file") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    try { const r = await writeMemory(msCtx, String(b.path || ""), String(b.content ?? "")); return jsonRes({ ok: true, ...r }, ctx, req); }
+    catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
+  }
+
+  // --- Skills management (~/.claude/skills) ---
+  // Enable/disable is a disk toggle (SKILL.md <-> SKILL.md.disabled) so a live reloadSkills()
+  // reflects it and every other (incl. plugin) skill is untouched.
+  if (req.method === "GET" && path === "/app/api/skills") {
+    return jsonRes({ skills: listSkills(msCtx) }, ctx, req);
+  }
+  if (req.method === "GET" && path === "/app/api/skill") {
+    const name = new URL(req.url).searchParams.get("name") || "";
+    try { return jsonRes(await readSkill(msCtx, name), ctx, req); }
+    catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
+  }
+  if (req.method === "POST" && path === "/app/api/skill") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    try {
+      const r = await writeSkill(msCtx, String(b.name || ""), String(b.content ?? ""), !!b.create);
+      if (b.reloadId) { const live = get(String(b.reloadId)); if (live) await live.reloadSkills(); } // pick up the change live
+      return jsonRes({ ok: true, ...r }, ctx, req);
+    } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
+  }
+  if (req.method === "POST" && path === "/app/api/skill/enabled") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    try {
+      const r = await setSkillEnabled(msCtx, String(b.name || ""), !!b.enabled);
+      if (b.reloadId) { const live = get(String(b.reloadId)); if (live) await live.reloadSkills(); }
+      return jsonRes({ ok: true, ...r }, ctx, req);
+    } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
+  }
 
   // --- Voice mode proxies (owner-gated above). Forward to the loopback Whisper/Kokoro
   //     services so the mic audio + synthesized speech never leave the box unproxied. ---
@@ -359,7 +446,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
     if (existing) { existing.send(text); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
-    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk });
+    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile });
     void conv.run(text);
     return jsonRes({ id: conv.id, cwd, model: model || null }, ctx, req);
   }
