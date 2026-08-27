@@ -59,6 +59,9 @@ export class Conversation {
   private closed = false;
   private subs = new Set<Sub>();
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
+  private runStart = 0; // index in `log` where the CURRENT turn began — new subscribers only
+  // get this turn's events, not the whole multi-turn history (which the client already has
+  // from the transcript). Otherwise reopening a live conversation replays every prior turn.
   private seqCounter = 0; // stable per-conversation sequence so a reconnect can dedupe
 
   constructor(id: string, opts: ConvOpts) {
@@ -70,14 +73,17 @@ export class Conversation {
 
   subscribe(fn: Sub): () => void {
     this.subs.add(fn);
-    for (const e of this.log) fn(e); // catch the new listener up on this run
+    // Replay only the CURRENT turn (from the last turn boundary), so a client that reopens
+    // an already-live conversation doesn't get every prior turn re-injected. The client has
+    // the earlier turns from the transcript, and _seq dedupe covers mid-turn reconnects.
+    for (let i = this.runStart; i < this.log.length; i++) fn(this.log[i]);
     return () => this.subs.delete(fn);
   }
 
   private emit(e: AppEvent) {
     (e as any)._seq = this.seqCounter++;
     this.log.push(e);
-    if (this.log.length > 5000) this.log.splice(0, this.log.length - 5000);
+    if (this.log.length > 5000) { const drop = this.log.length - 5000; this.log.splice(0, drop); this.runStart = Math.max(0, this.runStart - drop); }
     for (const s of this.subs) {
       try { s(e); } catch {}
     }
@@ -89,6 +95,7 @@ export class Conversation {
     if (this.closed) return;
     this.lastActivity = Date.now();
     this.busy = true;
+    this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
     this.emit({ t: "user", text });
     this.emit({ t: "busy", busy: true });
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
@@ -114,6 +121,7 @@ export class Conversation {
   private async *inputGen(first?: string): AsyncGenerator<SDKUserMessage> {
     if (first !== undefined) {
       this.busy = true;
+      this.runStart = this.log.length; // first turn's replay boundary
       this.emit({ t: "user", text: first });
       this.emit({ t: "busy", busy: true });
       yield { type: "user", message: { role: "user", content: first }, parent_tool_use_id: null };

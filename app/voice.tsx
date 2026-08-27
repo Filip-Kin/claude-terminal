@@ -143,6 +143,8 @@ export function VoiceMode({ bridge, open, onClose }: { bridge: VoiceBridge; open
   // per-turn assistant text buffering for sentence chunking + TTS
   const sentBufRef = useRef("");
   const turnDoneRef = useRef(true);
+  const expectedUserRef = useRef<string | null>(null); // text of the turn voice just submitted
+  const armedRef = useRef(false); // only speak after our own user turn echoes back (skip replayed/in-flight text)
   const ttsChainRef = useRef<Promise<void>>(Promise.resolve());
   const activeRef = useRef(false); // voice mode active
 
@@ -228,8 +230,10 @@ export function VoiceMode({ bridge, open, onClose }: { bridge: VoiceBridge; open
     if (!activeRef.current) return;
     if (!text) { startListening(); return; } // heard nothing usable -> keep listening
     setHeard(text);
-    // begin a fresh assistant turn
+    // begin a fresh assistant turn — disarm until our own user turn echoes back, so any
+    // replayed history or an in-flight previous reply isn't spoken as this turn.
     sentBufRef.current = ""; turnDoneRef.current = false; setCaption("");
+    expectedUserRef.current = text; armedRef.current = false;
     setPhaseR("thinking");
     try { await bridge.submit(text); } catch { setErr("send failed"); setPhaseR("error"); }
   }, [bridge, startListening]);
@@ -258,6 +262,14 @@ export function VoiceMode({ bridge, open, onClose }: { bridge: VoiceBridge; open
     if (!open) return;
     const unsub = bridge.subscribe((e) => {
       if (!activeRef.current) return;
+      if (e.t === "user") {
+        // arm only when OUR submitted turn echoes back; ignore other/replayed user turns
+        if (!armedRef.current && expectedUserRef.current != null && (e as any).text === expectedUserRef.current) {
+          armedRef.current = true; sentBufRef.current = ""; setCaption("");
+        }
+        return;
+      }
+      if (!armedRef.current) return; // pre-arm: skip replayed history / in-flight prior reply
       if (e.t === "text_delta" || e.t === "text") {
         const t = (e as any).text || "";
         if (!t) return;
@@ -361,8 +373,13 @@ export function VoiceMode({ bridge, open, onClose }: { bridge: VoiceBridge; open
         <button className="voice-x" onClick={onClose} aria-label="Exit voice mode">Done</button>
       </div>
       <div className="voice-center">
-        <div className={"voice-orb voice-" + phase} style={{ transform: `scale(${1 + (phase === "listening" ? level * 0.6 : phase === "speaking" ? 0.18 : 0)})` }}>
-          <div className="voice-orb-core" />
+        <div className={"voice-orb voice-" + phase}>
+          <span className="vo-ring vo-ring1" />
+          <span className="vo-ring vo-ring2" />
+          <div className="voice-orb-blob" style={{ transform: `scale(${1 + (phase === "listening" ? level * 0.5 : phase === "speaking" ? 0.14 : 0)})` }}>
+            <span className="vo-sheen" />
+            <span className="vo-gloss" />
+          </div>
         </div>
         <div className="voice-state">{label}</div>
         {err ? <div className="voice-err">{err}</div> : null}
@@ -390,15 +407,29 @@ function injectVoiceCss() {
   .voice-badge{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#8f8fa3;font-weight:600}
   .voice-x{background:rgba(255,255,255,.08);border:none;color:#ececf1;border-radius:999px;padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer}
   .voice-x:active{background:rgba(255,255,255,.16)}
-  .voice-center{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px}
-  .voice-orb{width:168px;height:168px;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:transform .12s ease-out;will-change:transform;background:radial-gradient(circle at 50% 40%,rgba(217,119,87,.30),rgba(217,119,87,.06) 60%,transparent 72%)}
-  .voice-orb-core{width:112px;height:112px;border-radius:50%;background:linear-gradient(160deg,#d97757,#b95e42);box-shadow:0 0 60px rgba(217,119,87,.55),inset 0 0 30px rgba(255,255,255,.12);transition:box-shadow .2s}
-  .voice-listening .voice-orb-core{background:linear-gradient(160deg,#5b8cff,#3f6ad8);box-shadow:0 0 60px rgba(91,140,255,.5),inset 0 0 30px rgba(255,255,255,.14)}
-  .voice-thinking .voice-orb-core{animation:voicePulse 1.3s ease-in-out infinite}
-  .voice-speaking .voice-orb-core{animation:voiceGlow 1.1s ease-in-out infinite}
-  .voice-transcribing .voice-orb-core{animation:voicePulse 1s ease-in-out infinite}
-  @keyframes voicePulse{0%,100%{transform:scale(.94);opacity:.8}50%{transform:scale(1.04);opacity:1}}
-  @keyframes voiceGlow{0%,100%{box-shadow:0 0 44px rgba(217,119,87,.4),inset 0 0 30px rgba(255,255,255,.1)}50%{box-shadow:0 0 80px rgba(217,119,87,.75),inset 0 0 30px rgba(255,255,255,.18)}}
+  .voice-center{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px}
+  /* --- morphing voice orb: an organic blob that morphs shape + spins an inner sheen,
+        reacts to mic level (scale) and state (colour), with ripple rings while listening --- */
+  .voice-orb{position:relative;width:188px;height:188px;display:flex;align-items:center;justify-content:center;--vo-a:#d97757;--vo-b:#b95e42;--vo-glow:rgba(217,119,87,.55)}
+  .voice-listening{--vo-a:#5b8cff;--vo-b:#3f6ad8;--vo-glow:rgba(91,140,255,.55)}
+  .voice-thinking{--vo-a:#f5b64a;--vo-b:#e0912a;--vo-glow:rgba(245,182,74,.5)}
+  .voice-transcribing{--vo-a:#8b8bf0;--vo-b:#6a6ad8;--vo-glow:rgba(139,139,240,.5)}
+  .voice-orb-blob{position:relative;width:130px;height:130px;overflow:hidden;background:linear-gradient(150deg,var(--vo-a),var(--vo-b));box-shadow:0 0 60px var(--vo-glow),inset 0 6px 22px rgba(255,255,255,.18),inset 0 -10px 26px rgba(0,0,0,.28);transition:transform .1s ease-out,box-shadow .3s,background .4s;will-change:transform,border-radius;border-radius:42% 58% 57% 43% / 53% 44% 56% 47%;animation:blobMorph 7s ease-in-out infinite}
+  .vo-sheen{position:absolute;inset:-40%;background:conic-gradient(from 0deg,transparent 0deg,rgba(255,255,255,.28) 70deg,transparent 150deg,rgba(255,255,255,.16) 250deg,transparent 330deg);animation:blobSpin 6s linear infinite;opacity:.7}
+  .vo-gloss{position:absolute;left:22%;top:14%;width:42%;height:34%;border-radius:50%;background:radial-gradient(circle at 40% 40%,rgba(255,255,255,.55),transparent 70%);filter:blur(2px)}
+  .vo-ring{position:absolute;width:130px;height:130px;border-radius:50%;border:2px solid var(--vo-glow);opacity:0}
+  .voice-listening .vo-ring1{animation:voRipple 1.9s ease-out infinite}
+  .voice-listening .vo-ring2{animation:voRipple 1.9s ease-out infinite .95s}
+  .voice-thinking .voice-orb-blob{animation:blobMorph 3.2s ease-in-out infinite,voBreathe 1.4s ease-in-out infinite}
+  .voice-speaking .voice-orb-blob{animation:blobMorph 2.4s ease-in-out infinite,voBeat 1s ease-in-out infinite}
+  .voice-speaking .vo-sheen{animation-duration:2.4s}
+  .voice-transcribing .voice-orb-blob{animation:blobMorph 2s ease-in-out infinite}
+  @keyframes blobMorph{0%,100%{border-radius:42% 58% 57% 43% / 53% 44% 56% 47%}33%{border-radius:62% 38% 44% 56% / 46% 60% 40% 54%}66%{border-radius:45% 55% 64% 36% / 62% 42% 58% 38%}}
+  @keyframes blobSpin{to{transform:rotate(360deg)}}
+  @keyframes voRipple{0%{opacity:.55;transform:scale(.85)}100%{opacity:0;transform:scale(1.55)}}
+  @keyframes voBreathe{0%,100%{box-shadow:0 0 40px var(--vo-glow),inset 0 6px 22px rgba(255,255,255,.18),inset 0 -10px 26px rgba(0,0,0,.28)}50%{box-shadow:0 0 78px var(--vo-glow),inset 0 6px 22px rgba(255,255,255,.22),inset 0 -10px 26px rgba(0,0,0,.28)}}
+  @keyframes voBeat{0%,100%{box-shadow:0 0 46px var(--vo-glow),inset 0 6px 22px rgba(255,255,255,.2),inset 0 -10px 26px rgba(0,0,0,.28)}50%{box-shadow:0 0 92px var(--vo-glow),inset 0 8px 26px rgba(255,255,255,.28),inset 0 -10px 26px rgba(0,0,0,.28)}}
+  @media (prefers-reduced-motion:reduce){.voice-orb-blob,.vo-sheen,.vo-ring{animation:none!important}}
   .voice-state{font-size:19px;font-weight:600;color:#c9c9d6;min-height:24px}
   .voice-err{font-size:14px;color:#ff8f8f;max-width:320px;text-align:center}
   .voice-transcript{max-height:34vh;overflow-y:auto;display:flex;flex-direction:column;gap:12px;padding:0 6px 8px;-webkit-overflow-scrolling:touch}
@@ -410,6 +441,14 @@ function injectVoiceCss() {
   .voice-skip{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#ececf1;border-radius:999px;padding:12px 26px;font-size:15px;font-weight:600;cursor:pointer}
   .voice-skip:active{background:rgba(255,255,255,.16)}
   @media (min-width:720px){.voice-transcript{max-width:640px;margin:0 auto;width:100%}}
+  /* composer mic button: a gentle breathing hint that this opens hands-free voice */
+  .voice-open-btn{position:relative}
+  .voice-open-btn svg{animation:micBreathe 2.8s ease-in-out infinite;transform-origin:center}
+  .voice-open-btn::after{content:"";position:absolute;inset:0;border-radius:50%;pointer-events:none;box-shadow:0 0 0 0 rgba(91,140,255,.45);animation:micPing 2.8s ease-out infinite}
+  .voice-open-btn:active svg{transform:scale(.9)}
+  @keyframes micBreathe{0%,100%{transform:scale(1)}50%{transform:scale(1.12)}}
+  @keyframes micPing{0%{box-shadow:0 0 0 0 rgba(91,140,255,.5)}70%,100%{box-shadow:0 0 0 11px rgba(91,140,255,0)}}
+  @media (prefers-reduced-motion:reduce){.voice-open-btn svg,.voice-open-btn::after{animation:none!important}}
   `;
   const el = document.createElement("style"); el.id = "voice-css"; el.textContent = css; document.head.appendChild(el);
 }
