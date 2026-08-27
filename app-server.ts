@@ -16,8 +16,10 @@ export interface AppCtx {
   dataDir: string; // ~/.claude/projects
   historyHide: string[]; // cwds to hide (from cfg.historyHide)
   defaultCwd: string; // cwd for a brand-new chat (cfg.spawnCwd || HOME)
-  models: { id: string; label: string }[];
+  models: { id: string; label: string }[]; // quick picks
+  moreModels: { id: string; label: string }[]; // the "Other…" dialog list
   favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
+  titlesFile: string; // JSON map {sessionId: customTitle} — user-renamed conversations
 }
 
 // #region favorites (starred conversations) — server-side, shared across the owner's devices
@@ -29,6 +31,17 @@ async function loadFavs(file: string): Promise<Set<string>> {
   return favSet;
 }
 async function saveFavs(file: string) { if (favSet) await Bun.write(file, JSON.stringify([...favSet])); }
+// #endregion
+
+// #region custom titles (renamed conversations) — server-side map, syncs across devices
+let titleMap: Record<string, string> | null = null;
+async function loadTitles(file: string): Promise<Record<string, string>> {
+  if (titleMap) return titleMap;
+  try { const o = JSON.parse(await Bun.file(file).text()); titleMap = o && typeof o === "object" ? o : {}; }
+  catch { titleMap = {}; }
+  return titleMap;
+}
+async function saveTitles(file: string) { if (titleMap) await Bun.write(file, JSON.stringify(titleMap)); }
 // #endregion
 
 const enc = (s: string) => encodeURIComponent(s);
@@ -156,7 +169,22 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   // --- API ---
-  if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, defaultCwd: ctx.defaultCwd }, ctx, req);
+  if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, moreModels: ctx.moreModels, defaultCwd: ctx.defaultCwd }, ctx, req);
+
+  if (req.method === "GET" && path === "/app/api/titles") {
+    const t = await loadTitles(ctx.titlesFile);
+    return jsonRes({ titles: t }, ctx, req);
+  }
+  if (req.method === "POST" && path === "/app/api/title") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const id = String(b.id || "");
+    if (!id) return jsonRes({ error: "id required" }, ctx, req, 400);
+    const t = await loadTitles(ctx.titlesFile);
+    const title = String(b.title ?? "").trim().slice(0, 200);
+    if (title) t[id] = title; else delete t[id]; // empty title clears the override
+    await saveTitles(ctx.titlesFile);
+    return jsonRes({ ok: true, title: t[id] || null }, ctx, req);
+  }
 
   if (req.method === "GET" && path === "/app/api/favorites") {
     const f = await loadFavs(ctx.favoritesFile);
@@ -174,12 +202,14 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
 
   if (req.method === "GET" && path === "/app/api/conversations") {
     const rows = listConversations(ctx);
+    const titles = await loadTitles(ctx.titlesFile);
     const out: ConvRow[] = [];
     for (const r of rows.slice(0, 200)) {
       const meta = await convMeta(r.path);
       if (ctx.historyHide.some((h) => (meta.cwd || "").startsWith(h))) continue;
-      if (!meta.title) continue;
-      out.push({ sessionId: r.sessionId, title: meta.title, cwd: meta.cwd, mtime: r.mtime, project: r.project });
+      const title = titles[r.sessionId] || meta.title; // user rename wins
+      if (!title) continue;
+      out.push({ sessionId: r.sessionId, title, cwd: meta.cwd, mtime: r.mtime, project: r.project });
       if (out.length >= 100) break;
     }
     return jsonRes({ conversations: out }, ctx, req);

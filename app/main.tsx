@@ -54,6 +54,8 @@ const api = {
   favorites: () => fetch("/app/api/favorites").then(J),
   toggleFav: (id: string, fav: boolean) =>
     fetch("/app/api/favorites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, fav }) }).then(J),
+  setTitle: (id: string, title: string) =>
+    fetch("/app/api/title", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, title }) }).then(J),
 };
 // #endregion
 
@@ -162,6 +164,10 @@ function groupLabel(mtime: number): string {
 
 function App() {
   const [models, setModels] = useState<Model[]>([]);
+  const [moreModels, setMoreModels] = useState<Model[]>([]);
+  const [otherOpen, setOtherOpen] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
   const [defaultCwd, setDefaultCwd] = useState<string>("");
   const [convs, setConvs] = useState<Conv[]>([]);
   const [items, setItems] = useState<Item[]>([]);
@@ -191,7 +197,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    api.models().then((d) => { setModels(d.models || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
     refreshConvs();
     refreshFavs();
     const c = new URLSearchParams(location.search).get("c");
@@ -296,8 +302,18 @@ function App() {
   const stop = async () => { if (activeId) await api.interrupt(activeId); setBusy(false); };
 
   const onPickModel = async (m: string) => {
-    setModel(m); localStorage.setItem("ct-app-model", m); setMenuOpen(false);
+    setModel(m); localStorage.setItem("ct-app-model", m); setMenuOpen(false); setOtherOpen(false);
     if (esOpen.current && activeId) { try { await api.setModel({ id: activeId, model: m }); } catch { /* */ } }
+  };
+
+  const startRename = () => { if (!activeId) return; setTitleDraft(convs.find((c) => c.sessionId === activeId)?.title || ""); setEditingTitle(true); };
+  const saveTitle = async () => {
+    const t = titleDraft.trim();
+    setEditingTitle(false);
+    if (!activeId) return;
+    if (t) setConvs((cs) => cs.map((c) => (c.sessionId === activeId ? { ...c, title: t } : c)));
+    try { await api.setTitle(activeId, t); } catch { /* */ }
+    setTimeout(refreshConvs, 300);
   };
 
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -308,7 +324,7 @@ function App() {
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void doSend(); } };
   const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => { setInput(e.target.value); const ta = e.target; ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; };
 
-  const modelLabel = models.find((m) => m.id === model)?.label || model || "Model";
+  const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || model || "Model";
 
   // sidebar grouping — favorites pulled into their own section, the rest grouped by recency
   const favConvs = useMemo(() => convs.filter((c) => favorites.has(c.sessionId)), [convs, favorites]);
@@ -328,7 +344,7 @@ function App() {
         <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
         <span className="conv-title">{c.title}</span>
         <button className={"conv-star" + (fav ? " on" : "")} onClick={(e) => { e.stopPropagation(); toggleFav(c.sessionId); }} aria-label={fav ? "Unfavorite" : "Favorite"} title={fav ? "Unfavorite" : "Favorite"}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill={fav ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.6"><path d="M12 3.2l2.6 5.3 5.8.85-4.2 4.1 1 5.8L12 21.6l-5.2-2.75 1-5.8-4.2-4.1 5.8-.85z" strokeLinejoin="round" /></svg>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill={fav ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26" /></svg>
         </button>
       </div>
     );
@@ -341,6 +357,22 @@ function App() {
           <span>A new version is available.</span>
           <button className="ut-reload" onClick={hardRefresh}>Reload</button>
           <button className="ut-dismiss" onClick={() => setUpdateAvail(false)} aria-label="Dismiss">×</button>
+        </div>
+      )}
+      {otherOpen && (
+        <div className="modal-scrim" onClick={() => setOtherOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">Choose a model<button className="modal-x" onClick={() => setOtherOpen(false)} aria-label="Close">×</button></div>
+            <div className="modal-list">
+              {moreModels.map((m) => (
+                <button key={m.id} className={m.id === model ? "active" : ""} onClick={() => onPickModel(m.id)}>
+                  <span className="mm-label">{m.label}</span>
+                  <span className="mm-id">{m.id}</span>
+                  {m.id === model && <span className="dot">●</span>}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       )}
       <div className="scrim" onClick={() => setDrawer(false)} />
@@ -378,7 +410,21 @@ function App() {
           <button className="icon-btn" onClick={() => setDrawer((d) => !d)} aria-label="Menu">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
           </button>
-          <div className="topbar-title">{activeId ? convs.find((c) => c.sessionId === activeId)?.title || "Conversation" : "New chat"}</div>
+          {editingTitle ? (
+            <input className="topbar-title-input" autoFocus value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void saveTitle(); } else if (e.key === "Escape") setEditingTitle(false); }}
+              onBlur={() => void saveTitle()} placeholder="Conversation name" />
+          ) : (
+            <div className="topbar-title">
+              <span className="tt-text">{activeId ? convs.find((c) => c.sessionId === activeId)?.title || "Conversation" : "New chat"}</span>
+              {activeId && (
+                <button className="rename-btn" onClick={startRename} title="Rename conversation" aria-label="Rename">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
+                </button>
+              )}
+            </div>
+          )}
           <div className="model-picker">
             <button className="model-btn" onClick={() => setMenuOpen((o) => !o)}>
               {modelLabel}
@@ -389,6 +435,7 @@ function App() {
                 {models.map((m) => (
                   <button key={m.id} onClick={() => onPickModel(m.id)}>{m.label}{m.id === model && <span className="dot">●</span>}</button>
                 ))}
+                {moreModels.length > 0 && <button className="model-other" onClick={() => { setMenuOpen(false); setOtherOpen(true); }}>Other versions…</button>}
               </div>
             )}
           </div>

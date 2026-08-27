@@ -551,10 +551,23 @@ const conns = new Connections(STATE_DIR, cfg.netApplyHelper);
 // Only the owner reaches it (gateTerminal). Guest sidecars set usagePage:false but this
 // is independent of that; guests simply never get an /app route in the router. Model list
 // is config-overridable; the ids are CLI/SDK model aliases resolved at query time.
+// Quick picks (shown in the model menu) — versioned ids so the label shows the version.
 const APP_MODELS: { id: string; label: string }[] = cfg.appModels || [
-  { id: "opus", label: "Opus" },
-  { id: "sonnet", label: "Sonnet" },
-  { id: "haiku", label: "Haiku" },
+  { id: "claude-opus-4-8", label: "Opus 4.8" },
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
+  { id: "claude-haiku-4-5", label: "Haiku 4.5" },
+];
+// "Other…" list (older / more versions) — shown in a dialog behind the Other option.
+const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
+  { id: "claude-opus-5", label: "Opus 5" },
+  { id: "claude-opus-4-7", label: "Opus 4.7" },
+  { id: "claude-opus-4-6", label: "Opus 4.6" },
+  { id: "claude-sonnet-5", label: "Sonnet 5" },
+  { id: "claude-fable-5", label: "Fable 5" },
+  { id: "claude-haiku-4-5", label: "Haiku 4.5" },
+  { id: "opus", label: "Opus (latest)" },
+  { id: "sonnet", label: "Sonnet (latest)" },
+  { id: "haiku", label: "Haiku (latest)" },
 ];
 const appCtx: AppCtx = {
   allowed,
@@ -564,7 +577,9 @@ const appCtx: AppCtx = {
   historyHide: cfg.historyHide || [],
   defaultCwd: SPAWN_CWD,
   models: APP_MODELS,
+  moreModels: APP_MORE_MODELS,
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
+  titlesFile: join(STATE_DIR, "claude-app-titles.json"),
 };
 // #endregion
 
