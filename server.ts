@@ -564,6 +564,7 @@ const appCtx: AppCtx = {
   historyHide: cfg.historyHide || [],
   defaultCwd: SPAWN_CWD,
   models: APP_MODELS,
+  favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
 };
 // #endregion
 

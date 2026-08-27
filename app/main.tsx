@@ -51,6 +51,9 @@ const api = {
     const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
     return fetch("/app/api/upload", { method: "POST", body: fd }).then(J);
   },
+  favorites: () => fetch("/app/api/favorites").then(J),
+  toggleFav: (id: string, fav: boolean) =>
+    fetch("/app/api/favorites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, fav }) }).then(J),
 };
 // #endregion
 
@@ -170,6 +173,7 @@ function App() {
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [updateAvail, setUpdateAvail] = useState(false);
+  const [favorites, setFavorites] = useState<Set<string>>(new Set());
 
   const esRef = useRef<EventSource | null>(null);
   const esOpen = useRef(false);
@@ -178,12 +182,18 @@ function App() {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const cwdRef = useRef<string>("");
   const pendingUser = useRef<string[]>([]); // optimistic user turns awaiting their SSE echo
+  const forceBottom = useRef(false); // scroll to the end after opening a conversation
 
   const refreshConvs = useCallback(() => { api.convs().then((d) => setConvs(d.conversations || [])).catch(() => {}); }, []);
+  const refreshFavs = useCallback(() => { api.favorites().then((d) => setFavorites(new Set(d.favorites || []))).catch(() => {}); }, []);
+  const toggleFav = useCallback((id: string) => {
+    setFavorites((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); void api.toggleFav(id, !s.has(id)).then((d) => { if (d?.favorites) setFavorites(new Set(d.favorites)); }).catch(() => {}); return n; });
+  }, []);
 
   useEffect(() => {
     api.models().then((d) => { setModels(d.models || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
     refreshConvs();
+    refreshFavs();
     const c = new URLSearchParams(location.search).get("c");
     if (c) void loadConv(c);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -215,9 +225,10 @@ function App() {
     location.reload();
   };
 
-  // autoscroll if near the bottom
+  // autoscroll: jump to the end when a conversation is opened, else follow only if near bottom
   useEffect(() => {
     const el = scrollRef.current; if (!el) return;
+    if (forceBottom.current) { forceBottom.current = false; el.scrollTop = el.scrollHeight; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; }); return; }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 240;
     if (nearBottom) el.scrollTop = el.scrollHeight;
   }, [items, busy]);
@@ -254,6 +265,7 @@ function App() {
     try {
       const d = await api.conversation(id);
       const built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+      forceBottom.current = true; // open at the latest message, not the top
       setItems(built); setActiveId(id);
       cwdRef.current = d.cwd || defaultCwd;
       history.replaceState(null, "", `/app?c=${id}`);
@@ -298,12 +310,29 @@ function App() {
 
   const modelLabel = models.find((m) => m.id === model)?.label || model || "Model";
 
-  // sidebar grouping
+  // sidebar grouping — favorites pulled into their own section, the rest grouped by recency
+  const favConvs = useMemo(() => convs.filter((c) => favorites.has(c.sessionId)), [convs, favorites]);
   const groups = useMemo(() => {
     const g: { label: string; items: Conv[] }[] = [];
-    for (const c of convs) { const l = groupLabel(c.mtime); let last = g[g.length - 1]; if (!last || last.label !== l) { last = { label: l, items: [] }; g.push(last); } last.items.push(c); }
+    for (const c of convs) {
+      if (favorites.has(c.sessionId)) continue;
+      const l = groupLabel(c.mtime); let last = g[g.length - 1]; if (!last || last.label !== l) { last = { label: l, items: [] }; g.push(last); } last.items.push(c);
+    }
     return g;
-  }, [convs]);
+  }, [convs, favorites]);
+
+  const renderConv = (c: Conv) => {
+    const fav = favorites.has(c.sessionId);
+    return (
+      <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId)}>
+        <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+        <span className="conv-title">{c.title}</span>
+        <button className={"conv-star" + (fav ? " on" : "")} onClick={(e) => { e.stopPropagation(); toggleFav(c.sessionId); }} aria-label={fav ? "Unfavorite" : "Favorite"} title={fav ? "Unfavorite" : "Favorite"}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill={fav ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.6"><path d="M12 3.2l2.6 5.3 5.8.85-4.2 4.1 1 5.8L12 21.6l-5.2-2.75 1-5.8-4.2-4.1 5.8-.85z" strokeLinejoin="round" /></svg>
+        </button>
+      </div>
+    );
+  };
 
   return (
     <div className={"app" + (drawer ? " drawer-open" : "")}>
@@ -322,15 +351,16 @@ function App() {
           New chat
         </button>
         <div className="conv-list">
+          {favConvs.length > 0 && (
+            <div>
+              <div className="conv-group-label">Favorites</div>
+              {favConvs.map(renderConv)}
+            </div>
+          )}
           {groups.map((g) => (
             <div key={g.label}>
               <div className="conv-group-label">{g.label}</div>
-              {g.items.map((c) => (
-                <button key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId)}>
-                  <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                  <span className="conv-title">{c.title}</span>
-                </button>
-              ))}
+              {g.items.map(renderConv)}
             </div>
           ))}
           {!convs.length && <div className="conv-group-label">No conversations yet</div>}

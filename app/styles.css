@@ -54,13 +54,22 @@ a { color: var(--accent-2); }
 .conv-group-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); padding: 12px 8px 4px; font-weight: 600; }
 .conv-item {
   display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; padding: 8px 10px; margin: 1px 0; border: none;
-  background: transparent; color: var(--text-2); border-radius: 9px; font-size: 13.5px;
+  background: transparent; color: var(--text-2); border-radius: 9px; font-size: 13.5px; cursor: pointer;
   transition: background .12s, color .12s;
 }
 .conv-item .conv-ic { flex: 0 0 auto; color: var(--text-3); }
-.conv-item .conv-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.conv-item .conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .conv-item:hover { background: var(--bg-2); color: var(--text); }
 .conv-item:hover .conv-ic, .conv-item.active .conv-ic { color: var(--accent); }
+.conv-star {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+  padding: 0; border: none; background: transparent; color: var(--text-3); border-radius: 6px; opacity: 0;
+  transition: opacity .12s, color .12s, background .12s;
+}
+.conv-item:hover .conv-star { opacity: 1; }
+.conv-star.on { opacity: 1; color: var(--accent); }
+.conv-star:hover { background: var(--bg-3); color: var(--accent); }
+@media (hover: none) { .conv-star { opacity: .5; } .conv-star.on { opacity: 1; } } /* touch: always tappable */
 .conv-item.active { background: var(--bg-3); color: var(--text); }
 .sb-foot { padding: 10px 12px; border-top: 1px solid var(--line-2); }
 .term-link {

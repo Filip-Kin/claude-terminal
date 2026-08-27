@@ -17,7 +17,19 @@ export interface AppCtx {
   historyHide: string[]; // cwds to hide (from cfg.historyHide)
   defaultCwd: string; // cwd for a brand-new chat (cfg.spawnCwd || HOME)
   models: { id: string; label: string }[];
+  favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
 }
+
+// #region favorites (starred conversations) — server-side, shared across the owner's devices
+let favSet: Set<string> | null = null;
+async function loadFavs(file: string): Promise<Set<string>> {
+  if (favSet) return favSet;
+  try { const arr = JSON.parse(await Bun.file(file).text()); favSet = new Set(Array.isArray(arr) ? arr.map(String) : []); }
+  catch { favSet = new Set(); }
+  return favSet;
+}
+async function saveFavs(file: string) { if (favSet) await Bun.write(file, JSON.stringify([...favSet])); }
+// #endregion
 
 const enc = (s: string) => encodeURIComponent(s);
 
@@ -145,6 +157,20 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
 
   // --- API ---
   if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, defaultCwd: ctx.defaultCwd }, ctx, req);
+
+  if (req.method === "GET" && path === "/app/api/favorites") {
+    const f = await loadFavs(ctx.favoritesFile);
+    return jsonRes({ favorites: [...f] }, ctx, req);
+  }
+  if (req.method === "POST" && path === "/app/api/favorites") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const id = String(b.id || "");
+    if (!id) return jsonRes({ error: "id required" }, ctx, req, 400);
+    const f = await loadFavs(ctx.favoritesFile);
+    if (b.fav) f.add(id); else f.delete(id);
+    await saveFavs(ctx.favoritesFile);
+    return jsonRes({ favorites: [...f] }, ctx, req);
+  }
 
   if (req.method === "GET" && path === "/app/api/conversations") {
     const rows = listConversations(ctx);
