@@ -66,7 +66,7 @@ type AppEvent =
   | { t: "error"; message: string; _seq?: number }
   | { t: "closed"; _seq?: number };
 
-type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number };
+type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
 
 type Item =
   | { kind: "user"; text: string }
@@ -339,9 +339,9 @@ function ThinkingCard({ it, isLast }: { it: Extract<Item, { kind: "thinking" }>;
   const secs = it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
   const meta = [secs == null ? "" : fmtDur(secs), it.tokens ? `~${it.tokens} tokens` : ""].filter(Boolean).join(" · ");
   return (
-    <div className="thinking think-progress live">
+    <div className="thinking-live">
+      <span className="think-dots"><span></span><span></span><span></span></span>
       <span className="think-label">Thinking</span>
-      <span className="think-ellipsis">…</span>
       {meta && <span className="think-tok">{meta}</span>}
       {it.text && <div className="think-text">{it.text}</div>}
     </div>
@@ -402,9 +402,12 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   const think = turnFinal ? turnThinkingTotals(items, i) : null;
   const usage = it.usage;
   const parts: string[] = [];
-  if (think) parts.push(`Thought for ${fmtDur(Math.round(think.ms / 1000))}`);
+  // Real run wall-clock from the result (duration_ms); fall back to the measured thinking time.
+  const secs = usage?.durationMs ? Math.round(usage.durationMs / 1000) : think ? Math.round(think.ms / 1000) : 0;
+  if (secs > 0) parts.push(`Worked for ${fmtDur(secs)}`);
+  // Output tokens generated since the last idle (all models), not the visible text only.
   const toks = usage?.output ?? (think ? think.tokens : 0);
-  if (toks) parts.push(`${fmtTokens(toks)} tokens`);
+  if (toks) parts.push(`${fmtTokens(toks)} output tokens`);
   const summary = turnFinal && parts.length ? parts.join(" · ") : "";
   // Hover: the full picture — output (incl. the exact thinking subset), the context read (mostly
   // cached history, so the big number), the grand total processed, and cost.
@@ -475,6 +478,8 @@ function App() {
   const esOpen = useRef(false);
   const lastSeq = useRef(-1);
   const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the live stream last say anything
+  const compactingRef = useRef(false); // mirror of `compacting` for stable callbacks
+  const compactQueue = useRef<string[]>([]); // messages typed DURING compaction, sent once it finishes
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const newChatRef = useRef<(() => void) | null>(null); // lets earlier callbacks reset to a blank chat
   const taRef = useRef<HTMLTextAreaElement | null>(null);
@@ -532,10 +537,15 @@ function App() {
   const refreshContext = useCallback((id: string | null) => {
     if (!id || id.startsWith("pending-")) { setContext(null); return; }
     api.context(id).then((d) => {
-      if (d?.available) { setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false }); return; }
-      // Not live in memory (historical / not yet resumed): show an estimate so the gauge is always present.
-      const est = estimateContextTokens(itemsRef.current);
-      setContext(est > 0 ? { percentage: Math.min(100, (est / DEFAULT_CTX) * 100), total: est, max: DEFAULT_CTX, estimated: true } : null);
+      if (d?.available) { try { localStorage.setItem("ct-app-ctxmax", String(d.max)); } catch { /* */ } setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false }); return; }
+      const max = Number(localStorage.getItem("ct-app-ctxmax")) || DEFAULT_CTX;
+      // Not live in memory: use the REAL context from the last committed turn's usage (stamped on
+      // assistant items during replay), so a reopened conversation shows its true last-message context.
+      let realCtx = 0;
+      for (let k = itemsRef.current.length - 1; k >= 0; k--) { const t = itemsRef.current[k]; if (t.kind === "assistant" && t.usage) { realCtx = t.usage.context; break; } }
+      if (realCtx > 0) { setContext({ percentage: Math.min(100, (realCtx / max) * 100), total: realCtx, max, estimated: false }); return; }
+      const est = estimateContextTokens(itemsRef.current); // last resort (no usage recorded yet)
+      setContext(est > 0 ? { percentage: Math.min(100, (est / max) * 100), total: est, max, estimated: true } : null);
     }).catch(() => { /* keep the last value on a transient error */ });
   }, []);
   const compactStartRef = useRef(0);
@@ -545,7 +555,7 @@ function App() {
     setCompacting(true);
     try { await api.compact(activeIdRef.current); } catch { /* */ }
     // Cleared for real by the compact event (handleEvent); this is just a safety net.
-    setTimeout(() => { setCompacting(false); refreshContext(activeIdRef.current); }, 45000);
+    setTimeout(() => { setCompacting(false); compactingRef.current = false; refreshContext(activeIdRef.current); flushCompactRef.current(); }, 45000);
   }, [compacting, refreshContext]);
   // Which conversations have an offline message queued (resume target) — drives the queued indicator
   // on EXISTING conversations, not just brand-new offline chats.
@@ -598,6 +608,8 @@ function App() {
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
   useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, markRead]);
   useEffect(() => { itemsRef.current = items; }, [items]); // for the context estimate
+  useEffect(() => { compactingRef.current = compacting; }, [compacting]);
+  const flushCompactRef = useRef<() => void>(() => {}); // assigned after openStream is defined
 
   // PWA update check: poll the server build id; if it changed since load, offer a reload.
   // Content-hashed assets + no-store index mean the reload gets everything fresh.
@@ -694,7 +706,7 @@ function App() {
       return;
     }
     if (e.t === "busy") { setBusy(e.busy); return; }
-    if (e.t === "compact") { setCompacting(false); refreshContext(activeIdRef.current); setItems((it) => applyEvent(it, e)); return; } // compaction finished
+    if (e.t === "compact") { setCompacting(false); compactingRef.current = false; refreshContext(activeIdRef.current); setItems((it) => applyEvent(it, e)); flushCompactRef.current(); return; } // compaction finished -> send anything held
     if (e.t === "result") { setBusy(false); setItems((it) => applyEvent(it, e)); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage
     if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
     if (e.t === "closed") { return; }
@@ -713,6 +725,22 @@ function App() {
     };
     es.onerror = () => { /* EventSource auto-reconnects; buffer + _seq dedupe keeps us consistent */ };
   }, [handleEvent]);
+
+  // Flush messages held during compaction (assigned here so it can use openStream). Called via a ref
+  // from doCompact/handleEvent to sidestep declaration order.
+  flushCompactRef.current = () => {
+    const q = compactQueue.current; compactQueue.current = [];
+    if (!q.length) return;
+    void (async () => {
+      for (const text of q) {
+        const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
+        try {
+          if (esOpen.current && activeIdRef.current) await api.send({ id: activeIdRef.current, text });
+          else { const r = await api.start(body); if (r?.id) { setActiveId(r.id); activeIdRef.current = r.id; openStream(r.id); } }
+        } catch { await offline.enqueueSend(body); void refreshQueue(); }
+      }
+    })();
+  };
 
   // Render one conversation payload (from network or cache) into the view.
   const applyConv = useCallback((id: string, d: any, highlight?: string) => {
@@ -864,6 +892,9 @@ function App() {
       setBusy(false);
     };
     if (typeof navigator !== "undefined" && !navigator.onLine) { await queue(); return null; } // offline: hold it, send on reconnect
+    // During compaction, hold the message (already rendered optimistically) and send it once the
+    // compaction finishes, so it isn't lost or racing the /compact turn.
+    if (compactingRef.current && activeIdRef.current) { compactQueue.current.push(text); return activeIdRef.current; }
     try {
       if (esOpen.current && activeIdRef.current) { await api.send({ id: activeIdRef.current, text }); return activeIdRef.current; }
       const r = await api.start(body);
@@ -1151,7 +1182,6 @@ function App() {
           )}
         </div>
         {loadingConv && <div className="load-bar" aria-label="Loading conversation" />}
-        {compacting && <CompactionBanner start={compactStartRef.current} />}
 
         {(!online || queued > 0) && (
           <div className={"net-banner" + (online ? " sending" : "")}>
@@ -1183,7 +1213,8 @@ function App() {
                 }
                 return nodes;
               })()}
-              {busy && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
+              {compacting && <CompactionBanner start={compactStartRef.current} />}
+              {busy && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}
         </div>

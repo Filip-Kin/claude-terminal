@@ -34,9 +34,11 @@ export type AppEvent =
   | { t: "error"; message: string }
   | { t: "closed" };
 
-// Per-turn token usage. output includes thinking; `thinking` is the exact reasoning-token subset;
-// context = the tokens read to answer (mostly cached history). total = everything processed.
-export type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number };
+// Per-run token usage (since the last idle). output = tokens generated across ALL models this run
+// (main loop + Task subagents, from modelUsage), so it isn't undercounted by tool/subagent work;
+// thinking is the exact reasoning subset; context = tokens read to answer (mostly cached history);
+// durationMs = the run's real wall-clock.
+export type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
 
 type Sub = (e: AppEvent) => void;
 // #endregion
@@ -86,6 +88,7 @@ export class Conversation {
   private askCounter = 0;
   private askToolUseIds = new Set<string>(); // tool_use ids of ask_user calls — their raw tool card/result are suppressed (the ask card replaces them)
   lastUsage?: TurnUsage; // most recent turn's real token usage (from the SDK result message)
+  private cumModel = { out: 0, in: 0, cr: 0, cc: 0 }; // running modelUsage totals, to delta per run
   private runStart = 0; // index in `log` where the CURRENT turn began — new subscribers only
   // get this turn's events, not the whole multi-turn history (which the client already has
   // from the transcript). Otherwise reopening a live conversation replays every prior turn.
@@ -316,11 +319,19 @@ export class Conversation {
       case "result": {
         this.busy = false;
         const u = anyM.usage || {};
-        const input = u.input_tokens || 0, output = u.output_tokens || 0;
+        const input = u.input_tokens || 0;
         const cacheCreate = u.cache_creation_input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0;
         const thinking = u.output_tokens_details?.thinking_tokens || 0; // exact reasoning tokens (subset of output)
         const context = input + cacheCreate + cacheRead; // tokens read to answer (mostly cached history)
-        const usage: TurnUsage = { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: anyM.total_cost_usd || 0 };
+        // Output SINCE THE LAST IDLE across every model (main loop + subagents), via the cumulative
+        // modelUsage delta — so a run with tool/subagent work isn't undercounted by the main-loop-only
+        // usage field. Falls back to the per-turn output when modelUsage is absent.
+        const mu = anyM.modelUsage || {};
+        let cOut = 0, cIn = 0, cCr = 0, cCc = 0;
+        for (const k in mu) { const v = mu[k] || {}; cOut += v.outputTokens || 0; cIn += v.inputTokens || 0; cCr += v.cacheReadInputTokens || 0; cCc += v.cacheCreationInputTokens || 0; }
+        const output = Object.keys(mu).length ? Math.max(0, cOut - this.cumModel.out) : (u.output_tokens || 0);
+        this.cumModel = { out: cOut, in: cIn, cr: cCr, cc: cCc };
+        const usage: TurnUsage = { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: anyM.total_cost_usd || 0, durationMs: anyM.duration_ms || 0 };
         this.lastUsage = usage;
         this.emit({ t: "result", subtype: anyM.subtype, sessionId: anyM.session_id || this.id, costUsd: usage.costUsd, usage });
         this.emit({ t: "busy", busy: false });
@@ -425,7 +436,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         const input = u.input_tokens || 0, output = u.output_tokens || 0;
         const cacheCreate = u.cache_creation_input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0;
         const thinking = u.output_tokens_details?.thinking_tokens || 0, context = input + cacheCreate + cacheRead;
-        out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: 0 } });
+        out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: 0, durationMs: 0 } });
       }
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       out.push({ t: "compact", trigger: o.compact_metadata?.trigger || "auto" });

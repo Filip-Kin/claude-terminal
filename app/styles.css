@@ -98,7 +98,7 @@ a { color: var(--accent-2); }
 @keyframes ctpulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.65); } }
 .load-bar { height: 2px; background: linear-gradient(90deg, transparent, var(--accent), transparent); background-size: 40% 100%; background-repeat: no-repeat; animation: loadslide 1.1s ease-in-out infinite; }
 @keyframes loadslide { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
-.compact-banner { padding: 8px 20px; background: var(--bg-2); border-bottom: 1px solid var(--line); }
+.compact-banner { margin: 10px 0; padding: 10px 14px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; }
 .compact-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-2); }
 .compact-secs { color: var(--text-3); font-variant-numeric: tabular-nums; }
 .compact-bar { margin-top: 6px; height: 3px; border-radius: 3px; background: linear-gradient(90deg, transparent, var(--accent), transparent); background-size: 40% 100%; background-repeat: no-repeat; animation: loadslide 1.1s ease-in-out infinite; }
@@ -222,6 +222,14 @@ a { color: var(--accent-2); }
 .think-label { font-style: normal; font-size: 12px; letter-spacing: 0; color: var(--text-3); font-weight: 600; margin-bottom: 3px; opacity: .9; }
 .think-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-style: normal; }
 .think-text { flex-basis: 100%; font-style: italic; font-size: 13px; margin-top: 4px; white-space: pre-wrap; color: var(--text-3); }
+/* Live "Thinking" indicator: pulsing dots on the LEFT, no left bar, no ellipsis, time + tokens after. */
+.thinking-live { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 2px 0 12px; color: var(--text-3); font-size: 12.5px; }
+.thinking-live .think-label { font-weight: 600; color: var(--accent); }
+.thinking-live .think-tok { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.think-dots { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+.think-dots span { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: ctpulse 1.2s ease-in-out infinite; }
+.think-dots span:nth-child(2) { animation-delay: .18s; }
+.think-dots span:nth-child(3) { animation-delay: .36s; }
 .turn-think { margin-top: 8px; font-size: 11.5px; color: var(--text-3); opacity: .8; font-variant-numeric: tabular-nums; }
 .tool-group { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: var(--bg-2); overflow: hidden; }
 .tool-group-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 12px; background: none; border: 0; color: var(--text-2); cursor: pointer; font-size: 13px; text-align: left; }
