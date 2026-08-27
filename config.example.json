@@ -67,5 +67,8 @@
     "guest:2": "#f59e0b",
     "guest:3": "#ec4899",
     "system": "#64748b"
-  }
+  },
+  "voice": true,
+  "sttUrl": "http://127.0.0.1:7801",
+  "ttsUrl": "http://127.0.0.1:7802"
 }

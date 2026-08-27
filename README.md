@@ -227,6 +227,39 @@ bundle; an already-open tab or installed PWA polls `/app/api/version` every 60s 
 toast (which clears Cache Storage and reloads — it does not touch the shared push service worker).
 This is FTA-Buddy's version-poll + reload-toast pattern, without its cache-first shell precache.
 
+### Hands-free voice mode
+
+The chat app has an optional phone-call-style voice mode: talk to Claude and it talks back,
+listening resumes automatically after each reply, and talking over Claude interrupts it (barge-in).
+Speech is **fully server-side** so it works identically on iOS Safari (which has no Web Speech API)
+and Android: the browser records the mic with `MediaRecorder`, POSTs the clip to a local Whisper
+service (`/app/api/stt` → text); that becomes a normal chat turn; Claude's streamed reply is chunked
+by sentence and each sentence is sent to a local Kokoro TTS service (`/app/api/tts` → audio) and
+played in a queue, so Claude starts speaking before the whole reply is finished.
+
+Two small Python/uv services under `voice/` back this (both bind loopback only; the sidecar proxies
+and owner-gates them):
+
+- `voice/stt` — [faster-whisper](https://github.com/SYSTRAN/faster-whisper), `base.en` by default
+  (~0.4s per short turn on a modern CPU; set `STT_MODEL=small.en` for more accuracy at ~3× latency).
+- `voice/tts` — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), voice `af_heart`
+  (first-audio ~0.37s, ~5× faster than real time on CPU). [Piper](https://github.com/rhasspy/piper)
+  is a lighter alternative if you need one.
+
+Set up and run each with `uv` (models download to `~/.cache/huggingface` on first start):
+
+```bash
+cd voice/stt && uv sync && uv run uvicorn main:app --host 127.0.0.1 --port 7801
+cd voice/tts && uv sync && uv run uvicorn main:app --host 127.0.0.1 --port 7802
+```
+
+Example systemd units are in `voice/systemd/`. Then enable voice in `config.json` — either
+`"voice": true` (uses the default loopback ports 7801/7802) or point at custom URLs with
+`"sttUrl"`/`"ttsUrl"`. When configured, `/app/api/models` reports `voice: true` and the app shows a
+mic button; otherwise the button is hidden and the routes return 503, so a vanilla install and guest
+sidecars are unaffected. `espeak-ng` is needed for Kokoro's out-of-dictionary word fallback
+(`apt install espeak-ng`).
+
 ## Importing from a previous setup
 
 `migrate-state.ts` imports legacy per-user JSON buckets into SQLite (preserving byte-offsets so the

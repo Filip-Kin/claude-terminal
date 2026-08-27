@@ -1,0 +1,20 @@
+[project]
+name = "claude-tts"
+version = "0.1.0"
+description = "Local neural text-to-speech sidecar for the claude-terminal chat app (Kokoro-82M)."
+requires-python = ">=3.10"
+dependencies = [
+    "kokoro==0.9.4",
+    "soundfile==0.13.1",
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "numpy<2.3",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

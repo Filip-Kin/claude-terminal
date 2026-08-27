@@ -4,6 +4,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
+import { VoiceMode, type VoiceBridge } from "./voice";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -180,6 +181,8 @@ function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
+  const [voiceAvail, setVoiceAvail] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   const esRef = useRef<EventSource | null>(null);
   const esOpen = useRef(false);
@@ -189,6 +192,11 @@ function App() {
   const cwdRef = useRef<string>("");
   const pendingUser = useRef<string[]>([]); // optimistic user turns awaiting their SSE echo
   const forceBottom = useRef(false); // scroll to the end after opening a conversation
+  const activeIdRef = useRef<string | null>(null); // latest activeId for stable callbacks (voice)
+  const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
+  const voiceSinks = useRef<Set<(e: AppEvent) => void>>(new Set()); // voice-mode event subscribers
+  useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
+  useEffect(() => { modelRef.current = model; }, [model]);
 
   const refreshConvs = useCallback(() => { api.convs().then((d) => setConvs(d.conversations || [])).catch(() => {}); }, []);
   const refreshFavs = useCallback(() => { api.favorites().then((d) => setFavorites(new Set(d.favorites || []))).catch(() => {}); }, []);
@@ -197,7 +205,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
     refreshConvs();
     refreshFavs();
     const c = new URLSearchParams(location.search).get("c");
@@ -242,7 +250,8 @@ function App() {
   const closeStream = () => { esRef.current?.close(); esRef.current = null; esOpen.current = false; };
 
   const handleEvent = useCallback((e: AppEvent) => {
-    if (e.t === "init") { setActiveId(e.sessionId); history.replaceState(null, "", `/app?c=${e.sessionId}`); setTimeout(refreshConvs, 400); return; }
+    for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode (streaming text, result, error)
+    if (e.t === "init") { setActiveId(e.sessionId); activeIdRef.current = e.sessionId; history.replaceState(null, "", `/app?c=${e.sessionId}`); setTimeout(refreshConvs, 400); return; }
     // user echo: if we already rendered this turn optimistically, drop the echo
     if (e.t === "user") { if (pendingUser.current[0] === e.text) { pendingUser.current.shift(); return; } setItems((it) => applyEvent(it, e)); return; }
     if (e.t === "busy") { setBusy(e.busy); return; }
@@ -280,24 +289,37 @@ function App() {
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
 
+  // Core send used by both the composer and voice mode. Renders the user turn optimistically,
+  // starts/resumes the conversation, and returns its session id. Stable (reads refs) so the
+  // voice bridge identity never churns.
+  const submitText = useCallback(async (text: string): Promise<string | null> => {
+    if (!text.trim()) return null;
+    setBusy(true);
+    pendingUser.current.push(text);
+    setItems((it) => applyEvent(it, { t: "user", text }));
+    try {
+      if (esOpen.current && activeIdRef.current) { await api.send({ id: activeIdRef.current, text }); return activeIdRef.current; }
+      const r = await api.start({ text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined });
+      if (r?.id) { setActiveId(r.id); activeIdRef.current = r.id; openStream(r.id); return r.id; }
+      setBusy(false); return null;
+    } catch { setBusy(false); return null; }
+  }, [openStream]);
+
   const doSend = async () => {
     const raw = input.trim();
     if ((!raw && !attachments.length) || busy) return;
     let text = raw;
     if (attachments.length) text = "Attached files:\n" + attachments.map((a) => a.path).join("\n") + (raw ? "\n\n" + raw : "");
-    setInput(""); setAttachments([]); setBusy(true);
+    setInput(""); setAttachments([]);
     if (taRef.current) taRef.current.style.height = "auto";
-    // render the user's message immediately; the server's SSE echo is deduped in handleEvent
-    pendingUser.current.push(text);
-    setItems((it) => applyEvent(it, { t: "user", text }));
-    try {
-      if (esOpen.current && activeId) { await api.send({ id: activeId, text }); }
-      else {
-        const r = await api.start({ text, resume: activeId || undefined, model: model || undefined, cwd: cwdRef.current || undefined });
-        if (r?.id) { setActiveId(r.id); openStream(r.id); } else { setBusy(false); }
-      }
-    } catch { setBusy(false); }
+    await submitText(text);
   };
+
+  // Stable bridge handed to voice mode: submit a turn + subscribe to the live event stream.
+  const voiceBridge = useMemo<VoiceBridge>(() => ({
+    submit: submitText,
+    subscribe: (fn) => { voiceSinks.current.add(fn as (e: AppEvent) => void); return () => { voiceSinks.current.delete(fn as (e: AppEvent) => void); }; },
+  }), [submitText]);
 
   const stop = async () => { if (activeId) await api.interrupt(activeId); setBusy(false); };
 
@@ -469,6 +491,11 @@ function App() {
                 <input type="file" style={{ display: "none" }} onChange={onFile} />
               </label>
               <div className="spacer" />
+              {voiceAvail && (
+                <button className="act-btn voice-open-btn" onClick={() => setVoiceOpen(true)} title="Hands-free voice mode">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z" stroke="currentColor" strokeWidth="1.7" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /></svg>
+                </button>
+              )}
               {busy ? (
                 <button className="send-btn stop-btn" onClick={stop} title="Stop">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
@@ -483,6 +510,7 @@ function App() {
           <div className="hint">Claude runs with tools enabled in {cwdRef.current || "the default folder"}. Enter to send, Shift+Enter for a new line.</div>
         </div>
       </main>
+      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} />
     </div>
   );
 }

@@ -1,0 +1,7 @@
+# Python virtualenvs + build/cache artifacts for the voice services. The service code,
+# pyproject.toml, uv.lock, and systemd units ARE tracked; models are fetched into
+# ~/.cache/huggingface at first run (see README).
+.venv/
+__pycache__/
+*.pyc
+.uv/

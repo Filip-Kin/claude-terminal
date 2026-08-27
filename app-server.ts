@@ -20,6 +20,8 @@ export interface AppCtx {
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
   favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
   titlesFile: string; // JSON map {sessionId: customTitle} — user-renamed conversations
+  sttUrl?: string; // local Whisper service base URL (loopback); enables hands-free voice in
+  ttsUrl?: string; // local Kokoro service base URL (loopback); enables voice out
 }
 
 // #region favorites (starred conversations) — server-side, shared across the owner's devices
@@ -169,7 +171,40 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   // --- API ---
-  if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, moreModels: ctx.moreModels, defaultCwd: ctx.defaultCwd }, ctx, req);
+  if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, moreModels: ctx.moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl) }, ctx, req);
+
+  // --- Voice mode proxies (owner-gated above). Forward to the loopback Whisper/Kokoro
+  //     services so the mic audio + synthesized speech never leave the box unproxied. ---
+  if (req.method === "POST" && path === "/app/api/stt") {
+    if (!ctx.sttUrl) return jsonRes({ error: "stt not configured" }, ctx, req, 503);
+    try {
+      const body = await req.arrayBuffer(); // multipart form-data with the recorded clip
+      const up = await fetch(ctx.sttUrl.replace(/\/$/, "") + "/transcribe", {
+        method: "POST",
+        headers: { "content-type": req.headers.get("content-type") || "application/octet-stream" },
+        body,
+      });
+      const text = await up.text();
+      return new Response(text, { status: up.status, headers: { ...ctx.cors(req), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    } catch (e: any) {
+      return jsonRes({ error: "stt upstream: " + (e?.message || e) }, ctx, req, 502);
+    }
+  }
+  if (req.method === "POST" && path === "/app/api/tts") {
+    if (!ctx.ttsUrl) return jsonRes({ error: "tts not configured" }, ctx, req, 503);
+    try {
+      const body = await req.arrayBuffer(); // {text, voice?, speed?}
+      const up = await fetch(ctx.ttsUrl.replace(/\/$/, "") + "/speak", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      if (!up.ok) { const t = await up.text(); return new Response(t, { status: up.status, headers: { ...ctx.cors(req), "Content-Type": "application/json" } }); }
+      return new Response(up.body, { status: 200, headers: { ...ctx.cors(req), "Content-Type": "audio/wav", "Cache-Control": "no-store" } });
+    } catch (e: any) {
+      return jsonRes({ error: "tts upstream: " + (e?.message || e) }, ctx, req, 502);
+    }
+  }
 
   if (req.method === "GET" && path === "/app/api/titles") {
     const t = await loadTitles(ctx.titlesFile);
