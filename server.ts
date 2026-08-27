@@ -14,6 +14,7 @@ import { Database } from "bun:sqlite";
 import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
 import { Connections } from "./connections.ts";
+import { appRoutes, type AppCtx } from "./app-server.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -546,11 +547,35 @@ async function spawnWorker(name: string | undefined, cwd: string, prompt: string
 // is set -> the overlay hides the whole Connections UI on a vanilla install.
 const conns = new Connections(STATE_DIR, cfg.netApplyHelper);
 
+// #region chat-app front-end (the "looks like the Claude app" interface, /app*)
+// Only the owner reaches it (gateTerminal). Guest sidecars set usagePage:false but this
+// is independent of that; guests simply never get an /app route in the router. Model list
+// is config-overridable; the ids are CLI/SDK model aliases resolved at query time.
+const APP_MODELS: { id: string; label: string }[] = cfg.appModels || [
+  { id: "opus", label: "Opus" },
+  { id: "sonnet", label: "Sonnet" },
+  { id: "haiku", label: "Haiku" },
+];
+const appCtx: AppCtx = {
+  allowed,
+  cors,
+  publicDir: PUBLIC_DIR,
+  dataDir: cfg.dataDir,
+  historyHide: cfg.historyHide || [],
+  defaultCwd: SPAWN_CWD,
+  models: APP_MODELS,
+};
+// #endregion
+
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
   async fetch(req) {
     const path = new URL(req.url).pathname;
+
+    // Chat-app front-end (/app*). Returns null for non-app paths so the rest still matches.
+    const appRes = await appRoutes(req, path, appCtx);
+    if (appRes) return appRes;
 
     // Deterministic live push: the collector POSTs here after it commits usage.db.
     // The server binds 127.0.0.1 only, so this is inherently localhost-only.
