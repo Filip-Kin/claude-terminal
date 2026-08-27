@@ -441,14 +441,10 @@ function injectVoiceCss() {
   .voice-skip{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#ececf1;border-radius:999px;padding:12px 26px;font-size:15px;font-weight:600;cursor:pointer}
   .voice-skip:active{background:rgba(255,255,255,.16)}
   @media (min-width:720px){.voice-transcript{max-width:640px;margin:0 auto;width:100%}}
-  /* composer mic button: a gentle breathing hint that this opens hands-free voice */
-  .voice-open-btn{position:relative}
-  .voice-open-btn svg{animation:micBreathe 2.8s ease-in-out infinite;transform-origin:center}
-  .voice-open-btn::after{content:"";position:absolute;inset:0;border-radius:50%;pointer-events:none;box-shadow:0 0 0 0 rgba(91,140,255,.45);animation:micPing 2.8s ease-out infinite}
+  /* composer mic button: static (no constant animation); the icon just reacts on tap */
+  .voice-open-btn{position:relative;transform-origin:center}
+  .voice-open-btn svg{transition:transform .12s ease}
   .voice-open-btn:active svg{transform:scale(.9)}
-  @keyframes micBreathe{0%,100%{transform:scale(1)}50%{transform:scale(1.12)}}
-  @keyframes micPing{0%{box-shadow:0 0 0 0 rgba(91,140,255,.5)}70%,100%{box-shadow:0 0 0 11px rgba(91,140,255,0)}}
-  @media (prefers-reduced-motion:reduce){.voice-open-btn svg,.voice-open-btn::after{animation:none!important}}
   `;
   const el = document.createElement("style"); el.id = "voice-css"; el.textContent = css; document.head.appendChild(el);
 }
