@@ -52,7 +52,7 @@ type AppEvent =
 type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
-  | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number }
+  | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "compact" };
@@ -110,9 +110,22 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
     case "thinking_delta":
       if (last && last.kind === "thinking") { const c = items.slice(); c[c.length - 1] = { ...last, text: last.text + e.text }; return c; }
       return [...items, { kind: "thinking", text: e.text, started: Date.now() }];
-    case "thinking_progress":
-      if (last && last.kind === "thinking") { const c = items.slice(); c[c.length - 1] = { ...last, tokens: e.tokens }; return c; }
-      return [...items, { kind: "thinking", text: "", tokens: e.tokens, started: Date.now() }];
+    case "thinking_progress": {
+      // estimated_tokens resets across thinking sub-segments (goes up, then drops back on a new
+      // segment). Track the running peak per segment and carry a base of prior peaks so the
+      // displayed count is a monotonic total for the whole block, not the instantaneous reading.
+      const v = e.tokens || 0;
+      if (last && last.kind === "thinking") {
+        const peak = last._peak || 0;
+        const base = last._base || 0;
+        const nextBase = v < peak ? base + peak : base; // reset detected -> bank the last peak
+        const nextPeak = v < peak ? v : v;
+        const c = items.slice();
+        c[c.length - 1] = { ...last, _base: nextBase, _peak: nextPeak, tokens: nextBase + nextPeak };
+        return c;
+      }
+      return [...items, { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now() }];
+    }
     case "thinking": return [...items, { kind: "thinking", text: e.text }];
     case "tool_use": return [...items, { kind: "tool", id: e.id, name: e.name, input: e.input }];
     case "tool_result": {
@@ -176,9 +189,27 @@ function Assistant({ text }: { text: string }) {
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-// Thinking indicator. Live: "Thinking… 12s" ticking every second (+ token estimate when the
-// platform sends one). Done: "Thought for 12s · ~340 tokens". Reasoning text, when the platform
-// exposes it (subscription auth usually redacts it), renders below.
+const fmtDur = (secs: number) => (secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`);
+
+// Sum the thinking time + tokens for the turn that ends at assistant block `i` (walk back to the
+// previous user/compact = turn start). Powers the Claude-Code-style summary under the final reply.
+function turnThinkingTotals(items: Item[], i: number): { ms: number; tokens: number } | null {
+  let start = 0;
+  for (let k = i - 1; k >= 0; k--) { if (items[k].kind === "user" || items[k].kind === "compact") { start = k + 1; break; } }
+  let ms = 0, tokens = 0, any = false;
+  for (let k = start; k <= i; k++) {
+    const it = items[k];
+    if (it.kind !== "thinking") continue;
+    any = true;
+    if (it.elapsed != null) ms += it.elapsed; else if (it.started) ms += Math.max(0, Date.now() - it.started);
+    if (it.tokens) tokens += it.tokens;
+  }
+  return any ? { ms, tokens } : null;
+}
+
+// Thinking indicator. LIVE: "Thinking… 12s · ~340 tokens" ticking each second. When done we hide
+// the standalone indicator (the turn summary under the final reply carries the totals), unless the
+// platform actually exposed the reasoning text — then we show that.
 function ThinkingCard({ it, isLast }: { it: Extract<Item, { kind: "thinking" }>; isLast: boolean }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -186,17 +217,16 @@ function ThinkingCard({ it, isLast }: { it: Extract<Item, { kind: "thinking" }>;
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, [isLast]);
-  const secs = it.started
-    ? (isLast ? Math.max(0, Math.round((now - it.started) / 1000)) : it.elapsed != null ? Math.round(it.elapsed / 1000) : null)
-    : null;
-  const dur = secs == null ? "" : secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
-  const tok = it.tokens ? `~${it.tokens} tokens` : "";
-  const label = isLast ? "Thinking" : "Thought";
-  const meta = [isLast ? dur : dur && `for ${dur}`, tok].filter(Boolean).join(" · ");
+  if (!isLast) {
+    // finished: only worth showing if the reasoning text is exposed (usually redacted on subscription auth)
+    return it.text ? (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>) : null;
+  }
+  const secs = it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
+  const meta = [secs == null ? "" : fmtDur(secs), it.tokens ? `~${it.tokens} tokens` : ""].filter(Boolean).join(" · ");
   return (
-    <div className={"thinking think-progress" + (isLast ? " live" : "")}>
-      <span className="think-label">{label}</span>
-      {isLast && <span className="think-ellipsis">…</span>}
+    <div className="thinking think-progress live">
+      <span className="think-label">Thinking</span>
+      <span className="think-ellipsis">…</span>
       {meta && <span className="think-tok">{meta}</span>}
       {it.text && <div className="think-text">{it.text}</div>}
     </div>
@@ -241,7 +271,18 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   // assistant — show a role label only when it opens an assistant run
   const prev = items[i - 1];
   const showRole = !prev || prev.kind === "user" || prev.kind === "compact";
-  return (<div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>{showRole && <div className="role">Claude</div>}<Assistant text={it.text} /></div>);
+  // Turn-final assistant block? Show a Claude-Code-style "Thought for Xs · ~N tokens" footer that
+  // totals the turn's thinking. Only on the last text of the turn (next is a new user turn / end).
+  const next = items[i + 1];
+  const turnFinal = !next || next.kind === "user" || next.kind === "compact";
+  const totals = turnFinal ? turnThinkingTotals(items, i) : null;
+  return (
+    <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
+      {showRole && <div className="role">Claude</div>}
+      <Assistant text={it.text} />
+      {totals && <div className="turn-think">Thought for {fmtDur(Math.round(totals.ms / 1000))}{totals.tokens ? ` · ~${totals.tokens} tokens` : ""}</div>}
+    </div>
+  );
 }
 // #endregion
 
