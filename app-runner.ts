@@ -7,7 +7,8 @@
 // Auth: inherits the box's Claude login (claude.ai subscription, apiKeySource "none") —
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
-import { query, type SDKMessage, type SDKUserMessage, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
@@ -20,6 +21,8 @@ export type AppEvent =
   | { t: "tool_use"; id: string; name: string; input: unknown }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
   | { t: "compact"; trigger: "manual" | "auto" }
+  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[] } // Claude asks with tappable options
+  | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
   | { t: "user"; text: string } // an echoed user turn (used by history replay)
   | { t: "result"; subtype: string; sessionId: string; costUsd: number }
   | { t: "busy"; busy: boolean }
@@ -59,6 +62,9 @@ export class Conversation {
   private closed = false;
   private subs = new Set<Sub>();
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
+  private pendingAsks = new Map<string, (answer: string) => void>(); // ask_user awaiting a tap
+  private askCounter = 0;
+  private askToolUseIds = new Set<string>(); // tool_use ids of ask_user calls — their raw tool card/result are suppressed (the ask card replaces them)
   private runStart = 0; // index in `log` where the CURRENT turn began — new subscribers only
   // get this turn's events, not the whole multi-turn history (which the client already has
   // from the transcript). Otherwise reopening a live conversation replays every prior turn.
@@ -110,10 +116,49 @@ export class Conversation {
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
 
+  // The user tapped an option (or dismissed) for an ask_user prompt.
+  answerAsk(askId: string, answer: string): boolean {
+    const resolve = this.pendingAsks.get(askId);
+    if (!resolve) return false;
+    this.pendingAsks.delete(askId);
+    this.emit({ t: "ask_done", askId, answer });
+    resolve(answer);
+    return true;
+  }
+
+  // In-process MCP server exposing an `ask_user` tool so Claude can ask with tappable options.
+  // The handler emits an `ask` event to the client and blocks until answerAsk() resolves it.
+  private makeAskServer() {
+    return createSdkMcpServer({
+      name: "app-ui",
+      tools: [
+        tool(
+          "ask_user",
+          "Ask the user a question and let them pick from a few tappable options. PREFER this over asking in plain prose whenever you are offering the user a choice between a small set of options (yes/no, pick one of N, which approach, etc.). Returns the option the user chose.",
+          {
+            question: z.string().describe("The question to ask the user"),
+            options: z.array(z.object({ label: z.string().describe("Short option label the user taps"), description: z.string().optional().describe("Optional one-line clarification") })).min(2).max(6).describe("2-6 options to choose from"),
+          },
+          async (args: { question: string; options: { label: string; description?: string }[] }) => {
+            if (this.closed) return { content: [{ type: "text" as const, text: "(conversation closed)" }] };
+            const askId = `${this.id}-ask-${this.askCounter++}`;
+            const answer = await new Promise<string>((resolve) => {
+              this.pendingAsks.set(askId, resolve);
+              this.emit({ t: "ask", askId, question: args.question, options: args.options });
+            });
+            return { content: [{ type: "text" as const, text: answer }] };
+          },
+        ),
+      ],
+    });
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); }
+    for (const [, resolve] of this.pendingAsks) resolve("(the user did not answer)"); // unblock any pending ask
+    this.pendingAsks.clear();
     try { this.q?.close(); } catch {}
     this.emit({ t: "closed" });
   }
@@ -146,6 +191,7 @@ export class Conversation {
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
         thinking: { type: "adaptive" }, // let Claude think; we render it streaming
+        mcpServers: { "app-ui": this.makeAskServer() }, // ask_user tool -> tappable options in the UI
       },
     });
     try {
@@ -187,14 +233,16 @@ export class Conversation {
         // message we only need tool_use (its input is complete here).
         const blocks = (anyM.message?.content as any[]) || [];
         for (const b of blocks) {
-          if (b?.type === "tool_use") this.emit({ t: "tool_use", id: b.id, name: b.name, input: b.input });
+          if (b?.type !== "tool_use") continue;
+          if (b.name === "mcp__app-ui__ask_user") { this.askToolUseIds.add(b.id); continue; } // the ask card renders this, not a raw tool card
+          this.emit({ t: "tool_use", id: b.id, name: b.name, input: b.input });
         }
         break;
       }
       case "user": {
         // tool_result blocks come back as a user message
         const c = anyM.message?.content;
-        if (Array.isArray(c)) for (const b of c) if (b?.type === "tool_result") this.emit({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error });
+        if (Array.isArray(c)) for (const b of c) if (b?.type === "tool_result") { if (this.askToolUseIds.has(b.tool_use_id)) continue; this.emit({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error }); }
         break;
       }
       case "result":

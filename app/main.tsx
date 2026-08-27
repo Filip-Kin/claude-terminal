@@ -22,6 +22,8 @@ type AppEvent =
   | { t: "tool_use"; id: string; name: string; input: unknown; _seq?: number }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean; _seq?: number }
   | { t: "compact"; trigger: string; _seq?: number }
+  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; _seq?: number }
+  | { t: "ask_done"; askId: string; answer: string; _seq?: number }
   | { t: "user"; text: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; _seq?: number }
   | { t: "busy"; busy: boolean; _seq?: number }
@@ -33,6 +35,7 @@ type Item =
   | { kind: "assistant"; text: string }
   | { kind: "thinking"; text: string; tokens?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
+  | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; answered?: string }
   | { kind: "compact" };
 // #endregion
 
@@ -59,6 +62,8 @@ const api = {
   setTitle: (id: string, title: string) =>
     fetch("/app/api/title", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, title }) }).then(J),
   search: (q: string) => fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J),
+  answerAsk: (id: string, askId: string, answer: string) =>
+    fetch("/app/api/ask-answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, askId, answer }) }).then(J),
 };
 // #endregion
 
@@ -92,6 +97,12 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       return items;
     }
     case "compact": return [...items, { kind: "compact" }];
+    case "ask": return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options }];
+    case "ask_done": {
+      const idx = items.findIndex((it) => it.kind === "ask" && it.askId === e.askId);
+      if (idx < 0) return items;
+      const c = items.slice(); c[idx] = { ...(c[idx] as Extract<Item, { kind: "ask" }>), answered: e.answer }; return c;
+    }
     default: return items;
   }
 }
@@ -134,10 +145,23 @@ function Assistant({ text }: { text: string }) {
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-function MessageBlock({ items, i }: { items: Item[]; i: number }) {
+function MessageBlock({ items, i, onAnswer }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void }) {
   const it = items[i];
   if (it.kind === "user") return (<div className="msg"><div className="bubble-user">{it.text}</div></div>);
   if (it.kind === "compact") return <div className="compact-div">conversation compacted</div>;
+  if (it.kind === "ask") return (
+    <div className="ask-card">
+      <div className="ask-q">{it.question}</div>
+      <div className="ask-opts">
+        {it.options.map((o, k) => (
+          <button key={k} className={"ask-opt" + (it.answered !== undefined ? " done" : "") + (it.answered === o.label ? " chosen" : "")} disabled={it.answered !== undefined} onClick={() => onAnswer(it.askId, o.label)}>
+            <span className="ask-opt-label">{o.label}</span>
+            {o.description && <span className="ask-opt-desc">{o.description}</span>}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
   if (it.kind === "thinking") {
     const isLast = i === items.length - 1;
     if (it.text) return (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>);
@@ -400,6 +424,12 @@ function App() {
 
   const stop = async () => { if (activeId) await api.interrupt(activeId); setBusy(false); };
 
+  // User tapped an ask_user option: mark it chosen locally + tell the server (unblocks Claude).
+  const answerAsk = useCallback((askId: string, answer: string) => {
+    setItems((its) => its.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)));
+    if (activeIdRef.current) api.answerAsk(activeIdRef.current, askId, answer).catch(() => {});
+  }, []);
+
   const onPickModel = async (m: string) => {
     setModel(m); localStorage.setItem("ct-app-model", m); setMenuOpen(false); setOtherOpen(false);
     if (esOpen.current && activeId) { try { await api.setModel({ id: activeId, model: m }); } catch { /* */ } }
@@ -582,7 +612,7 @@ function App() {
             </div>
           ) : (
             <div className="thread">
-              {items.map((_, i) => <MessageBlock key={i} items={items} i={i} />)}
+              {items.map((_, i) => <MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} />)}
               {busy && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}

@@ -252,6 +252,18 @@ a { color: var(--accent-2); }
 .net-banner { flex: 0 0 auto; text-align: center; font-size: 12.5px; padding: 7px 14px; background: #3a2c17; color: #f0cf9c; border-bottom: 1px solid var(--line-2); }
 .net-banner.sending { background: #24201b; color: var(--text-2); }
 
+/* ask_user card (Claude asks with tappable options) */
+.ask-card { align-self: stretch; background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin: 0 0 14px; }
+.ask-q { font-size: 15px; font-weight: 500; color: var(--text); margin-bottom: 12px; line-height: 1.45; }
+.ask-opts { display: flex; flex-direction: column; gap: 8px; }
+.ask-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 10px 13px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 10px; color: var(--text); transition: background .12s, border-color .12s; }
+.ask-opt:hover:not(:disabled) { background: #322b26; border-color: var(--accent); }
+.ask-opt:disabled { cursor: default; opacity: .5; }
+.ask-opt.chosen { border-color: var(--accent); background: rgba(217, 119, 87, .14); opacity: 1; }
+.ask-opt .ask-opt-label { font-weight: 500; font-size: 14px; }
+.ask-opt.chosen .ask-opt-label::after { content: " ✓"; color: var(--accent); }
+.ask-opt .ask-opt-desc { font-size: 12px; color: var(--text-3); }
+
 /* ---------- mobile ---------- */
 @media (max-width: 820px) {
   .icon-btn { display: inline-flex; }

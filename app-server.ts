@@ -356,6 +356,17 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     return jsonRes({ ok: !!conv }, ctx, req);
   }
 
+  // The user tapped an option for an ask_user prompt -> unblock the tool + let Claude continue.
+  if (req.method === "POST" && path === "/app/api/ask-answer") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const conv = b.id ? get(String(b.id)) : undefined;
+    const askId = String(b.askId || "");
+    const answer = String(b.answer ?? "");
+    if (!conv || !askId) return jsonRes({ error: "id + askId required" }, ctx, req, 400);
+    const ok = conv.answerAsk(askId, answer);
+    return jsonRes({ ok }, ctx, req);
+  }
+
   // File upload into a conversation's cwd (so Claude can read it next turn).
   if (req.method === "POST" && path === "/app/api/upload") {
     const ct = req.headers.get("content-type") || "";
