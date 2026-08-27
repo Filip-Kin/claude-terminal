@@ -6,7 +6,7 @@
 // or null to let server.ts keep matching its own routes.
 
 import { join } from "path";
-import { readdirSync, statSync } from "fs";
+import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { getOrCreate, get, replayTranscript, type AppEvent, type AskNotifier } from "./app-runner";
 
 export interface AppCtx {
@@ -282,6 +282,24 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     return jsonRes({ conversations: out, favorites, nextOffset: i, hasMore }, ctx, req);
   }
 
+  // Delete a conversation: remove its transcript (+ any subagents sidecar dir) and drop it from
+  // favorites/titles. Guarded to the data dir and refuses agent/automation dirs.
+  if (req.method === "POST" && path === "/app/api/delete") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const id = String(b.id || "");
+    if (!/^[A-Za-z0-9-]{6,}$/.test(id)) return jsonRes({ error: "bad id" }, ctx, req, 400);
+    const t = findTranscript(ctx, id);
+    if (!t) return jsonRes({ error: "not found" }, ctx, req, 404);
+    const pdir = join(ctx.dataDir, t.project);
+    if (ctx.hideProjectDirs.some((d) => pdir === d || pdir.startsWith(d + "/"))) return jsonRes({ error: "forbidden" }, ctx, req, 403);
+    try { get(id)?.close(); } catch {} // stop a live session first
+    try { unlinkSync(t.path); } catch {}
+    try { rmSync(join(pdir, id), { recursive: true, force: true }); } catch {} // subagents/<id> sidecar dir
+    const favs = await loadFavs(ctx.favoritesFile); if (favs.delete(id)) await saveFavs(ctx.favoritesFile);
+    const titles = await loadTitles(ctx.titlesFile); if (titles[id]) { delete titles[id]; await saveTitles(ctx.titlesFile); }
+    return jsonRes({ ok: true }, ctx, req);
+  }
+
   // Full-text message search across conversations. Title matching is done client-side
   // (instant, offline-friendly); this searches message CONTENT and returns a snippet +
   // match count per conversation so you can find a specific message.
@@ -424,7 +442,11 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const id = u.searchParams.get("id") || "";
     const rel = u.searchParams.get("path") || "";
     const conv = id ? get(id) : undefined;
-    const base = conv?.cwd || ctx.defaultCwd;
+    let base = conv?.cwd || undefined;
+    // Not live in memory (a historical conversation)? Recover its cwd from the transcript so
+    // image previews in the chat log still resolve.
+    if (!base && /^[A-Za-z0-9-]{6,}$/.test(id)) { const t = findTranscript(ctx, id); if (t) base = (await convMeta(t.path)).cwd || undefined; }
+    base = base || ctx.defaultCwd;
     const target = rel.startsWith("/") ? rel : join(base, rel);
     if (!target.startsWith(base + "/") && target !== base) return jsonRes({ error: "path outside conversation" }, ctx, req, 403);
     const f = Bun.file(target);

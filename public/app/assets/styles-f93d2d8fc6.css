@@ -224,6 +224,13 @@ a { color: var(--accent-2); }
 .chip-img { padding: 3px 8px 3px 3px; }
 .chip-thumb { width: 28px; height: 28px; object-fit: cover; border-radius: 5px; flex: 0 0 auto; }
 .msg-img { max-width: min(260px, 70%); max-height: 260px; border-radius: 10px; margin: 4px 0; display: block; border: 1px solid var(--line); }
+.msg-file { font-size: 13px; color: var(--text-2); margin: 2px 0; }
+.bubble-user-text { margin-top: 4px; white-space: pre-wrap; }
+.ctx-scrim { position: fixed; inset: 0; z-index: 60; }
+.ctx-menu { position: fixed; z-index: 61; min-width: 150px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 5px; box-shadow: 0 10px 30px rgba(0,0,0,.4); display: flex; flex-direction: column; }
+.ctx-menu button { text-align: left; background: none; border: 0; color: var(--text); padding: 9px 12px; border-radius: 7px; font-size: 14px; cursor: pointer; }
+.ctx-menu button:hover { background: var(--bg-3); }
+.ctx-menu .ctx-danger { color: var(--error, #EF4444); }
 .composer textarea {
   resize: none; border: none; outline: none; background: transparent; color: var(--text);
   font-family: inherit; font-size: 15px; line-height: 1.5; max-height: 220px; padding: 6px 0; width: 100%;

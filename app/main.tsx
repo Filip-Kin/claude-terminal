@@ -13,6 +13,21 @@ marked.setOptions({ gfm: true, breaks: true });
 // Coarse pointer + no hover ≈ phone/tablet. Drives the Enter-to-send vs Enter-newline behaviour.
 const IS_TOUCH = typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
 
+// Long-press (touch, ~500ms, cancelled on scroll) or right-click (desktop) → open a context menu at
+// (x, y). Returns handlers to spread onto the target element.
+function longPressBind(open: (x: number, y: number) => void) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let sx = 0, sy = 0, fired = false;
+  const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  return {
+    onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); open(e.clientX, e.clientY); },
+    onTouchStart: (e: React.TouchEvent) => { const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; open(sx, sy); }, 500); },
+    onTouchMove: (e: React.TouchEvent) => { const t = e.touches[0]; if (t && (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10)) clear(); },
+    onTouchEnd: (e: React.TouchEvent) => { clear(); if (fired) { e.preventDefault(); fired = false; } }, // swallow the click that a long-press would otherwise fire
+    onTouchCancel: clear,
+  };
+}
+
 // #region types
 type Model = { id: string; label: string };
 type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean };
@@ -65,6 +80,7 @@ const api = {
     fetch("/app/api/favorites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, fav }) }).then(J),
   setTitle: (id: string, title: string) =>
     fetch("/app/api/title", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, title }) }).then(J),
+  del: (id: string) => fetch("/app/api/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
   search: (q: string) => fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J),
   answerAsk: (id: string, askId: string, answer: string) =>
     fetch("/app/api/ask-answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, askId, answer }) }).then(J),
@@ -187,9 +203,34 @@ function ThinkingCard({ it, isLast }: { it: Extract<Item, { kind: "thinking" }>;
   );
 }
 
-function MessageBlock({ items, i, onAnswer }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void }) {
+const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|heic|heif|svg|avif)$/i;
+// A user turn that carried attachments is stored as "Attached files:\n<path>\n...\n\n<message>".
+// Split it back out so image paths render as thumbnails and the typed message shows on its own.
+function parseUserText(text: string): { images: string[]; files: string[]; body: string } {
+  if (!text.startsWith("Attached files:\n")) return { images: [], files: [], body: text };
+  const rest = text.slice("Attached files:\n".length);
+  const nl = rest.indexOf("\n\n");
+  const block = nl >= 0 ? rest.slice(0, nl) : rest;
+  const body = nl >= 0 ? rest.slice(nl + 2) : "";
+  const paths = block.split("\n").map((s) => s.trim()).filter(Boolean);
+  return { images: paths.filter((p) => IMG_RE.test(p)), files: paths.filter((p) => !IMG_RE.test(p)), body };
+}
+
+function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant") => void }) {
   const it = items[i];
-  if (it.kind === "user") return (<div className="msg"><div className="bubble-user">{it.text}</div></div>);
+  const menuBind = (text: string, kind: "user" | "assistant") => onMenu ? longPressBind((x, y) => onMenu(x, y, text, kind)) : {};
+  if (it.kind === "user") {
+    const { images, files, body } = parseUserText(it.text);
+    return (
+      <div className="msg">
+        <div className="bubble-user" {...menuBind(body || it.text, "user")}>
+          {images.map((p, k) => <img key={k} className="msg-img" loading="lazy" src={`/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`} alt="attachment" />)}
+          {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
+          {body && <div className="bubble-user-text">{body}</div>}
+        </div>
+      </div>
+    );
+  }
   if (it.kind === "compact") return <div className="compact-div">conversation compacted</div>;
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
@@ -197,7 +238,7 @@ function MessageBlock({ items, i, onAnswer }: { items: Item[]; i: number; onAnsw
   // assistant — show a role label only when it opens an assistant run
   const prev = items[i - 1];
   const showRole = !prev || prev.kind === "user" || prev.kind === "compact";
-  return (<div className="msg bubble-assistant">{showRole && <div className="role">Claude</div>}<Assistant text={it.text} /></div>);
+  return (<div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>{showRole && <div className="role">Claude</div>}<Assistant text={it.text} /></div>);
 }
 // #endregion
 
@@ -232,6 +273,8 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant" } | null>(null);
+  const [convMenu, setConvMenu] = useState<{ x: number; y: number; id: string; title: string; fav: boolean } | null>(null);
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
   const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
   const [voiceAvail, setVoiceAvail] = useState(false);
@@ -246,6 +289,7 @@ function App() {
   const esOpen = useRef(false);
   const lastSeq = useRef(-1);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const newChatRef = useRef<(() => void) | null>(null); // lets earlier callbacks reset to a blank chat
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const cwdRef = useRef<string>("");
   const pendingUser = useRef<string[]>([]); // optimistic user turns awaiting their SSE echo
@@ -410,6 +454,7 @@ function App() {
   }, [defaultCwd, openStream]);
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
+  newChatRef.current = newChat;
 
   // #region offline: online/offline detection + queued-message drain
   const drainQueueUI = useCallback(async () => {
@@ -511,6 +556,26 @@ function App() {
 
   const stop = async () => { if (activeId) await api.interrupt(activeId); setBusy(false); };
 
+  // #region context menus (long-press / right-click): message copy+edit, conversation rename+delete
+  const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant") => setMsgMenu({ x, y, text, kind }), []);
+  const copyText = (t: string) => { try { void navigator.clipboard?.writeText(t); } catch { /* */ } };
+  const editIntoComposer = (t: string) => { setInput(t); setMsgMenu(null); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
+  const deleteConv = useCallback(async (id: string) => {
+    setConvMenu(null);
+    setConvs((cs) => cs.filter((c) => c.sessionId !== id)); // optimistic
+    try { await api.del(id); } catch { refreshConvs(); return; }
+    if (activeIdRef.current === id) newChatRef.current?.();
+  }, [refreshConvs]);
+  const renameConv = async (id: string, current: string) => {
+    setConvMenu(null);
+    const next = (typeof window !== "undefined" ? window.prompt("Rename conversation", current) : null);
+    if (next == null) return;
+    const t = next.trim();
+    setConvs((cs) => cs.map((c) => (c.sessionId === id ? { ...c, title: t || c.title } : c)));
+    try { await api.setTitle(id, t); } catch { /* */ }
+  };
+  // #endregion
+
   // User tapped an ask_user option: mark it chosen locally + tell the server (unblocks Claude).
   const answerAsk = useCallback((askId: string, answer: string) => {
     setItems((its) => its.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)));
@@ -589,7 +654,7 @@ function App() {
       );
     }
     return (
-      <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId, search.trim() || undefined)}>
+      <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId, search.trim() || undefined)} {...longPressBind((x, y) => setConvMenu({ x, y, id: c.sessionId, title: c.title, fav }))}>
         <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
         <span className="conv-title">{c.title}</span>
         <button className={"conv-star" + (fav ? " on" : "")} onClick={(e) => { e.stopPropagation(); toggleFav(c.sessionId); }} aria-label={fav ? "Unfavorite" : "Favorite"} title={fav ? "Unfavorite" : "Favorite"}>
@@ -759,7 +824,7 @@ function App() {
             </div>
           ) : (
             <div className="thread">
-              {items.map((_, i) => <MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} />)}
+              {items.map((_, i) => <MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} />)}
               {busy && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}
@@ -808,6 +873,25 @@ function App() {
           </div>
         </div>
       </main>
+      {msgMenu && (
+        <>
+          <div className="ctx-scrim" onClick={() => setMsgMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMsgMenu(null); }} />
+          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 120), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
+            <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
+            {msgMenu.kind === "user" && <button onClick={() => editIntoComposer(msgMenu.text)}>Edit</button>}
+          </div>
+        </>
+      )}
+      {convMenu && (
+        <>
+          <div className="ctx-scrim" onClick={() => setConvMenu(null)} onContextMenu={(e) => { e.preventDefault(); setConvMenu(null); }} />
+          <div className="ctx-menu" style={{ top: Math.min(convMenu.y, window.innerHeight - 160), left: Math.min(convMenu.x, window.innerWidth - 180) }}>
+            <button onClick={() => renameConv(convMenu.id, convMenu.title)}>Rename</button>
+            <button onClick={() => { toggleFav(convMenu.id); setConvMenu(null); }}>{convMenu.fav ? "Unfavorite" : "Favorite"}</button>
+            <button className="ctx-danger" onClick={() => deleteConv(convMenu.id)}>Delete</button>
+          </div>
+        </>
+      )}
       <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} />
     </div>
   );
