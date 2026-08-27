@@ -26,6 +26,7 @@ export interface AppCtx {
   sttUrl?: string; // local Whisper service base URL (loopback); enables hands-free voice in
   ttsUrl?: string; // local Kokoro service base URL (loopback); enables voice out
   notifyAsk?: AskNotifier; // push a PWA notification when Claude asks and no client is watching
+  ownerUsage?: () => { output5h: number; url: string } | null; // rolling 5h output + link to the usage page
 }
 
 // #region favorites (starred conversations) — server-side, shared across the owner's devices
@@ -226,6 +227,30 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (title) t[id] = title; else delete t[id]; // empty title clears the override
     await saveTitles(ctx.titlesFile);
     return jsonRes({ ok: true, title: t[id] || null }, ctx, req);
+  }
+
+  // Live context-window usage (for the pie + compaction hint). available:false when the chat isn't
+  // live in memory or the SDK build lacks getContextUsage.
+  if (req.method === "GET" && path === "/app/api/context") {
+    const id = new URL(req.url).searchParams.get("id") || "";
+    const conv = id ? get(id) : undefined;
+    if (!conv) return jsonRes({ available: false }, ctx, req);
+    const cu = await conv.contextUsage();
+    if (!cu) return jsonRes({ available: false }, ctx, req);
+    return jsonRes({ available: true, total: cu.total_tokens, max: cu.raw_max_tokens, percentage: cu.percentage, categories: cu.categories, overLimit: cu.over_limit || null }, ctx, req);
+  }
+  // Manually compact the live conversation (frees context). No-op if the chat isn't live.
+  if (req.method === "POST" && path === "/app/api/compact") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const conv = b.id ? get(String(b.id)) : undefined;
+    if (!conv) return jsonRes({ error: "no live conversation to compact" }, ctx, req, 400);
+    conv.compact();
+    return jsonRes({ ok: true }, ctx, req);
+  }
+  // Owner's rolling 5-hour output tokens + a link to the full usage page (terminal-side dashboard).
+  if (req.method === "GET" && path === "/app/api/usage") {
+    const u = ctx.ownerUsage?.();
+    return jsonRes(u ? { available: true, ...u } : { available: false }, ctx, req);
   }
 
   if (req.method === "GET" && path === "/app/api/favorites") {

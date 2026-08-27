@@ -24,10 +24,18 @@ export type AppEvent =
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
   | { t: "user"; text: string } // an echoed user turn (used by history replay)
-  | { t: "result"; subtype: string; sessionId: string; costUsd: number }
+  // Real token accounting for the turn (from the SDK result message): output = tokens Claude
+  // actually generated this turn (thinking + text + tool-call args); in/cacheRead = context read.
+  | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage }
+  // A background/peer event surfaced in the thread: a subagent task settling, or a message from
+  // another of Filip's running sessions (peer-send-message). kind drives how it renders.
+  | { t: "notice"; kind: "task" | "peer" | "info"; text: string; from?: string; status?: string }
   | { t: "busy"; busy: boolean }
   | { t: "error"; message: string }
   | { t: "closed" };
+
+// Per-turn token usage, plus running cumulative totals across the whole conversation.
+export type TurnUsage = { input: number; output: number; cacheCreate: number; cacheRead: number; total: number; costUsd: number };
 
 type Sub = (e: AppEvent) => void;
 // #endregion
@@ -76,6 +84,7 @@ export class Conversation {
   private pendingAskMeta = new Map<string, PendingAsk>(); // question/options for each open ask, so a reconnect can re-render it
   private askCounter = 0;
   private askToolUseIds = new Set<string>(); // tool_use ids of ask_user calls — their raw tool card/result are suppressed (the ask card replaces them)
+  lastUsage?: TurnUsage; // most recent turn's real token usage (from the SDK result message)
   private runStart = 0; // index in `log` where the CURRENT turn began — new subscribers only
   // get this turn's events, not the whole multi-turn history (which the client already has
   // from the transcript). Otherwise reopening a live conversation replays every prior turn.
@@ -182,6 +191,20 @@ export class Conversation {
     });
   }
 
+  // Live context-window usage (for the pie + compaction hint). Null if the SDK build lacks the
+  // control method or the query isn't running yet.
+  async contextUsage(): Promise<any | null> {
+    try { return this.q ? await (this.q as any).getContextUsage() : null; } catch { return null; }
+  }
+
+  // Trigger a manual compaction. The CLI treats a "/compact" prompt as the compact command; the
+  // resulting compact_boundary streams back as a normal compact event.
+  compact() {
+    if (this.closed) return;
+    const msg: SDKUserMessage = { type: "user", message: { role: "user", content: "/compact" }, parent_tool_use_id: null } as any;
+    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); } else this.queue.push(msg);
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -221,6 +244,7 @@ export class Conversation {
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
         thinking: { type: "adaptive" }, // let Claude think; we render it streaming
+        autoCompactEnabled: true, // compact automatically before the context window fills (default, set explicit)
         mcpServers: { "app-ui": this.makeAskServer() }, // ask_user tool -> tappable options in the UI
       },
     });
@@ -242,6 +266,17 @@ export class Conversation {
       case "system":
         if (anyM.subtype === "init") this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
         else if (anyM.subtype === "compact_boundary") this.emit({ t: "compact", trigger: anyM.compact_metadata?.trigger || "auto" });
+        // Background subagent activity + cross-session messages, surfaced inline so the thread
+        // shows work spun off to other agents (Claude Code's task/notification stream).
+        else if (anyM.subtype === "task_started") this.emit({ t: "notice", kind: "task", text: String(anyM.description || "background task"), status: "started" });
+        else if (anyM.subtype === "task_notification") {
+          const extra = anyM.usage ? ` (${anyM.usage.total_tokens || 0} tokens, ${anyM.usage.tool_uses || 0} tools)` : "";
+          this.emit({ t: "notice", kind: "task", text: String(anyM.summary || "background task") + extra, status: String(anyM.status || "done") });
+        }
+        else if (anyM.subtype === "notification") {
+          const isPeer = anyM.triggeredBy === "peer-send-message" || anyM.provenance === "peer-send-message";
+          this.emit({ t: "notice", kind: isPeer ? "peer" : "info", text: String(anyM.text || ""), from: anyM.from || anyM.sender });
+        }
         break;
       case "stream_event": {
         // live token streaming (includePartialMessages): text + thinking deltas
@@ -275,11 +310,17 @@ export class Conversation {
         if (Array.isArray(c)) for (const b of c) if (b?.type === "tool_result") { if (this.askToolUseIds.has(b.tool_use_id)) continue; this.emit({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error }); }
         break;
       }
-      case "result":
+      case "result": {
         this.busy = false;
-        this.emit({ t: "result", subtype: anyM.subtype, sessionId: anyM.session_id || this.id, costUsd: anyM.total_cost_usd || 0 });
+        const u = anyM.usage || {};
+        const input = u.input_tokens || 0, output = u.output_tokens || 0;
+        const cacheCreate = u.cache_creation_input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0;
+        const usage: TurnUsage = { input, output, cacheCreate, cacheRead, total: input + output + cacheCreate + cacheRead, costUsd: anyM.total_cost_usd || 0 };
+        this.lastUsage = usage;
+        this.emit({ t: "result", subtype: anyM.subtype, sessionId: anyM.session_id || this.id, costUsd: usage.costUsd, usage });
         this.emit({ t: "busy", busy: false });
         break;
+      }
     }
   }
 }

@@ -136,6 +136,11 @@ a { color: var(--accent-2); }
 .model-menu button:hover { background: var(--bg-3); }
 .model-menu .dot { color: var(--accent); }
 .model-menu .model-other { border-top: 1px solid var(--line-2); margin-top: 4px; padding-top: 9px; color: var(--text-2); font-size: 13px; }
+/* In the composer foot the menu opens UPWARD (it sits at the bottom of the screen) and to the left. */
+.model-picker.up .model-menu { top: auto; bottom: 40px; left: 0; right: auto; }
+.model-picker.up .model-btn { padding: 5px 10px; font-size: 12.5px; }
+.composer-foot { display: flex; align-items: center; gap: 8px; padding: 8px 2px 0; }
+.composer-foot .cf-spacer { flex: 1; }
 
 /* model dialog (Other versions) */
 .modal-scrim { position: fixed; inset: 0; z-index: 70; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
@@ -198,6 +203,17 @@ a { color: var(--accent-2); }
 .think-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-style: normal; }
 .think-text { flex-basis: 100%; font-style: italic; font-size: 13px; margin-top: 4px; white-space: pre-wrap; color: var(--text-3); }
 .turn-think { margin-top: 8px; font-size: 11.5px; color: var(--text-3); opacity: .8; font-variant-numeric: tabular-nums; }
+.ctx-ring { display: inline-flex; align-items: center; gap: 5px; background: none; border: 0; color: var(--text-2); cursor: pointer; padding: 2px 4px; border-radius: 8px; }
+.ctx-ring:hover { background: var(--bg-2); }
+.ctx-ring:disabled { opacity: .5; cursor: default; }
+.ctx-pct { font-size: 11px; font-variant-numeric: tabular-nums; }
+.usage-chip { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); text-decoration: none; font-size: 12px; padding: 6px 8px; border-radius: 8px; font-variant-numeric: tabular-nums; }
+.usage-chip:hover { background: var(--bg-2); color: var(--text); }
+.notice { display: flex; align-items: flex-start; gap: 8px; margin: 6px 0; padding: 7px 10px; border-radius: 8px; font-size: 12.5px; background: var(--bg-2); border: 1px solid var(--line); color: var(--text-2); }
+.notice-ic { flex: 0 0 auto; opacity: .8; }
+.notice-peer { border-color: var(--accent); }
+.notice-peer .notice-ic { color: var(--accent); }
+.notice-text { min-width: 0; word-break: break-word; }
 .think-progress .think-label { margin-bottom: 0; }
 .think-progress.live .think-label { color: var(--accent); opacity: 1; }
 .think-progress .think-ellipsis { color: var(--accent); animation: blink 1.2s infinite both; }

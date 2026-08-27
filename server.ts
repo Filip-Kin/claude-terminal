@@ -583,6 +583,16 @@ const appCtx: AppCtx = {
   moreModels: APP_MORE_MODELS,
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
+  // Rolling 5-hour output tokens for the owner + a link to the usage dashboard, for the app's
+  // usage chip (mirrors the terminal-side usage view). Null when there's no usage DB.
+  ownerUsage: () => {
+    if (!db) return null;
+    try {
+      const hours = new Map<string, any>();
+      for (const r of qHours.all(OWNER) as any[]) hours.set(r.hour_utc, { total: r.total, output: r.output });
+      return { output5h: rolling(hours, "output", new Date(), 5), url: cfg.usageUrl || "/usage/" };
+    } catch { return null; }
+  },
   // Hands-free voice: loopback Whisper (STT) + Kokoro (TTS) sidecars. Present only when
   // configured, so a vanilla install (and guest sidecars) simply never show the mic.
   sttUrl: cfg.sttUrl || (cfg.voice ? "http://127.0.0.1:7801" : undefined),

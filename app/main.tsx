@@ -44,17 +44,21 @@ type AppEvent =
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
   | { t: "user"; text: string; _seq?: number }
-  | { t: "result"; subtype: string; sessionId: string; costUsd: number; _seq?: number }
+  | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
+  | { t: "notice"; kind: "task" | "peer" | "info"; text: string; from?: string; status?: string; _seq?: number }
   | { t: "busy"; busy: boolean; _seq?: number }
   | { t: "error"; message: string; _seq?: number }
   | { t: "closed"; _seq?: number };
 
+type TurnUsage = { input: number; output: number; cacheCreate: number; cacheRead: number; total: number; costUsd: number };
+
 type Item =
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
+  | { kind: "assistant"; text: string; usage?: TurnUsage }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
+  | { kind: "notice"; noticeKind: "task" | "peer" | "info"; text: string; from?: string; status?: string }
   | { kind: "compact" };
 // #endregion
 
@@ -81,6 +85,9 @@ const api = {
   setTitle: (id: string, title: string) =>
     fetch("/app/api/title", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, title }) }).then(J),
   del: (id: string) => fetch("/app/api/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
+  context: (id: string) => fetch(`/app/api/context?id=${encodeURIComponent(id)}`).then(J),
+  compact: (id: string) => fetch("/app/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
+  usage: () => fetch("/app/api/usage").then(J),
   search: (q: string) => fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J),
   answerAsk: (id: string, askId: string, answer: string) =>
     fetch("/app/api/ask-answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, askId, answer }) }).then(J),
@@ -138,6 +145,14 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       return items;
     }
     case "compact": return [...items, { kind: "compact" }];
+    case "notice": return [...items, { kind: "notice", noticeKind: e.kind, text: e.text, from: e.from, status: e.status }];
+    case "result": {
+      // Stamp the turn's real token usage onto the most recent assistant block so the summary can
+      // show it (output = tokens Claude actually generated, incl. thinking + tool-call args).
+      if (!e.usage) return items;
+      for (let i = items.length - 1; i >= 0; i--) { if (items[i].kind === "assistant") { const c = items.slice(); c[i] = { ...(c[i] as Extract<Item, { kind: "assistant" }>), usage: e.usage }; return c; } }
+      return items;
+    }
     case "ask": {
       if (items.some((it) => it.kind === "ask" && it.askId === e.askId)) return items; // de-dupe (transcript + live)
       return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText }];
@@ -189,7 +204,25 @@ function Assistant({ text }: { text: string }) {
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+// Context-window gauge (like the real Claude app): a donut of how full the context is, green→amber
+// →red, click to compact. Sits in the topbar next to the model picker.
+function ContextRing({ pct, total, max, onCompact, busy }: { pct: number; total: number; max: number; onCompact: () => void; busy: boolean }) {
+  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  const r = 9, C = 2 * Math.PI * r;
+  const color = p >= 80 ? "var(--error, #EF4444)" : p >= 50 ? "var(--warning, #F59E0B)" : "var(--success, #10B981)";
+  return (
+    <button className="ctx-ring" onClick={onCompact} disabled={busy} title={`Context ${p}% full (${(total / 1000).toFixed(0)}k / ${(max / 1000).toFixed(0)}k tokens)${p >= 60 ? " — click to compact" : ""}`}>
+      <svg width="22" height="22" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r={r} fill="none" stroke="var(--line)" strokeWidth="3" />
+        <circle cx="12" cy="12" r={r} fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeDasharray={C} strokeDashoffset={C * (1 - p / 100)} transform="rotate(-90 12 12)" />
+      </svg>
+      <span className="ctx-pct">{p}%</span>
+    </button>
+  );
+}
+
 const fmtDur = (secs: number) => (secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`);
+const fmtTokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 
 // Sum the thinking time + tokens for the turn that ends at assistant block `i` (walk back to the
 // previous user/compact = turn start). Powers the Claude-Code-style summary under the final reply.
@@ -268,19 +301,35 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
   if (it.kind === "tool") return <ToolCard it={it} />;
+  if (it.kind === "notice") {
+    const icon = it.noticeKind === "peer" ? "⇄" : it.noticeKind === "task" ? "⛭" : "ⓘ";
+    return (
+      <div className={"notice notice-" + it.noticeKind} title={it.from ? `from ${it.from}` : undefined}>
+        <span className="notice-ic">{icon}</span>
+        <span className="notice-text">{it.noticeKind === "peer" ? (it.from ? `${it.from}: ` : "Agent: ") : ""}{it.text}{it.status ? ` · ${it.status}` : ""}</span>
+      </div>
+    );
+  }
   // assistant — show a role label only when it opens an assistant run
   const prev = items[i - 1];
   const showRole = !prev || prev.kind === "user" || prev.kind === "compact";
-  // Turn-final assistant block? Show a Claude-Code-style "Thought for Xs · ~N tokens" footer that
-  // totals the turn's thinking. Only on the last text of the turn (next is a new user turn / end).
+  // Turn-final assistant block? Show a Claude-Code-style footer: thinking time + the turn's REAL
+  // token usage (output = what Claude generated this turn, from the SDK result message).
   const next = items[i + 1];
   const turnFinal = !next || next.kind === "user" || next.kind === "compact";
-  const totals = turnFinal ? turnThinkingTotals(items, i) : null;
+  const think = turnFinal ? turnThinkingTotals(items, i) : null;
+  const usage = it.usage;
+  const parts: string[] = [];
+  if (think) parts.push(`Thought for ${fmtDur(Math.round(think.ms / 1000))}`);
+  const toks = usage?.output ?? (think ? think.tokens : 0);
+  if (toks) parts.push(`${fmtTokens(toks)} tokens`);
+  const summary = turnFinal && parts.length ? parts.join(" · ") : "";
+  const tip = usage ? `output ${usage.output} · input ${usage.input} · cache read ${usage.cacheRead} · $${usage.costUsd.toFixed(4)}` : undefined;
   return (
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
       {showRole && <div className="role">Claude</div>}
       <Assistant text={it.text} />
-      {totals && <div className="turn-think">Thought for {fmtDur(Math.round(totals.ms / 1000))}{totals.tokens ? ` · ~${totals.tokens} tokens` : ""}</div>}
+      {summary && <div className="turn-think" title={tip}>{summary}</div>}
     </div>
   );
 }
@@ -317,6 +366,9 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [context, setContext] = useState<{ percentage: number; total: number; max: number } | null>(null);
+  const [compacting, setCompacting] = useState(false);
+  const [usage5h, setUsage5h] = useState<{ output5h: number; url: string } | null>(null);
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant" } | null>(null);
   const [convMenu, setConvMenu] = useState<{ x: number; y: number; id: string; title: string; fav: boolean } | null>(null);
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
@@ -376,6 +428,16 @@ function App() {
       .finally(() => { loadingMoreRef.current = false; });
   }, [hasMore]);
   const refreshFavs = useCallback(() => { api.favorites().then((d) => setFavorites(new Set(d.favorites || []))).catch(() => {}); }, []);
+  const refreshContext = useCallback((id: string | null) => {
+    if (!id) { setContext(null); return; }
+    api.context(id).then((d) => setContext(d?.available ? { percentage: d.percentage, total: d.total, max: d.max } : null)).catch(() => {});
+  }, []);
+  const doCompact = useCallback(async () => {
+    if (!activeIdRef.current || compacting) return;
+    setCompacting(true);
+    try { await api.compact(activeIdRef.current); } catch { /* */ }
+    setTimeout(() => { setCompacting(false); refreshContext(activeIdRef.current); }, 2000);
+  }, [compacting, refreshContext]);
   const toggleFav = useCallback((id: string) => {
     setFavorites((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); void api.toggleFav(id, !s.has(id)).then((d) => { if (d?.favorites) setFavorites(new Set(d.favorites)); }).catch(() => {}); return n; });
   }, []);
@@ -387,6 +449,15 @@ function App() {
     const c = new URLSearchParams(location.search).get("c");
     if (c) void loadConv(c);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Context-window gauge: refresh for the open conversation on open, when a turn ends (busy flips),
+  // and on a slow poll while it's live.
+  useEffect(() => { refreshContext(activeId); const t = setInterval(() => refreshContext(activeId), 15000); return () => clearInterval(t); }, [activeId, busy, refreshContext]);
+  // Owner's rolling 5h usage for the sidebar chip (slow poll).
+  useEffect(() => {
+    const pull = () => api.usage().then((d) => setUsage5h(d?.available ? { output5h: d.output5h, url: d.url } : null)).catch(() => {});
+    pull(); const t = setInterval(pull, 120000); return () => clearInterval(t);
   }, []);
 
   // PWA update check: poll the server build id; if it changed since load, offer a reload.
@@ -810,6 +881,12 @@ function App() {
           )}
         </div>
         <div className="sb-foot">
+          {usage5h && (
+            <a className="usage-chip" href={usage5h.url} target="_blank" rel="noreferrer" title="Output tokens in the last 5 hours — open the usage dashboard">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><path d="M7 14l4-4 3 3 5-6" /></svg>
+              <span>{fmtTokens(usage5h.output5h)} · 5h</span>
+            </a>
+          )}
           <a className="term-link" href="/">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.6" /><path d="M8 10l2.5 2L8 14M12.5 14H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
             Terminal
@@ -837,20 +914,6 @@ function App() {
               )}
             </div>
           )}
-          <div className="model-picker">
-            <button className="model-btn" onClick={() => setMenuOpen((o) => !o)}>
-              {modelLabel}
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-            </button>
-            {menuOpen && (
-              <div className="model-menu" onMouseLeave={() => setMenuOpen(false)}>
-                {models.map((m) => (
-                  <button key={m.id} onClick={() => onPickModel(m.id)}>{m.label}{m.id === model && <span className="dot">●</span>}</button>
-                ))}
-                {moreModels.length > 0 && <button className="model-other" onClick={() => { setMenuOpen(false); setOtherOpen(true); }}>Other versions…</button>}
-              </div>
-            )}
-          </div>
         </div>
 
         {(!online || queued > 0) && (
@@ -899,6 +962,9 @@ function App() {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 12.5l-8.5 8.5a5 5 0 01-7-7L14 5.5a3.3 3.3 0 014.7 4.7l-9.2 9.2a1.6 1.6 0 01-2.3-2.3l8.5-8.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
                 <input type="file" multiple style={{ display: "none" }} onChange={onFile} />
               </label>
+              <button className="act-btn" onClick={() => setSettingsOpen(true)} title="Connections & tools (MCP servers, memory, skills)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M9 7V4a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v3M15 7V4a1 1 0 0 0-1-1M7 7h10l-.6 9a3 3 0 0 1-3 2.8H10.6a3 3 0 0 1-3-2.8L7 7z" /><path d="M12 18v3" /></svg>
+              </button>
               <div className="spacer" />
               {voiceAvail && (
                 <button className="act-btn voice-open-btn" onClick={() => setVoiceOpen(true)} title="Hands-free voice mode">
@@ -914,6 +980,24 @@ function App() {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 20V5M6 11l6-6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
               </button>
             </div>
+          </div>
+          <div className="composer-foot">
+            <div className="model-picker up">
+              <button className="model-btn" onClick={() => setMenuOpen((o) => !o)}>
+                {modelLabel}
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              </button>
+              {menuOpen && (
+                <div className="model-menu" onMouseLeave={() => setMenuOpen(false)}>
+                  {models.map((m) => (
+                    <button key={m.id} onClick={() => onPickModel(m.id)}>{m.label}{m.id === model && <span className="dot">●</span>}</button>
+                  ))}
+                  {moreModels.length > 0 && <button className="model-other" onClick={() => { setMenuOpen(false); setOtherOpen(true); }}>Other versions…</button>}
+                </div>
+              )}
+            </div>
+            <div className="cf-spacer" />
+            {activeId && context && <ContextRing pct={context.percentage} total={context.total} max={context.max} onCompact={doCompact} busy={compacting} />}
           </div>
         </div>
       </main>
