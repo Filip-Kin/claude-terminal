@@ -1284,13 +1284,12 @@ function App() {
           )}
         </div>
 
-        {!atBottom && items.length > 0 && (
-          <button className="jump-latest" onClick={jumpToLatest} title="Jump to latest" aria-label="Jump to latest">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M6 13l6 6 6-6" /></svg>
-          </button>
-        )}
-
         <div className="composer-wrap">
+          {!atBottom && items.length > 0 && (
+            <button className="jump-latest" onClick={jumpToLatest} title="Jump to latest" aria-label="Jump to latest">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M6 13l6 6 6-6" /></svg>
+            </button>
+          )}
           <div className="composer">
             {attachments.length > 0 && (
               <div className="attach-row">

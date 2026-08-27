@@ -116,6 +116,25 @@ export class SpeechPlayer {
 }
 // #endregion
 
+// #region shared TTS core (one sentence -> Kokoro -> SpeechPlayer)
+// The single fetch+enqueue step behind BOTH hands-free voice mode and one-shot read-aloud, so they
+// use the identical server pipeline. Returns false only on a real TTS failure (so read-aloud can
+// fall back to the browser voice); a skipped empty/punctuation sentence counts as success.
+export async function ttsSpeakInto(player: SpeechPlayer, sentence: string, isActive: () => boolean): Promise<boolean> {
+  const clean = speakable(sentence);
+  if (!clean || !/[a-z0-9]/i.test(clean)) return true;
+  if (!isActive()) return true;
+  try {
+    const r = await fetch("/app/api/tts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: clean }) });
+    if (!r.ok) return false;
+    const buf = await r.arrayBuffer();
+    if (!isActive()) return true;
+    await player.enqueue(buf);
+    return true;
+  } catch { return false; }
+}
+// #endregion
+
 // #region one-shot read-aloud (long-press a message -> hear it)
 // Reads a single message on demand, independent of hands-free voice mode. Prefers the same NAS
 // Kokoro voice as voice mode (useServerTts) so it matches; falls back to the browser's built-in
@@ -162,19 +181,14 @@ export function readAloud(raw: string, opts?: { useServerTts?: boolean; onEnd?: 
       if (cancelled) return;
       const t = s.trim();
       if (!t) continue;
-      try {
-        const r = await fetch("/app/api/tts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: t }) });
-        if (!r.ok) throw new Error("tts " + r.status);
-        const buf = await r.arrayBuffer();
-        if (cancelled) return;
-        started = true;
-        await player.enqueue(buf);
-      } catch {
+      const ok = await ttsSpeakInto(player, t, () => !cancelled); // same pipeline as voice mode
+      if (cancelled) return;
+      if (!ok) {
         // TTS sidecar unreachable (offline / not configured) -> finish with the browser voice
-        if (cancelled) return;
         if (!started) { try { ctx.close(); } catch { /* */ } synthSpeak(clean, onEnd); }
         return;
       }
+      started = true;
     }
   })();
 }
@@ -308,19 +322,10 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
 
   // #region TTS
   const speakSentence = useCallback((sentence: string) => {
-    const clean = speakable(sentence);
-    if (!clean || !/[a-z0-9]/i.test(clean)) return;
-    // serialise TTS fetches so audio enqueues in sentence order
-    ttsChainRef.current = ttsChainRef.current.then(async () => {
-      if (!activeRef.current) return;
-      try {
-        const r = await fetch("/app/api/tts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: clean }) });
-        if (!r.ok) return;
-        const buf = await r.arrayBuffer();
-        if (!activeRef.current) return;
-        await playerRef.current?.enqueue(buf);
-      } catch { /* ignore a failed sentence */ }
-    });
+    const player = playerRef.current;
+    if (!player) return;
+    // serialise TTS fetches so audio enqueues in sentence order — same core as one-shot read-aloud
+    ttsChainRef.current = ttsChainRef.current.then(() => ttsSpeakInto(player, sentence, () => activeRef.current)).then(() => {});
   }, []);
   // #endregion
 
