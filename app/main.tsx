@@ -218,7 +218,10 @@ function parseUserText(text: string): { images: string[]; files: string[]; body:
 
 function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant") => void }) {
   const it = items[i];
-  const menuBind = (text: string, kind: "user" | "assistant") => onMenu ? longPressBind((x, y) => onMenu(x, y, text, kind)) : {};
+  // Messages stay natively selectable (so you can highlight part of one to copy). The copy/edit
+  // menu is therefore RIGHT-CLICK only (desktop); a mobile long-press does OS text selection, not
+  // our menu. Conversation rows use the full long-press menu instead (they're not selectable).
+  const menuBind = (text: string, kind: "user" | "assistant") => onMenu ? { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind); } } : {};
   if (it.kind === "user") {
     const { images, files, body } = parseUserText(it.text);
     return (

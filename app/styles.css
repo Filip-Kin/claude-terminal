@@ -84,6 +84,9 @@ a { color: var(--accent-2); }
 .toggle.on { background: var(--accent); }
 .toggle .knob { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .15s; }
 .toggle.on .knob { transform: translateX(16px); }
+/* Names aren't selectable: a long-press opens the menu instead of grabbing the title text.
+   (Messages are deliberately left selectable so you can copy part of one.) */
+.conv-item, .conv-group-label { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .conv-item.pending { cursor: default; opacity: .7; }
 .conv-item.pending:hover { background: transparent; color: var(--text-2); }
 .conv-item.pending .conv-ic { color: var(--warning, #F59E0B); }

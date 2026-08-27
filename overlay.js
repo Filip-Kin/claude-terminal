@@ -1322,7 +1322,7 @@
     add("meta", { name: "mobile-web-app-capable", content: "yes" });
     add("meta", { name: "apple-mobile-web-app-status-bar-style", content: "black-translucent" });
     add("meta", { name: "apple-mobile-web-app-title", content: "Claude" });
-    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png?v=5" });
+    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png?v=6" });
   })();
 
   // Service worker (root scope) — drives push + installability. Served from /_ct/sw.js
@@ -1446,7 +1446,7 @@
     installBanner.id = "ct-install";
     installBanner.className = opts.ios ? "ios" : "";
     const icon = document.createElement("img");
-    icon.src = "/_ct/pwa/icon-192.png?v=5";
+    icon.src = "/_ct/pwa/icon-192.png?v=6";
     icon.alt = "";
     const txt = document.createElement("div");
     txt.className = "ct-inst-txt";
