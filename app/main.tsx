@@ -5,6 +5,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
 import { VoiceMode, type VoiceBridge } from "./voice";
+import * as offline from "./offline";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -57,7 +58,12 @@ const api = {
     fetch("/app/api/favorites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, fav }) }).then(J),
   setTitle: (id: string, title: string) =>
     fetch("/app/api/title", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, title }) }).then(J),
+  search: (q: string) => fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J),
 };
+// #endregion
+
+// #region search
+type SearchHit = { sessionId: string; title: string; snippet: string; count: number; mtime: number; cwd: string | null };
 // #endregion
 
 function applyEvent(items: Item[], e: AppEvent): Item[] {
@@ -183,6 +189,11 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [voiceAvail, setVoiceAvail] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  const [queued, setQueued] = useState(0);
 
   const esRef = useRef<EventSource | null>(null);
   const esOpen = useRef(false);
@@ -192,13 +203,18 @@ function App() {
   const cwdRef = useRef<string>("");
   const pendingUser = useRef<string[]>([]); // optimistic user turns awaiting their SSE echo
   const forceBottom = useRef(false); // scroll to the end after opening a conversation
+  const highlightRef = useRef<string>(""); // when set, scroll to + flash the first message containing it
   const activeIdRef = useRef<string | null>(null); // latest activeId for stable callbacks (voice)
   const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
   const voiceSinks = useRef<Set<(e: AppEvent) => void>>(new Set()); // voice-mode event subscribers
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { modelRef.current = model; }, [model]);
 
-  const refreshConvs = useCallback(() => { api.convs().then((d) => setConvs(d.conversations || [])).catch(() => {}); }, []);
+  const refreshConvs = useCallback(() => {
+    api.convs()
+      .then((d) => { const list: Conv[] = d.conversations || []; setConvs(list); offline.cacheList(list); })
+      .catch(async () => { const cached = await offline.getCachedList<Conv[]>(); if (cached) setConvs(cached); }); // offline: serve the last cached list
+  }, []);
   const refreshFavs = useCallback(() => { api.favorites().then((d) => setFavorites(new Set(d.favorites || []))).catch(() => {}); }, []);
   const toggleFav = useCallback((id: string) => {
     setFavorites((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); void api.toggleFav(id, !s.has(id)).then((d) => { if (d?.favorites) setFavorites(new Set(d.favorites)); }).catch(() => {}); return n; });
@@ -231,6 +247,13 @@ function App() {
     return () => { stop = true; clearInterval(iv); };
   }, []);
 
+  // Register the shared service worker from the app too — the terminal overlay is the only
+  // other place that does, so an /app-only PWA install needs this for offline load + Background
+  // Sync. Same script + scope as the terminal, so it's idempotent (no double registration).
+  useEffect(() => {
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/_ct/sw.js", { scope: "/" }).catch(() => {});
+  }, []);
+
   // Force the freshest assets. We do NOT unregister the service worker (it's the shared
   // push worker for the whole PWA); clearing Cache Storage + reloading the no-store shell
   // is what actually pulls the new hashed bundle.
@@ -242,6 +265,14 @@ function App() {
   // autoscroll: jump to the end when a conversation is opened, else follow only if near bottom
   useEffect(() => {
     const el = scrollRef.current; if (!el) return;
+    if (highlightRef.current) {
+      const q = highlightRef.current.toLowerCase(); highlightRef.current = "";
+      let found: Element | null = null;
+      for (const n of Array.from(el.querySelectorAll(".thread > *"))) { if ((n.textContent || "").toLowerCase().includes(q)) { found = n; break; } }
+      if (found) { (found as HTMLElement).scrollIntoView({ block: "center" }); found.classList.add("hl-flash"); const f = found; setTimeout(() => f.classList.remove("hl-flash"), 2200); }
+      else el.scrollTop = el.scrollHeight;
+      return;
+    }
     if (forceBottom.current) { forceBottom.current = false; el.scrollTop = el.scrollHeight; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; }); return; }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 240;
     if (nearBottom) el.scrollTop = el.scrollHeight;
@@ -274,20 +305,63 @@ function App() {
     es.onerror = () => { /* EventSource auto-reconnects; buffer + _seq dedupe keeps us consistent */ };
   }, [handleEvent]);
 
-  const loadConv = useCallback(async (id: string) => {
+  const loadConv = useCallback(async (id: string, highlight?: string) => {
     closeStream();
     setDrawer(false); setBusy(false);
-    try {
-      const d = await api.conversation(id);
-      const built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
-      forceBottom.current = true; // open at the latest message, not the top
-      setItems(built); setActiveId(id);
-      cwdRef.current = d.cwd || defaultCwd;
-      history.replaceState(null, "", `/app?c=${id}`);
-    } catch { /* ignore */ }
+    let d: any = null;
+    try { d = await api.conversation(id); offline.cacheConversation(id, d); } // cache for offline
+    catch { d = await offline.getCachedConversation(id); } // offline: serve from cache
+    if (!d) { setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); setActiveId(id); history.replaceState(null, "", `/app?c=${id}`); return; }
+    const built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+    if (highlight) highlightRef.current = highlight; else forceBottom.current = true; // jump to the match, else to the end
+    setItems(built); setActiveId(id);
+    cwdRef.current = d.cwd || defaultCwd;
+    history.replaceState(null, "", `/app?c=${id}`);
   }, [defaultCwd]);
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
+
+  // #region offline: online/offline detection + queued-message drain
+  const drainQueueUI = useCallback(async () => {
+    const q = await offline.getQueue();
+    if (!q.length) return;
+    let lastId: string | null = null;
+    for (const it of q.sort((a, b) => a.createdAt - b.createdAt)) {
+      try {
+        const r = await api.start(it.body);
+        if (it.qid != null) await offline.removeQueued(it.qid);
+        if (r?.id) lastId = r.id;
+      } catch { break; } // dropped offline again — leave the rest queued
+    }
+    offline.queueCount().then(setQueued);
+    refreshConvs();
+    // reconnect the active conversation's stream so a drained message's reply streams in live
+    if (lastId && (lastId === activeIdRef.current || activeIdRef.current === null)) { setActiveId(lastId); activeIdRef.current = lastId; openStream(lastId); }
+  }, [openStream, refreshConvs]);
+
+  useEffect(() => {
+    const goOnline = () => { setOnline(true); void drainQueueUI(); };
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    offline.queueCount().then(setQueued);
+    if (navigator.onLine) void drainQueueUI(); // send anything left queued from a previous session
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+  }, [drainQueueUI]);
+  // #endregion
+
+  // #region search: debounced content search (title filtering is instant + client-side below)
+  useEffect(() => {
+    const q = search.trim();
+    if (q.length < 2) { setSearchHits([]); setSearching(false); return; }
+    setSearching(true);
+    let cancelled = false;
+    const t = setTimeout(() => {
+      api.search(q).then((d) => { if (!cancelled) { setSearchHits(d.results || []); setSearching(false); } }).catch(() => { if (!cancelled) setSearching(false); });
+    }, 350);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [search]);
+  // #endregion
 
   // Core send used by both the composer and voice mode. Renders the user turn optimistically,
   // starts/resumes the conversation, and returns its session id. Stable (reads refs) so the
@@ -297,12 +371,15 @@ function App() {
     setBusy(true);
     pendingUser.current.push(text);
     setItems((it) => applyEvent(it, { t: "user", text }));
+    const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
+    const queue = async () => { await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued); setBusy(false); };
+    if (typeof navigator !== "undefined" && !navigator.onLine) { await queue(); return null; } // offline: hold it, send on reconnect
     try {
       if (esOpen.current && activeIdRef.current) { await api.send({ id: activeIdRef.current, text }); return activeIdRef.current; }
-      const r = await api.start({ text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined });
+      const r = await api.start(body);
       if (r?.id) { setActiveId(r.id); activeIdRef.current = r.id; openStream(r.id); return r.id; }
       setBusy(false); return null;
-    } catch { setBusy(false); return null; }
+    } catch { await queue(); return null; } // network died mid-send -> queue for reconnect
   }, [openStream]);
 
   const doSend = async () => {
@@ -362,7 +439,7 @@ function App() {
   const renderConv = (c: Conv) => {
     const fav = favorites.has(c.sessionId);
     return (
-      <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId)}>
+      <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId, search.trim() || undefined)}>
         <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
         <span className="conv-title">{c.title}</span>
         <button className={"conv-star" + (fav ? " on" : "")} onClick={(e) => { e.stopPropagation(); toggleFav(c.sessionId); }} aria-label={fav ? "Unfavorite" : "Favorite"} title={fav ? "Unfavorite" : "Favorite"}>
@@ -371,6 +448,12 @@ function App() {
       </div>
     );
   };
+
+  // search view: instant client title matches + server content matches (dedup the ones already title-matched)
+  const q = search.trim();
+  const titleMatches = q ? convs.filter((c) => (c.title || "").toLowerCase().includes(q.toLowerCase())) : [];
+  const titleIds = new Set(titleMatches.map((c) => c.sessionId));
+  const contentMatches = searchHits.filter((h) => !titleIds.has(h.sessionId));
 
   return (
     <div className={"app" + (drawer ? " drawer-open" : "")}>
@@ -404,20 +487,41 @@ function App() {
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
           New chat
         </button>
+        <div className="sb-search">
+          <svg className="sb-search-ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></svg>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search chats & messages" />
+          {search && <button className="sb-search-x" onClick={() => setSearch("")} aria-label="Clear search">×</button>}
+        </div>
         <div className="conv-list">
-          {favConvs.length > 0 && (
+          {q ? (
             <div>
-              <div className="conv-group-label">Favorites</div>
-              {favConvs.map(renderConv)}
+              {titleMatches.length > 0 && (<><div className="conv-group-label">Conversations</div>{titleMatches.map(renderConv)}</>)}
+              {(contentMatches.length > 0 || searching) && <div className="conv-group-label">Messages{searching ? " …" : ""}</div>}
+              {contentMatches.map((h) => (
+                <div key={h.sessionId} className={"conv-item search-hit" + (h.sessionId === activeId ? " active" : "")} title={h.title} onClick={() => loadConv(h.sessionId, q)}>
+                  <div className="hit-title">{h.title}{h.count > 1 && <span className="hit-count">{h.count}</span>}</div>
+                  <div className="hit-snippet">{h.snippet}</div>
+                </div>
+              ))}
+              {!titleMatches.length && !contentMatches.length && !searching && <div className="conv-group-label">No matches</div>}
             </div>
+          ) : (
+            <>
+              {favConvs.length > 0 && (
+                <div>
+                  <div className="conv-group-label">Favorites</div>
+                  {favConvs.map(renderConv)}
+                </div>
+              )}
+              {groups.map((g) => (
+                <div key={g.label}>
+                  <div className="conv-group-label">{g.label}</div>
+                  {g.items.map(renderConv)}
+                </div>
+              ))}
+              {!convs.length && <div className="conv-group-label">No conversations yet</div>}
+            </>
           )}
-          {groups.map((g) => (
-            <div key={g.label}>
-              <div className="conv-group-label">{g.label}</div>
-              {g.items.map(renderConv)}
-            </div>
-          ))}
-          {!convs.length && <div className="conv-group-label">No conversations yet</div>}
         </div>
         <div className="sb-foot">
           <a className="term-link" href="/">
@@ -463,6 +567,13 @@ function App() {
           </div>
         </div>
 
+        {(!online || queued > 0) && (
+          <div className={"net-banner" + (online ? " sending" : "")}>
+            {!online
+              ? (queued > 0 ? `Offline — ${queued} message${queued > 1 ? "s" : ""} queued, will send when you reconnect` : "You're offline — cached conversations available")
+              : `Back online — sending ${queued} queued message${queued > 1 ? "s" : ""}…`}
+          </div>
+        )}
         <div className="scroll" ref={scrollRef}>
           {items.length === 0 ? (
             <div className="empty">

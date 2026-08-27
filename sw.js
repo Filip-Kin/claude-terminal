@@ -9,13 +9,82 @@
 // monochrome status-bar glyph (white sunburst on transparent).
 const BADGE = "/_ct/pwa/badge-96.png?v=5";
 
+// #region chat-app offline support (scoped to /app only; the terminal + ttyd WS are untouched)
+const APP_CACHE = "ct-app-shell-v1"; // caches the /app shell + its content-hashed assets
+
 self.addEventListener("install", () => {
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil((async () => {
+    // drop any stale app-shell caches from a previous SW version
+    const keys = await caches.keys();
+    await Promise.all(keys.filter((k) => k.startsWith("ct-app-shell-") && k !== APP_CACHE).map((k) => caches.delete(k)));
+    await self.clients.claim();
+  })());
 });
+
+// Serve the chat-app shell + hashed assets from cache so /app loads offline. We ONLY act on
+// same-origin GETs under /app (never the shell's /app/api/* calls, the terminal, or WS
+// upgrades — those fall through to the network exactly as before).
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+  let url;
+  try { url = new URL(req.url); } catch { return; }
+  if (url.origin !== self.location.origin) return;
+  const p = url.pathname;
+  if (p === "/app" || p === "/app/") {
+    // shell: network-first (so updates flow), cache fallback when offline
+    event.respondWith((async () => {
+      try { const res = await fetch(req); if (res.ok) (await caches.open(APP_CACHE)).put("/app", res.clone()); return res; }
+      catch { return (await caches.match("/app")) || new Response("Offline", { status: 503, headers: { "content-type": "text/plain" } }); }
+    })());
+    return;
+  }
+  if (p.startsWith("/app/assets/")) {
+    // content-hashed -> cache-first
+    event.respondWith((async () => {
+      const cached = await caches.match(req);
+      if (cached) return cached;
+      try { const res = await fetch(req); if (res.ok) (await caches.open(APP_CACHE)).put(req, res.clone()); return res; }
+      catch { return cached || Response.error(); }
+    })());
+    return;
+  }
+  // everything else: not ours — leave the network alone
+});
+
+// Background Sync: replay the offline send-queue even if the app is backgrounded/closed
+// (Chrome/Android; iOS has no Background Sync, so the page drains on reopen instead).
+self.addEventListener("sync", (event) => {
+  if (event.tag === "ct-send-queue") event.waitUntil(drainSendQueue());
+});
+
+function idbOpenApp() {
+  return new Promise((resolve, reject) => {
+    let r;
+    try { r = indexedDB.open("ct-app", 1); } catch (e) { reject(e); return; }
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function drainSendQueue() {
+  let db;
+  try { db = await idbOpenApp(); } catch { return; }
+  if (!db.objectStoreNames.contains("queue")) return;
+  const all = await new Promise((res) => { const t = db.transaction("queue", "readonly"); const rq = t.objectStore("queue").getAll(); rq.onsuccess = () => res(rq.result || []); rq.onerror = () => res([]); });
+  all.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  for (const it of all) {
+    try {
+      const r = await fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(it.body) });
+      if (!r.ok) break; // reachable but rejected — stop; leave queued
+      await new Promise((res) => { const t = db.transaction("queue", "readwrite"); t.objectStore("queue").delete(it.qid); t.oncomplete = () => res(); t.onerror = () => res(); });
+    } catch { break; } // still offline
+  }
+}
+// #endregion
 
 // A push arrived from the server (VAPID). Payload is JSON:
 // { title, body?, url?, tag?, icon?, requireInteraction?, sessionId? }
