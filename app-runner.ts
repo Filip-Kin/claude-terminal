@@ -34,8 +34,9 @@ export type AppEvent =
   | { t: "error"; message: string }
   | { t: "closed" };
 
-// Per-turn token usage, plus running cumulative totals across the whole conversation.
-export type TurnUsage = { input: number; output: number; cacheCreate: number; cacheRead: number; total: number; costUsd: number };
+// Per-turn token usage. output includes thinking; `thinking` is the exact reasoning-token subset;
+// context = the tokens read to answer (mostly cached history). total = everything processed.
+export type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number };
 
 type Sub = (e: AppEvent) => void;
 // #endregion
@@ -317,7 +318,9 @@ export class Conversation {
         const u = anyM.usage || {};
         const input = u.input_tokens || 0, output = u.output_tokens || 0;
         const cacheCreate = u.cache_creation_input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0;
-        const usage: TurnUsage = { input, output, cacheCreate, cacheRead, total: input + output + cacheCreate + cacheRead, costUsd: anyM.total_cost_usd || 0 };
+        const thinking = u.output_tokens_details?.thinking_tokens || 0; // exact reasoning tokens (subset of output)
+        const context = input + cacheCreate + cacheRead; // tokens read to answer (mostly cached history)
+        const usage: TurnUsage = { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: anyM.total_cost_usd || 0 };
         this.lastUsage = usage;
         this.emit({ t: "result", subtype: anyM.subtype, sessionId: anyM.session_id || this.id, costUsd: usage.costUsd, usage });
         this.emit({ t: "busy", busy: false });
@@ -414,6 +417,15 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
           askToolIds.add(b.id);
           out.push({ t: "ask", askId: b.id, question: String(inp.question || ""), options: Array.isArray(inp.options) ? inp.options : [], multiSelect: !!inp.multiSelect, allowText: !!inp.allowText });
         } else if (b?.type === "tool_use") out.push({ t: "tool_use", id: b.id, name: b.name, input: b.input });
+      }
+      // Stamp the turn's token usage from the transcript so historical turns show the same footer as
+      // live ones (last usage before the next user turn wins, i.e. the turn total).
+      const u = msg.usage;
+      if (u && (u.output_tokens || u.input_tokens)) {
+        const input = u.input_tokens || 0, output = u.output_tokens || 0;
+        const cacheCreate = u.cache_creation_input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0;
+        const thinking = u.output_tokens_details?.thinking_tokens || 0, context = input + cacheCreate + cacheRead;
+        out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: 0 } });
       }
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       out.push({ t: "compact", trigger: o.compact_metadata?.trigger || "auto" });

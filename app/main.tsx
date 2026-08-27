@@ -46,7 +46,7 @@ function longPressBind(open: (x: number, y: number) => void) {
 
 // #region types
 type Model = { id: string; label: string };
-type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean };
+type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean; queuedText?: string };
 type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
   | { t: "text"; text: string; _seq?: number }
@@ -66,7 +66,7 @@ type AppEvent =
   | { t: "error"; message: string; _seq?: number }
   | { t: "closed"; _seq?: number };
 
-type TurnUsage = { input: number; output: number; cacheCreate: number; cacheRead: number; total: number; costUsd: number };
+type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number };
 
 type Item =
   | { kind: "user"; text: string }
@@ -187,6 +187,16 @@ const contentToText = (c: unknown): string =>
   typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (typeof b === "string" ? b : b?.type === "text" ? b.text : b?.text || "")).join("\n") : c == null ? "" : JSON.stringify(c, null, 2);
 
 // #region small components
+// Rough token estimate for a tool (its call args + returned result). The SDK doesn't attribute
+// tokens per tool, but tool RESULTS are what fill the context, so ~chars/4 gives a useful sense of
+// which tools are expensive. Clearly labelled "~".
+function estToolTokens(it: Extract<Item, { kind: "tool" }>): number {
+  let n = 0;
+  try { n += (contentToText(it.input) || "").length; } catch { /* */ }
+  try { if (it.result !== undefined) n += (contentToText(it.result) || "").length; } catch { /* */ }
+  return Math.round(n / 4);
+}
+
 function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
   const [open, setOpen] = useState(false);
   const summary = useMemo(() => {
@@ -197,12 +207,14 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
     if (inp.pattern) return inp.pattern;
     try { return JSON.stringify(inp).slice(0, 120); } catch { return ""; }
   }, [it]);
+  const est = it.result !== undefined ? estToolTokens(it) : 0;
   return (
     <div className="tool">
       <button className={"tool-head" + (open ? " open" : "")} onClick={() => setOpen((o) => !o)}>
         <svg className="chev" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
         <span className="tname">{it.name}</span>
         <span className={"tsum" + (it.isError ? " terr" : "")}>{summary}</span>
+        {est > 0 && <span className="tool-tok" title="Estimated tokens (call + result)">~{fmtTokens(est)} tokens</span>}
         {it.result === undefined && <span className="typing"><span></span><span></span><span></span></span>}
       </button>
       {open && (
@@ -212,6 +224,24 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
           {it.result !== undefined && (<><div className="tool-label">Output{it.isError ? " (error)" : ""}</div><pre>{contentToText(it.result)}</pre></>)}
         </div>
       )}
+    </div>
+  );
+}
+
+// A run of consecutive tool uses, collapsed into one accordion: "Used N tools · ~Xk tokens" (counts
+// up live). Open it to see each tool card. Single tools render on their own (no accordion).
+function ToolGroup({ tools, live }: { tools: Extract<Item, { kind: "tool" }>[]; live: boolean }) {
+  const [open, setOpen] = useState(false);
+  const n = tools.length;
+  const est = tools.reduce((a, it) => a + estToolTokens(it), 0);
+  return (
+    <div className={"tool-group" + (open ? " open" : "")}>
+      <button className="tool-group-head" onClick={() => setOpen((o) => !o)}>
+        <svg className="chev" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+        <span className="tg-label">{live ? `Using ${n} tools…` : `Used ${n} tools`}</span>
+        {est > 0 && <span className="tg-tok" title="Estimated total tokens across these tools">~{fmtTokens(est)} tokens</span>}
+      </button>
+      {open && <div className="tool-group-body">{tools.map((it, k) => <ToolCard key={k} it={it} />)}</div>}
     </div>
   );
 }
@@ -232,12 +262,12 @@ function Assistant({ text, convId }: { text: string; convId?: string | null }) {
 
 // Context-window gauge (like the real Claude app): a donut of how full the context is, green→amber
 // →red, click to compact. Sits in the topbar next to the model picker.
-function ContextRing({ pct, total, max, onCompact, busy }: { pct: number; total: number; max: number; onCompact: () => void; busy: boolean }) {
+function ContextRing({ pct, total, max, onCompact, busy, estimated }: { pct: number; total: number; max: number; onCompact: () => void; busy: boolean; estimated?: boolean }) {
   const p = Math.max(0, Math.min(100, Math.round(pct)));
   const r = 9, C = 2 * Math.PI * r;
   const color = p >= 80 ? "var(--error, #EF4444)" : p >= 50 ? "var(--warning, #F59E0B)" : "var(--success, #10B981)";
   return (
-    <button className="ctx-ring" onClick={onCompact} disabled={busy} title={`Context ${p}% full (${(total / 1000).toFixed(0)}k / ${(max / 1000).toFixed(0)}k tokens)${p >= 60 ? " — click to compact" : ""}`}>
+    <button className={"ctx-ring" + (estimated ? " est" : "")} onClick={onCompact} disabled={busy || estimated} title={`Context ${estimated ? "~" : ""}${p}% full (${(total / 1000).toFixed(0)}k / ${(max / 1000).toFixed(0)}k tokens)${estimated ? " (estimated — send a message for the exact figure)" : p >= 60 ? " — click to compact" : ""}`}>
       <svg width="22" height="22" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r={r} fill="none" stroke="var(--line)" strokeWidth="3" />
         <circle cx="12" cy="12" r={r} fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeDasharray={C} strokeDashoffset={C * (1 - p / 100)} transform="rotate(-90 12 12)" />
@@ -259,6 +289,18 @@ function CompactionBanner({ start }: { start: number }) {
       <div className="compact-bar" />
     </div>
   );
+}
+
+const DEFAULT_CTX = 200_000; // fallback window for the estimated context gauge
+// Rough context-token estimate from the loaded transcript (~chars/4), for conversations that aren't
+// live in memory so getContextUsage() has no real number yet.
+function estimateContextTokens(items: Item[]): number {
+  let chars = 0;
+  for (const it of items) {
+    if (it.kind === "user" || it.kind === "assistant" || it.kind === "thinking") chars += (it.text || "").length;
+    else if (it.kind === "tool") { try { chars += JSON.stringify(it.input || "").length + (typeof it.result === "string" ? it.result.length : JSON.stringify(it.result ?? "").length); } catch { /* */ } }
+  }
+  return Math.round(chars / 4);
 }
 
 const fmtDur = (secs: number) => (secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`);
@@ -364,7 +406,9 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   const toks = usage?.output ?? (think ? think.tokens : 0);
   if (toks) parts.push(`${fmtTokens(toks)} tokens`);
   const summary = turnFinal && parts.length ? parts.join(" · ") : "";
-  const tip = usage ? `output ${usage.output} · input ${usage.input} · cache read ${usage.cacheRead} · $${usage.costUsd.toFixed(4)}` : undefined;
+  // Hover: the full picture — output (incl. the exact thinking subset), the context read (mostly
+  // cached history, so the big number), the grand total processed, and cost.
+  const tip = usage ? `output ${usage.output}${usage.thinking ? ` (thinking ${usage.thinking})` : ""} · context ${usage.context.toLocaleString()} · total ${usage.total.toLocaleString()} · $${usage.costUsd.toFixed(4)}` : undefined;
   return (
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
       {showRole && <div className="role">Claude</div>}
@@ -406,7 +450,8 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [context, setContext] = useState<{ percentage: number; total: number; max: number } | null>(null);
+  const [context, setContext] = useState<{ percentage: number; total: number; max: number; estimated?: boolean } | null>(null);
+  const itemsRef = useRef<Item[]>([]);
   const [compacting, setCompacting] = useState(false);
   const [loadingConv, setLoadingConv] = useState(false);
   const [usage5h, setUsage5h] = useState<{ output5h: number; url: string } | null>(null);
@@ -429,6 +474,7 @@ function App() {
   const esRef = useRef<EventSource | null>(null);
   const esOpen = useRef(false);
   const lastSeq = useRef(-1);
+  const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the live stream last say anything
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const newChatRef = useRef<(() => void) | null>(null); // lets earlier callbacks reset to a blank chat
   const taRef = useRef<HTMLTextAreaElement | null>(null);
@@ -484,8 +530,13 @@ function App() {
     }).catch(() => { setFavorites(loadFavsLocal()); }); // offline: keep the cached set
   }, []);
   const refreshContext = useCallback((id: string | null) => {
-    if (!id) { setContext(null); return; }
-    api.context(id).then((d) => setContext(d?.available ? { percentage: d.percentage, total: d.total, max: d.max } : null)).catch(() => {});
+    if (!id || id.startsWith("pending-")) { setContext(null); return; }
+    api.context(id).then((d) => {
+      if (d?.available) { setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false }); return; }
+      // Not live in memory (historical / not yet resumed): show an estimate so the gauge is always present.
+      const est = estimateContextTokens(itemsRef.current);
+      setContext(est > 0 ? { percentage: Math.min(100, (est / DEFAULT_CTX) * 100), total: est, max: DEFAULT_CTX, estimated: true } : null);
+    }).catch(() => { /* keep the last value on a transient error */ });
   }, []);
   const compactStartRef = useRef(0);
   const doCompact = useCallback(async () => {
@@ -546,6 +597,7 @@ function App() {
   }, [refreshQueue]);
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
   useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, markRead]);
+  useEffect(() => { itemsRef.current = items; }, [items]); // for the context estimate
 
   // PWA update check: poll the server build id; if it changed since load, offer a reload.
   // Content-hashed assets + no-store index mean the reload gets everything fresh.
@@ -594,14 +646,20 @@ function App() {
 
   // Edge-swipe to open the sidebar (right from the left edge) and swipe-left to close it. Only
   // horizontal gestures act; vertical scrolls and stationary long-presses are ignored.
-  const swipe = useRef<{ x: number; y: number; edge: boolean } | null>(null);
-  const onAppTouchStart = (e: React.TouchEvent) => { const t = e.touches[0]; if (!t) return; swipe.current = { x: t.clientX, y: t.clientY, edge: t.clientX <= 30 }; };
+  const swipe = useRef<{ x: number; y: number; fromLeft: boolean; done: boolean } | null>(null);
+  const onAppTouchStart = (e: React.TouchEvent) => {
+    const t = e.touches[0]; if (!t) return;
+    // Start in the left ~45% of the screen counts as an "open" candidate. (Not the very edge only —
+    // iOS reserves the extreme edge for its own back-swipe, so that never reaches us.)
+    swipe.current = { x: t.clientX, y: t.clientY, fromLeft: t.clientX < window.innerWidth * 0.45, done: false };
+  };
   const onAppTouchMove = (e: React.TouchEvent) => {
-    const s = swipe.current, t = e.touches[0]; if (!s || !t) return;
+    const s = swipe.current, t = e.touches[0]; if (!s || s.done || !t) return;
     const dx = t.clientX - s.x, dy = t.clientY - s.y;
-    if (Math.abs(dy) > 45) { swipe.current = null; return; } // vertical scroll — not a drawer gesture
-    if (!drawer && s.edge && dx > 55) { setDrawer(true); swipe.current = null; }
-    else if (drawer && dx < -55) { setDrawer(false); swipe.current = null; }
+    if (Math.abs(dx) < 12) return; // wait for a clear horizontal intent
+    if (Math.abs(dx) <= Math.abs(dy) * 1.2) { s.done = true; return; } // it's a vertical scroll, bail
+    if (!drawer && s.fromLeft && dx > 45) { setDrawer(true); s.done = true; }
+    else if (drawer && dx < -45) { setDrawer(false); s.done = true; }
   };
   const onAppTouchEnd = () => { swipe.current = null; };
 
@@ -624,6 +682,7 @@ function App() {
   const closeStream = () => { esRef.current?.close(); esRef.current = null; esOpen.current = false; };
 
   const handleEvent = useCallback((e: AppEvent) => {
+    lastEventAt.current = Date.now(); // stream is alive
     for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode (streaming text, result, error)
     if (e.t === "init") { setActiveId(e.sessionId); activeIdRef.current = e.sessionId; history.replaceState(null, "", `/app?c=${e.sessionId}`); setTimeout(refreshConvs, 400); return; }
     // user echo: drop it if we already rendered this turn optimistically (match by value, any
@@ -698,6 +757,14 @@ function App() {
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
+  // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
+  // to drain into a real conversation.
+  const viewPending = useCallback((c: Conv) => {
+    closeStream();
+    setActiveId(c.sessionId); activeIdRef.current = c.sessionId;
+    setItems([{ kind: "user", text: c.queuedText || c.title }, { kind: "notice", noticeKind: "info", text: "Queued — this sends and starts the conversation as soon as you're back online." }]);
+    setBusy(false); setDrawer(false); history.replaceState(null, "", "/app");
+  }, []);
 
   // #region offline: online/offline detection + queued-message drain
   const drainQueueUI = useCallback(async () => {
@@ -743,6 +810,24 @@ function App() {
   }, [drainQueueUI, loadConv, refreshFavs, refreshQueue]);
   // #endregion
 
+  // Stall watchdog: on a weak link the SSE can die silently mid-turn, so it LOOKS like Claude stopped
+  // working until you send again (which reopens the stream). While "working", if the stream has gone
+  // quiet, resync from the server: reattaches the stream and picks up the ending or the missed events.
+  useEffect(() => {
+    if (!busy) return;
+    const t = setInterval(() => {
+      const id = activeIdRef.current;
+      if (!id || id.startsWith("pending-") || !navigator.onLine) return;
+      const quietFor = Date.now() - lastEventAt.current;
+      const st = statuses[id];
+      const serverDone = st ? !st.busy : false; // server knows this conv and says the turn ended
+      // Missed the ending (server done but we still show busy) -> resync fast. Otherwise only after a
+      // longer silence, so a genuinely long, quiet tool run isn't interrupted.
+      if ((serverDone && quietFor > 8000) || quietFor > 30000) { lastEventAt.current = Date.now(); void loadConv(id); }
+    }, 5000);
+    return () => clearInterval(t);
+  }, [busy, statuses, loadConv]);
+
   // #region search: debounced content search (title filtering is instant + client-side below)
   useEffect(() => {
     const q = search.trim();
@@ -774,7 +859,7 @@ function App() {
       if (isNewChat) {
         const firstLine = text.replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
         const pid = "pending-" + Date.now();
-        setConvs((cs) => [{ sessionId: pid, title: firstLine, cwd: cwdRef.current || null, mtime: Date.now(), pending: true }, ...cs]);
+        setConvs((cs) => [{ sessionId: pid, title: firstLine, cwd: cwdRef.current || null, mtime: Date.now(), pending: true, queuedText: text }, ...cs]);
       }
       setBusy(false);
     };
@@ -908,7 +993,7 @@ function App() {
     if (c.pending) {
       // Started offline, not sent yet: clock icon + muted, not openable until it drains.
       return (
-        <div key={c.sessionId} className="conv-item pending" title={"Waiting to send — " + c.title}>
+        <div key={c.sessionId} className={"conv-item pending" + (c.sessionId === activeId ? " active" : "")} title={"Queued — tap to view. " + c.title} onClick={() => viewPending(c)}>
           <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.7" /><path d="M12 7v5l3 2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
           <span className="conv-title">{c.title}</span>
           <span className="conv-pending-tag">Queued</span>
@@ -1056,6 +1141,7 @@ function App() {
           ) : (
             <div className="topbar-title">
               <span className="tt-text">{activeId ? convs.find((c) => c.sessionId === activeId)?.title || "Conversation" : "New chat"}</span>
+              {busy && <span className="working-pill" title="Claude is working"><span className="wp-dot" />Working</span>}
               {activeId && (
                 <button className="rename-btn" onClick={startRename} title="Rename conversation" aria-label="Rename">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
@@ -1082,7 +1168,21 @@ function App() {
             </div>
           ) : (
             <div className="thread">
-              {items.map((_, i) => <MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} />)}
+              {(() => {
+                const nodes: React.ReactNode[] = [];
+                for (let i = 0; i < items.length; i++) {
+                  if (items[i].kind === "tool") {
+                    let j = i; const run: Extract<Item, { kind: "tool" }>[] = [];
+                    while (j < items.length && items[j].kind === "tool") { run.push(items[j] as Extract<Item, { kind: "tool" }>); j++; }
+                    if (run.length >= 2) { // collapse a run of tools into one accordion
+                      nodes.push(<ToolGroup key={"tg" + i} tools={run} live={busy && j === items.length} />);
+                      i = j - 1; continue;
+                    }
+                  }
+                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} />);
+                }
+                return nodes;
+              })()}
               {busy && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}
@@ -1148,7 +1248,7 @@ function App() {
               )}
             </div>
             <div className="cf-spacer" />
-            {activeId && context && <ContextRing pct={context.percentage} total={context.total} max={context.max} onCompact={doCompact} busy={compacting} />}
+            {activeId && context && <ContextRing pct={context.percentage} total={context.total} max={context.max} onCompact={doCompact} busy={compacting} estimated={context.estimated} />}
           </div>
         </div>
       </main>
