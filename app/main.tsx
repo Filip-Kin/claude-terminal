@@ -216,8 +216,17 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
   );
 }
 
-function Assistant({ text }: { text: string }) {
-  const html = useMemo(() => marked.parse(text || "") as string, [text]);
+// Rewrite local file references Claude produces (images it wrote, files it saved) to the download
+// route so they preview inline / are downloadable. Remote (http/data/blob) URLs are left alone.
+function rewriteLocalRefs(html: string, convId: string | null): string {
+  const dl = (p: string) => `/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`;
+  return html
+    .replace(/<img([^>]*?)\ssrc="([^"]+)"([^>]*)>/g, (m, pre, src, post) => /^(https?:|data:|blob:|\/app\/api\/)/i.test(src) ? `<img${pre} src="${src}"${post} loading="lazy">` : `<img${pre} src="${dl(src)}"${post} loading="lazy">`)
+    .replace(/<a([^>]*?)\shref="([^"]+)"([^>]*)>/g, (m, pre, href, post) => /^(https?:|mailto:|#|\/app\/api\/)/i.test(href) ? m : `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`);
+}
+
+function Assistant({ text, convId }: { text: string; convId?: string | null }) {
+  const html = useMemo(() => rewriteLocalRefs(marked.parse(text || "") as string, convId ?? null), [text, convId]);
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
@@ -235,6 +244,20 @@ function ContextRing({ pct, total, max, onCompact, busy }: { pct: number; total:
       </svg>
       <span className="ctx-pct">{p}%</span>
     </button>
+  );
+}
+
+// Shown while a compaction runs (manual click or the /compact turn). The SDK doesn't expose an
+// ETA, so this is an elapsed timer + indeterminate progress rather than a fake estimate.
+function CompactionBanner({ start }: { start: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 500); return () => clearInterval(t); }, []);
+  const secs = Math.max(0, Math.round((now - start) / 1000));
+  return (
+    <div className="compact-banner">
+      <div className="compact-row"><span className="spin" />Compacting conversation to free context… <span className="compact-secs">{secs}s</span></div>
+      <div className="compact-bar" />
+    </div>
   );
 }
 
@@ -345,7 +368,7 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   return (
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
       {showRole && <div className="role">Claude</div>}
-      <Assistant text={it.text} />
+      <Assistant text={it.text} convId={convId} />
       {summary && <div className="turn-think" title={tip}>{summary}</div>}
     </div>
   );
@@ -464,11 +487,14 @@ function App() {
     if (!id) { setContext(null); return; }
     api.context(id).then((d) => setContext(d?.available ? { percentage: d.percentage, total: d.total, max: d.max } : null)).catch(() => {});
   }, []);
+  const compactStartRef = useRef(0);
   const doCompact = useCallback(async () => {
     if (!activeIdRef.current || compacting) return;
+    compactStartRef.current = Date.now();
     setCompacting(true);
     try { await api.compact(activeIdRef.current); } catch { /* */ }
-    setTimeout(() => { setCompacting(false); refreshContext(activeIdRef.current); }, 2000);
+    // Cleared for real by the compact event (handleEvent); this is just a safety net.
+    setTimeout(() => { setCompacting(false); refreshContext(activeIdRef.current); }, 45000);
   }, [compacting, refreshContext]);
   // Which conversations have an offline message queued (resume target) — drives the queued indicator
   // on EXISTING conversations, not just brand-new offline chats.
@@ -609,11 +635,12 @@ function App() {
       return;
     }
     if (e.t === "busy") { setBusy(e.busy); return; }
+    if (e.t === "compact") { setCompacting(false); refreshContext(activeIdRef.current); setItems((it) => applyEvent(it, e)); return; } // compaction finished
     if (e.t === "result") { setBusy(false); setItems((it) => applyEvent(it, e)); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage
     if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
     if (e.t === "closed") { return; }
     setItems((it) => applyEvent(it, e));
-  }, [refreshConvs]);
+  }, [refreshConvs, refreshContext]);
 
   const openStream = useCallback((id: string, tail = false) => {
     closeStream();
@@ -1038,6 +1065,7 @@ function App() {
           )}
         </div>
         {loadingConv && <div className="load-bar" aria-label="Loading conversation" />}
+        {compacting && <CompactionBanner start={compactStartRef.current} />}
 
         {(!online || queued > 0) && (
           <div className={"net-banner" + (online ? " sending" : "")}>
