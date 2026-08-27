@@ -259,6 +259,8 @@ a { color: var(--accent-2); }
 .think-progress .think-tok { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 .compact-div { display: flex; align-items: center; gap: 12px; color: var(--text-3); font-size: 12px; margin: 18px 0; }
 .compact-div::before, .compact-div::after { content: ""; flex: 1; height: 1px; background: var(--line-2); }
+.compact-done { color: var(--text-2); font-variant-numeric: tabular-nums; }
+.compact-check { color: var(--success); font-weight: 600; }
 
 .typing { display: inline-flex; gap: 4px; padding: 4px 0; }
 .typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); animation: blink 1.2s infinite both; }

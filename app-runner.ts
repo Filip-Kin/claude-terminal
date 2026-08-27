@@ -395,6 +395,12 @@ setInterval(() => {
 export async function replayTranscript(path: string): Promise<AppEvent[]> {
   const out: AppEvent[] = [];
   const askToolIds = new Set<string>(); // tool_use ids of ask_user calls -> render as ask cards, not raw tool cards
+  // Per-turn accumulators so the reloaded footer matches the live one: a turn can span several
+  // assistant API responses (text -> tool -> text -> ...), each with its own usage. The live path
+  // reports the run-total (modelUsage delta); on replay we sum output/thinking across the turn and
+  // take context from the last response. Reset at each user/compact boundary. turnStartTs powers a
+  // real "Worked for" from transcript timestamps (live has duration_ms; replay doesn't).
+  let turnOut = 0, turnThink = 0, turnStartTs = 0;
   let text: string;
   try { text = await Bun.file(path).text(); } catch { return out; }
   for (const line of text.split("\n")) {
@@ -415,7 +421,11 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         }
       }
       const txt = textOfContent(c);
-      if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt });
+      if (txt.trim() && !txt.startsWith("<")) {
+        // New user turn -> reset the per-turn token/duration accumulators.
+        turnOut = 0; turnThink = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
+        out.push({ t: "user", text: txt });
+      }
     } else if (o.type === "assistant" && msg) {
       const blocks = (msg.content as any[]) || [];
       for (const b of blocks) {
@@ -433,12 +443,18 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       // live ones (last usage before the next user turn wins, i.e. the turn total).
       const u = msg.usage;
       if (u && (u.output_tokens || u.input_tokens)) {
-        const input = u.input_tokens || 0, output = u.output_tokens || 0;
+        const input = u.input_tokens || 0;
         const cacheCreate = u.cache_creation_input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0;
-        const thinking = u.output_tokens_details?.thinking_tokens || 0, context = input + cacheCreate + cacheRead;
-        out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: 0, durationMs: 0 } });
+        turnOut += u.output_tokens || 0; // run-total output since this turn's user message
+        turnThink += u.output_tokens_details?.thinking_tokens || 0;
+        const context = input + cacheCreate + cacheRead; // last response of the turn wins -> full context read
+        const ts = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
+        const durationMs = turnStartTs && ts > turnStartTs ? ts - turnStartTs : 0;
+        // output/thinking = cumulative turn totals so the footer matches what was shown live.
+        out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output: turnOut, thinking: turnThink, cacheCreate, cacheRead, context, total: context + turnOut, costUsd: 0, durationMs } });
       }
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
+      turnOut = 0; turnThink = 0; turnStartTs = 0; // compaction is a fresh turn boundary
       out.push({ t: "compact", trigger: o.compact_metadata?.trigger || "auto" });
     }
   }

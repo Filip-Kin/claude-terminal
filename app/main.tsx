@@ -75,7 +75,7 @@ type Item =
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "notice"; noticeKind: "task" | "peer" | "info"; text: string; from?: string; status?: string }
-  | { kind: "compact" };
+  | { kind: "compact"; savedTokens?: number; durationMs?: number; pctBefore?: number; pctAfter?: number };
 // #endregion
 
 // #region api
@@ -379,7 +379,18 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
       </div>
     );
   }
-  if (it.kind === "compact") return <div className="compact-div">conversation compacted</div>;
+  if (it.kind === "compact") {
+    // After a live compaction we know how long it took and how much context it freed — keep that as a
+    // persistent record. Historical/auto compactions (no timing captured) fall back to the plain line.
+    if (it.savedTokens || it.durationMs) {
+      const bits: string[] = ["Compacted"];
+      if (it.durationMs) bits.push(`in ${fmtDur(Math.round(it.durationMs / 1000))}`);
+      if (it.savedTokens) bits.push(`· freed ${fmtTokens(it.savedTokens)} tokens`);
+      if (it.pctBefore != null && it.pctAfter != null) bits.push(`(${Math.round(it.pctBefore)}% → ${Math.round(it.pctAfter)}% context)`);
+      return <div className="compact-div compact-done"><span className="compact-check">✓</span> {bits.join(" ")}</div>;
+    }
+    return <div className="compact-div">conversation compacted</div>;
+  }
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
   if (it.kind === "tool") return <ToolCard it={it} />;
@@ -454,6 +465,8 @@ function App() {
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [context, setContext] = useState<{ percentage: number; total: number; max: number; estimated?: boolean } | null>(null);
+  const contextRef = useRef<typeof context>(null); // mirror, so the compact handler can read the pre-compaction context
+  useEffect(() => { contextRef.current = context; }, [context]);
   const itemsRef = useRef<Item[]>([]);
   const [compacting, setCompacting] = useState(false);
   const [loadingConv, setLoadingConv] = useState(false);
@@ -706,7 +719,33 @@ function App() {
       return;
     }
     if (e.t === "busy") { setBusy(e.busy); return; }
-    if (e.t === "compact") { setCompacting(false); compactingRef.current = false; refreshContext(activeIdRef.current); setItems((it) => applyEvent(it, e)); flushCompactRef.current(); return; } // compaction finished -> send anything held
+    if (e.t === "compact") {
+      // Compaction finished. Capture the before-context (state hasn't refreshed yet) + elapsed, add the
+      // compact divider, release any queued messages, then fetch the after-context and stamp the divider
+      // with a persistent "freed Nk tokens" record.
+      setCompacting(false); compactingRef.current = false;
+      const before = contextRef.current;
+      const durMs = compactStartRef.current ? Date.now() - compactStartRef.current : 0;
+      compactStartRef.current = 0;
+      setItems((it) => applyEvent(it, e));
+      flushCompactRef.current();
+      const id = activeIdRef.current;
+      if (id && !id.startsWith("pending-")) {
+        api.context(id).then((d) => {
+          if (!d?.available) return;
+          try { localStorage.setItem("ct-app-ctxmax", String(d.max)); } catch { /* */ }
+          setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false });
+          const saved = before && before.total > d.total ? before.total - d.total : 0;
+          if (!saved && !durMs) return;
+          setItems((it) => {
+            const c = it.slice();
+            for (let k = c.length - 1; k >= 0; k--) if (c[k].kind === "compact") { c[k] = { kind: "compact", savedTokens: saved, durationMs: durMs, pctBefore: before?.percentage, pctAfter: d.percentage }; break; }
+            return c;
+          });
+        }).catch(() => { refreshContext(id); });
+      } else refreshContext(id);
+      return;
+    } // compaction finished -> send anything held
     if (e.t === "result") { setBusy(false); setItems((it) => applyEvent(it, e)); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage
     if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
     if (e.t === "closed") { return; }
