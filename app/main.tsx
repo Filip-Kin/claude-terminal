@@ -4,7 +4,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
-import { VoiceMode, type VoiceBridge } from "./voice";
+import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
 
@@ -366,7 +366,14 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   // Messages stay natively selectable (so you can highlight part of one to copy). The copy/edit
   // menu is therefore RIGHT-CLICK only (desktop); a mobile long-press does OS text selection, not
   // our menu. Conversation rows use the full long-press menu instead (they're not selectable).
-  const menuBind = (text: string, kind: "user" | "assistant") => onMenu ? { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind); } } : {};
+  // Desktop: right-click opens the menu, text stays selectable. Touch: a long-press opens it (so
+  // read-aloud / copy are reachable on mobile), which needs selection off on the bubble so the hold
+  // triggers our menu instead of the OS text-selection popup.
+  const menuBind = (text: string, kind: "user" | "assistant"): Record<string, unknown> => {
+    if (!onMenu) return {};
+    if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y) => onMenu(x, y, text, kind)) };
+    return { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind); } };
+  };
   if (it.kind === "user") {
     const { images, files, body } = parseUserText(it.text);
     return (
@@ -481,6 +488,7 @@ function App() {
   const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
   const [voiceAvail, setVoiceAvail] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [speaking, setSpeaking] = useState(false); // a message is being read aloud (long-press -> Read aloud)
   const [search, setSearch] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
@@ -499,6 +507,8 @@ function App() {
   const cwdRef = useRef<string>("");
   const pendingUser = useRef<string[]>([]); // optimistic user turns awaiting their SSE echo
   const forceBottom = useRef(false); // scroll to the end after opening a conversation
+  const stickBottom = useRef(true); // follow new content only while the user is parked at the bottom
+  const [atBottom, setAtBottom] = useState(true); // drives the "jump to latest" button while streaming
   const highlightRef = useRef<string>(""); // when set, scroll to + flash the first message containing it
   const activeIdRef = useRef<string | null>(null); // latest activeId for stable callbacks (voice)
   const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
@@ -699,10 +709,24 @@ function App() {
       else el.scrollTop = el.scrollHeight;
       return;
     }
-    if (forceBottom.current) { forceBottom.current = false; el.scrollTop = el.scrollHeight; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; }); return; }
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 240;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
+    if (forceBottom.current) { forceBottom.current = false; stickBottom.current = true; setAtBottom(true); el.scrollTop = el.scrollHeight; requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; }); return; }
+    // Follow new content ONLY while the user is parked at the bottom. The moment they scroll up to
+    // read, stickBottom goes false (see onThreadScroll) and we stop yanking them back down.
+    if (stickBottom.current) el.scrollTop = el.scrollHeight;
   }, [items, busy]);
+
+  // Track whether the user is at the bottom. Programmatic scroll-to-bottom lands here too and
+  // (correctly) re-sticks; scrolling up to read un-sticks and shows the jump-to-latest button.
+  const onThreadScroll = useCallback(() => {
+    const el = scrollRef.current; if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    stickBottom.current = near;
+    setAtBottom((v) => (v === near ? v : near));
+  }, []);
+  const jumpToLatest = useCallback(() => {
+    const el = scrollRef.current; if (!el) return;
+    stickBottom.current = true; setAtBottom(true); el.scrollTop = el.scrollHeight;
+  }, []);
 
   const closeStream = () => { esRef.current?.close(); esRef.current = null; esOpen.current = false; };
 
@@ -802,6 +826,7 @@ function App() {
 
   const loadConv = useCallback(async (id: string, highlight?: string) => {
     closeStream();
+    stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
     setDrawer(false); setBusy(false);
     // Switch INSTANTLY: set active + paint the cached copy right away, then refresh from the network
     // in the background and show a loader until it lands. On a weak link this avoids the long block
@@ -914,6 +939,7 @@ function App() {
   const submitText = useCallback(async (text: string): Promise<string | null> => {
     if (!text.trim()) return null;
     setBusy(true);
+    stickBottom.current = true; setAtBottom(true); // sending re-anchors to the bottom so you see your turn + the reply
     pendingUser.current.push(text);
     setItems((it) => applyEvent(it, { t: "user", text }));
     const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
@@ -1229,7 +1255,7 @@ function App() {
               : `Sending ${queued} queued message${queued > 1 ? "s" : ""}…`}
           </div>
         )}
-        <div className="scroll" ref={scrollRef}>
+        <div className="scroll" ref={scrollRef} onScroll={onThreadScroll}>
           {items.length === 0 ? (
             <div className="empty">
               <h2>What can I help with?</h2>
@@ -1257,6 +1283,12 @@ function App() {
             </div>
           )}
         </div>
+
+        {!atBottom && items.length > 0 && (
+          <button className="jump-latest" onClick={jumpToLatest} title="Jump to latest" aria-label="Jump to latest">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M6 13l6 6 6-6" /></svg>
+          </button>
+        )}
 
         <div className="composer-wrap">
           <div className="composer">
@@ -1325,7 +1357,12 @@ function App() {
       {msgMenu && (
         <>
           <div className="ctx-scrim" onClick={() => setMsgMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMsgMenu(null); }} />
-          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 120), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
+          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 160), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
+            {speaking ? (
+              <button onClick={() => { stopReadAloud(); setMsgMenu(null); }}>Stop reading</button>
+            ) : (
+              <button onClick={() => { const t = msgMenu.text; setMsgMenu(null); setSpeaking(true); readAloud(t, { useServerTts: voiceAvail && online, onEnd: () => setSpeaking(false) }); }}>Read aloud</button>
+            )}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
             {msgMenu.kind === "user" && <button onClick={() => editIntoComposer(msgMenu.text)}>Edit</button>}
           </div>

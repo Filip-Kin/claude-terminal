@@ -70,7 +70,7 @@ function takeSentences(buf: string): [string[], string] {
 // #endregion
 
 // #region audio playback queue (Web Audio so barge-in can stop instantly)
-class SpeechPlayer {
+export class SpeechPlayer {
   private ctx: AudioContext;
   private queue: AudioBuffer[] = [];
   private src: AudioBufferSourceNode | null = null;
@@ -113,6 +113,70 @@ class SpeechPlayer {
     if (this.src) { try { this.src.onended = null; this.src.stop(); } catch {} this.src = null; }
     this.playing = false;
   }
+}
+// #endregion
+
+// #region one-shot read-aloud (long-press a message -> hear it)
+// Reads a single message on demand, independent of hands-free voice mode. Prefers the same NAS
+// Kokoro voice as voice mode (useServerTts) so it matches; falls back to the browser's built-in
+// speechSynthesis (works offline / when the TTS sidecar is absent, e.g. iOS has SpeechSynthesis).
+// Only one read-aloud runs at a time — starting a new one (or calling stopReadAloud) stops the last.
+let raStop: (() => void) | null = null;
+let raOnEnd: (() => void) | null = null;
+export function stopReadAloud() { const s = raStop; raStop = null; const cb = raOnEnd; raOnEnd = null; if (s) s(); if (cb) cb(); }
+
+function synthSpeak(text: string, onEnd?: () => void) {
+  try {
+    const synth = window.speechSynthesis;
+    if (!synth) { onEnd?.(); return; }
+    synth.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.onend = () => { if (raStop) { raStop = null; raOnEnd = null; onEnd?.(); } };
+    u.onerror = u.onend;
+    raStop = () => { try { u.onend = null; u.onerror = null; synth.cancel(); } catch {} };
+    raOnEnd = onEnd || null;
+    synth.speak(u);
+  } catch { onEnd?.(); }
+}
+
+export function readAloud(raw: string, opts?: { useServerTts?: boolean; onEnd?: () => void }): void {
+  stopReadAloud();
+  const clean = speakable(raw).trim();
+  if (!clean) { opts?.onEnd?.(); return; }
+  const onEnd = opts?.onEnd;
+  if (!opts?.useServerTts) { synthSpeak(clean, onEnd); return; }
+  // server TTS path: chunk by sentence, fetch each, play through the same queue voice mode uses,
+  // so playback starts on the first sentence instead of waiting for the whole message.
+  let cancelled = false;
+  let started = false;
+  const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const ctx = new AC();
+  try { void ctx.resume(); } catch { /* */ }
+  const player = new SpeechPlayer(ctx);
+  player.onDrain = () => { if (started && !cancelled) { cancelled = true; try { ctx.close(); } catch { /* */ } if (raStop) { raStop = null; raOnEnd = null; onEnd?.(); } } };
+  raStop = () => { cancelled = true; player.stop(); try { ctx.close(); } catch { /* */ } };
+  raOnEnd = onEnd || null;
+  const sentences = clean.match(/\s*[^.!?…]+[.!?…]*/g) || [clean];
+  void (async () => {
+    for (const s of sentences) {
+      if (cancelled) return;
+      const t = s.trim();
+      if (!t) continue;
+      try {
+        const r = await fetch("/app/api/tts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: t }) });
+        if (!r.ok) throw new Error("tts " + r.status);
+        const buf = await r.arrayBuffer();
+        if (cancelled) return;
+        started = true;
+        await player.enqueue(buf);
+      } catch {
+        // TTS sidecar unreachable (offline / not configured) -> finish with the browser voice
+        if (cancelled) return;
+        if (!started) { try { ctx.close(); } catch { /* */ } synthSpeak(clean, onEnd); }
+        return;
+      }
+    }
+  })();
 }
 // #endregion
 
