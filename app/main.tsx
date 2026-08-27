@@ -13,7 +13,10 @@ type Conv = { sessionId: string; title: string; cwd: string | null; mtime: numbe
 type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
   | { t: "text"; text: string; _seq?: number }
+  | { t: "text_delta"; text: string; _seq?: number }
   | { t: "thinking"; text: string; _seq?: number }
+  | { t: "thinking_delta"; text: string; _seq?: number }
+  | { t: "thinking_progress"; tokens: number; _seq?: number }
   | { t: "tool_use"; id: string; name: string; input: unknown; _seq?: number }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean; _seq?: number }
   | { t: "compact"; trigger: string; _seq?: number }
@@ -26,7 +29,7 @@ type AppEvent =
 type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
-  | { kind: "thinking"; text: string }
+  | { kind: "thinking"; text: string; tokens?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
   | { kind: "compact" };
 // #endregion
@@ -56,8 +59,15 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
   switch (e.t) {
     case "user": return [...items, { kind: "user", text: e.text }];
     case "text":
+    case "text_delta":
       if (last && last.kind === "assistant") { const c = items.slice(); c[c.length - 1] = { kind: "assistant", text: last.text + e.text }; return c; }
       return [...items, { kind: "assistant", text: e.text }];
+    case "thinking_delta":
+      if (last && last.kind === "thinking") { const c = items.slice(); c[c.length - 1] = { ...last, text: last.text + e.text }; return c; }
+      return [...items, { kind: "thinking", text: e.text }];
+    case "thinking_progress":
+      if (last && last.kind === "thinking") { const c = items.slice(); c[c.length - 1] = { ...last, tokens: e.tokens }; return c; }
+      return [...items, { kind: "thinking", text: "", tokens: e.tokens }];
     case "thinking": return [...items, { kind: "thinking", text: e.text }];
     case "tool_use": return [...items, { kind: "tool", id: e.id, name: e.name, input: e.input }];
     case "tool_result": {
@@ -116,7 +126,18 @@ function MessageBlock({ items, i }: { items: Item[]; i: number }) {
   const it = items[i];
   if (it.kind === "user") return (<div className="msg"><div className="bubble-user">{it.text}</div></div>);
   if (it.kind === "compact") return <div className="compact-div">conversation compacted</div>;
-  if (it.kind === "thinking") return <div className="thinking">{it.text}</div>;
+  if (it.kind === "thinking") {
+    const isLast = i === items.length - 1;
+    if (it.text) return (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>);
+    // subscription auth redacts the reasoning text; show a live indicator with token progress
+    return (
+      <div className={"thinking think-progress" + (isLast ? " live" : "")}>
+        <span className="think-label">{isLast ? "Thinking" : "Thought"}</span>
+        {isLast && <span className="think-ellipsis">…</span>}
+        {it.tokens ? <span className="think-tok">~{it.tokens} tokens</span> : null}
+      </div>
+    );
+  }
   if (it.kind === "tool") return <ToolCard it={it} />;
   // assistant — show a role label only when it opens an assistant run
   const prev = items[i - 1];
@@ -156,6 +177,7 @@ function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const cwdRef = useRef<string>("");
+  const pendingUser = useRef<string[]>([]); // optimistic user turns awaiting their SSE echo
 
   const refreshConvs = useCallback(() => { api.convs().then((d) => setConvs(d.conversations || [])).catch(() => {}); }, []);
 
@@ -204,6 +226,8 @@ function App() {
 
   const handleEvent = useCallback((e: AppEvent) => {
     if (e.t === "init") { setActiveId(e.sessionId); history.replaceState(null, "", `/app?c=${e.sessionId}`); setTimeout(refreshConvs, 400); return; }
+    // user echo: if we already rendered this turn optimistically, drop the echo
+    if (e.t === "user") { if (pendingUser.current[0] === e.text) { pendingUser.current.shift(); return; } setItems((it) => applyEvent(it, e)); return; }
     if (e.t === "busy") { setBusy(e.busy); return; }
     if (e.t === "result") { setBusy(false); setTimeout(refreshConvs, 500); return; }
     if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
@@ -245,6 +269,9 @@ function App() {
     if (attachments.length) text = "Attached files:\n" + attachments.map((a) => a.path).join("\n") + (raw ? "\n\n" + raw : "");
     setInput(""); setAttachments([]); setBusy(true);
     if (taRef.current) taRef.current.style.height = "auto";
+    // render the user's message immediately; the server's SSE echo is deduped in handleEvent
+    pendingUser.current.push(text);
+    setItems((it) => applyEvent(it, { t: "user", text }));
     try {
       if (esOpen.current && activeId) { await api.send({ id: activeId, text }); }
       else {
@@ -299,7 +326,10 @@ function App() {
             <div key={g.label}>
               <div className="conv-group-label">{g.label}</div>
               {g.items.map((c) => (
-                <button key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId)}>{c.title}</button>
+                <button key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId)}>
+                  <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  <span className="conv-title">{c.title}</span>
+                </button>
               ))}
             </div>
           ))}
@@ -343,7 +373,7 @@ function App() {
           ) : (
             <div className="thread">
               {items.map((_, i) => <MessageBlock key={i} items={items} i={i} />)}
-              {busy && (items[items.length - 1]?.kind !== "tool") && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
+              {busy && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}
         </div>

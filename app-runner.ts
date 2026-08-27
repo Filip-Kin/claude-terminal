@@ -13,7 +13,10 @@ import { query, type SDKMessage, type SDKUserMessage, type Query } from "@anthro
 export type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string }
   | { t: "text"; text: string }
+  | { t: "text_delta"; text: string } // streamed token (includePartialMessages)
   | { t: "thinking"; text: string }
+  | { t: "thinking_delta"; text: string } // streamed thinking token (when content is exposed)
+  | { t: "thinking_progress"; tokens: number } // thinking is happening but text is redacted (subscription auth): show progress
   | { t: "tool_use"; id: string; name: string; input: unknown }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
   | { t: "compact"; trigger: "manual" | "auto" }
@@ -133,7 +136,8 @@ export class Conversation {
         ...(this.resume ? { resume: this.resume } : {}),
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
-        includePartialMessages: false,
+        includePartialMessages: true, // stream text + thinking tokens live
+        thinking: { type: "adaptive" }, // let Claude think; we render it streaming
       },
     });
     try {
@@ -155,12 +159,27 @@ export class Conversation {
         if (anyM.subtype === "init") this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
         else if (anyM.subtype === "compact_boundary") this.emit({ t: "compact", trigger: anyM.compact_metadata?.trigger || "auto" });
         break;
+      case "stream_event": {
+        // live token streaming (includePartialMessages): text + thinking deltas
+        const ev = anyM.event;
+        if (ev?.type === "content_block_delta") {
+          const d = ev.delta;
+          if (d?.type === "text_delta" && d.text) this.emit({ t: "text_delta", text: d.text });
+          else if (d?.type === "thinking_delta") {
+            // subscription auth redacts the thinking text (d.thinking === ""); we still get
+            // estimated_tokens progress, so surface a live "thinking" indicator either way.
+            if (d.thinking) this.emit({ t: "thinking_delta", text: d.thinking });
+            else this.emit({ t: "thinking_progress", tokens: d.estimated_tokens || 0 });
+          }
+        }
+        break;
+      }
       case "assistant": {
+        // text + thinking are streamed above via stream_event; from the aggregated
+        // message we only need tool_use (its input is complete here).
         const blocks = (anyM.message?.content as any[]) || [];
         for (const b of blocks) {
-          if (b?.type === "text") this.emit({ t: "text", text: b.text });
-          else if (b?.type === "thinking") this.emit({ t: "thinking", text: b.thinking || "" });
-          else if (b?.type === "tool_use") this.emit({ t: "tool_use", id: b.id, name: b.name, input: b.input });
+          if (b?.type === "tool_use") this.emit({ t: "tool_use", id: b.id, name: b.name, input: b.input });
         }
         break;
       }
