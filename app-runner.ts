@@ -7,8 +7,9 @@
 // Auth: inherits the box's Claude login (claude.ai subscription, apiKeySource "none") —
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
-import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { mcpServersForQuery } from "./app-mcp";
 
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
@@ -53,6 +54,8 @@ export interface ConvOpts {
   model?: string;
   resume?: string; // existing session id to reattach to
   notifier?: AskNotifier; // notify the owner about an unwatched ask_user prompt
+  mcpFile?: string; // STATE_DIR/claude-app-mcp.json — persisted MCP servers to connect for this chat
+  skills?: string[] | "all"; // which skills this chat may use (the SDK `skills` option); omit for CLI defaults
 }
 
 // Metadata for a still-open ask_user prompt, so a reconnecting client can re-render it.
@@ -66,6 +69,10 @@ export class Conversation {
   lastActivity = Date.now();
   private resume?: string;
   private notifier?: AskNotifier;
+  private mcpFile?: string;
+  private skills?: string[] | "all";
+  private askServer?: McpServerConfig; // the in-process ask_user SDK server, kept so a live
+  // setMcpServers (which replaces ALL dynamic servers) can re-include it rather than drop it.
   private q?: Query;
   private queue: SDKUserMessage[] = [];
   private waiter?: (v: SDKUserMessage | null) => void;
@@ -87,6 +94,8 @@ export class Conversation {
     this.model = opts.model;
     this.resume = opts.resume;
     this.notifier = opts.notifier;
+    this.mcpFile = opts.mcpFile;
+    this.skills = opts.skills;
   }
 
   // fromNow: subscribe to FUTURE events only (no buffer replay). Used when a client reopens a
@@ -135,6 +144,30 @@ export class Conversation {
   }
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
+
+  // Live status of every MCP server connected to this conversation (connected / failed /
+  // needs-auth / pending / disabled), including the in-process ask_user server. Empty if not running.
+  async mcpStatus(): Promise<McpServerStatus[]> {
+    try { return (await this.q?.mcpServerStatus?.()) ?? []; } catch { return []; }
+  }
+
+  // Apply a new persisted MCP set to THIS already-running conversation without restarting it.
+  // setMcpServers replaces the whole dynamic set, so we always re-include the ask_user server.
+  // Returns which servers were added/removed and any connection errors (or null if not running).
+  async applyMcpServers(stored: Record<string, McpServerConfig>) {
+    if (!this.q?.setMcpServers) return null;
+    const payload = { ...stored, ...(this.askServer ? { "app-ui": this.askServer } : {}) };
+    try { return await this.q.setMcpServers(payload); }
+    catch (e: any) { this.emit({ t: "error", message: "setMcpServers: " + (e?.message || e) }); return null; }
+  }
+
+  // Re-read skills from disk for this running conversation (after a skill file was created or
+  // edited from the Settings panel). Returns the refreshed skill list, or null if not running.
+  async reloadSkills() {
+    if (!this.q?.reloadSkills) return null;
+    try { return await this.q.reloadSkills(); }
+    catch (e: any) { this.emit({ t: "error", message: "reloadSkills: " + (e?.message || e) }); return null; }
+  }
 
   // The user tapped an option (or dismissed) for an ask_user prompt.
   answerAsk(askId: string, answer: string): boolean {
@@ -211,17 +244,23 @@ export class Conversation {
   // Start the SDK query. `first` is the opening user turn for a brand-new chat;
   // omit it when resuming (the client sends the next turn via send()).
   async run(first?: string) {
+    this.askServer = this.makeAskServer(); // cache so a live setMcpServers can re-include it
+    // Persisted MCP servers (managed from the Settings panel) connect alongside the always-present
+    // in-process ask_user server. A missing/empty file just yields {}.
+    let stored: Record<string, McpServerConfig> = {};
+    if (this.mcpFile) { try { stored = await mcpServersForQuery(this.mcpFile); } catch {} }
     this.q = query({
       prompt: this.inputGen(first),
       options: {
         cwd: this.cwd,
         ...(this.model ? { model: this.model } : {}),
         ...(this.resume ? { resume: this.resume } : {}),
+        ...(this.skills ? { skills: this.skills } : {}), // which skills this chat may use
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
         thinking: { type: "adaptive" }, // let Claude think; we render it streaming
-        mcpServers: { "app-ui": this.makeAskServer() }, // ask_user tool -> tappable options in the UI
+        mcpServers: { ...stored, "app-ui": this.askServer }, // ask_user + any managed MCP servers
       },
     });
     try {

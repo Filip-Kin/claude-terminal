@@ -5,6 +5,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
 import { VoiceMode, type VoiceBridge } from "./voice";
+import { ManageSections } from "./manage";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
 
@@ -752,6 +753,7 @@ function App() {
                 </span>
                 <button role="switch" aria-checked={speakFinalOnly} className={"toggle" + (speakFinalOnly ? " on" : "")} onClick={() => setSpeakFinal(!speakFinalOnly)}><span className="knob" /></button>
               </label>
+              <ManageSections activeId={activeId} />
             </div>
           </div>
         </div>

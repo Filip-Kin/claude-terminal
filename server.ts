@@ -583,6 +583,8 @@ const appCtx: AppCtx = {
   moreModels: APP_MORE_MODELS,
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
+  mcpFile: join(STATE_DIR, "claude-app-mcp.json"),
+  claudeDir: join(HOME, ".claude"),
   // Hands-free voice: loopback Whisper (STT) + Kokoro (TTS) sidecars. Present only when
   // configured, so a vanilla install (and guest sidecars) simply never show the mic.
   sttUrl: cfg.sttUrl || (cfg.voice ? "http://127.0.0.1:7801" : undefined),
