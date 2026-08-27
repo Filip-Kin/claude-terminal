@@ -7,7 +7,7 @@
 
 import { join } from "path";
 import { readdirSync, statSync } from "fs";
-import { getOrCreate, get, replayTranscript, type AppEvent } from "./app-runner";
+import { getOrCreate, get, replayTranscript, type AppEvent, type AskNotifier } from "./app-runner";
 
 export interface AppCtx {
   allowed: (req: Request) => boolean;
@@ -22,6 +22,7 @@ export interface AppCtx {
   titlesFile: string; // JSON map {sessionId: customTitle} — user-renamed conversations
   sttUrl?: string; // local Whisper service base URL (loopback); enables hands-free voice in
   ttsUrl?: string; // local Kokoro service base URL (loopback); enables voice out
+  notifyAsk?: AskNotifier; // push a PWA notification when Claude asks and no client is watching
 }
 
 // #region favorites (starred conversations) — server-side, shared across the owner's devices
@@ -110,7 +111,7 @@ function findTranscript(ctx: AppCtx, sessionId: string): { path: string; project
 // #endregion
 
 // #region SSE
-function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Request): Response {
+function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Request, fromNow = false): Response {
   let unsub = () => {};
   const stream = new ReadableStream({
     start(controller) {
@@ -119,7 +120,7 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
         try { controller.enqueue(enc2.encode(`data: ${JSON.stringify(e)}\n\n`)); } catch {}
       };
       controller.enqueue(enc2.encode(`retry: 3000\n\n`));
-      unsub = conv.subscribe(write); // replays this run's buffer, then live
+      unsub = conv.subscribe(write, fromNow); // replays this run's buffer (unless fromNow), then live
       const ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch {} }, 20_000);
       (controller as any)._ping = ping;
     },
@@ -293,7 +294,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const events = await replayTranscript(found.path);
     const meta = await convMeta(found.path);
     const live = get(id);
-    return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.title, events, live: !!live, busy: !!live?.busy }, ctx, req);
+    return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.title, events, live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [] }, ctx, req);
   }
 
   // Start a chat: brand-new (no resume) or resume an existing session id. Kicks the first turn.
@@ -309,7 +310,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
     if (existing) { existing.send(text); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
-    const conv = getOrCreate(resume || null, { cwd, model, resume });
+    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk });
     void conv.run(text);
     return jsonRes({ id: conv.id, cwd, model: model || null }, ctx, req);
   }
@@ -330,7 +331,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const id = decodeURIComponent(path.slice("/app/stream/".length));
     const conv = get(id);
     if (!conv) return new Response("data: " + JSON.stringify({ t: "error", message: "conversation not open" }) + "\n\n", { status: 404, headers: { ...ctx.cors(req), "Content-Type": "text/event-stream" } });
-    return sseStream(conv, ctx, req);
+    // tail=1: reconnecting to a live conversation already rebuilt from transcript + pending
+    // asks -> stream only future events so the current turn isn't rendered twice.
+    const tail = new URL(req.url).searchParams.get("tail") === "1";
+    return sseStream(conv, ctx, req, tail);
   }
 
   if (req.method === "POST" && path === "/app/api/model") {

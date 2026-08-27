@@ -263,6 +263,18 @@ a { color: var(--accent-2); }
 .ask-opt .ask-opt-label { font-weight: 500; font-size: 14px; }
 .ask-opt.chosen .ask-opt-label::after { content: " ✓"; color: var(--accent); }
 .ask-opt .ask-opt-desc { font-size: 12px; color: var(--text-3); }
+/* multi-select: a leading tick column + accent when selected */
+.ask-opt.sel { border-color: var(--accent); background: rgba(217, 119, 87, .14); }
+.ask-opt .ask-check { position: absolute; right: 12px; top: 10px; color: var(--accent); font-weight: 700; font-size: 13px; }
+.ask-opt { position: relative; padding-right: 30px; }
+/* free-text answer */
+.ask-text { width: 100%; margin-top: 10px; padding: 10px 12px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 10px; color: var(--text); font-size: 14px; }
+.ask-text:focus { outline: none; border-color: var(--accent); }
+.ask-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+.ask-submit { background: var(--accent); color: #1a1613; border: none; border-radius: 9px; padding: 8px 18px; font-weight: 600; font-size: 14px; transition: background .15s, opacity .15s; }
+.ask-submit:hover:not(:disabled) { background: var(--accent-2); }
+.ask-submit:disabled { opacity: .45; cursor: default; }
+.ask-answered { margin-top: 10px; font-size: 13px; color: var(--text-3); }
 
 /* ---------- mobile ---------- */
 @media (max-width: 820px) {

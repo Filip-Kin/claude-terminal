@@ -21,7 +21,7 @@ export type AppEvent =
   | { t: "tool_use"; id: string; name: string; input: unknown }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
   | { t: "compact"; trigger: "manual" | "auto" }
-  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[] } // Claude asks with tappable options
+  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
   | { t: "user"; text: string } // an echoed user turn (used by history replay)
   | { t: "result"; subtype: string; sessionId: string; costUsd: number }
@@ -43,11 +43,20 @@ function textOfContent(content: unknown): string {
 }
 
 // #region live conversation
+// Fired when Claude asks a question and no client is streaming this conversation, so the
+// owner can be pushed a PWA notification (see server.ts wiring). Kept as a plain callback so
+// app-runner stays decoupled from the web-push machinery in server.ts.
+export type AskNotifier = (info: { sessionId: string; question: string; multiSelect?: boolean; allowText?: boolean }) => void;
+
 export interface ConvOpts {
   cwd: string;
   model?: string;
   resume?: string; // existing session id to reattach to
+  notifier?: AskNotifier; // notify the owner about an unwatched ask_user prompt
 }
+
+// Metadata for a still-open ask_user prompt, so a reconnecting client can re-render it.
+export type PendingAsk = { askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean };
 
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
@@ -56,6 +65,7 @@ export class Conversation {
   busy = false;
   lastActivity = Date.now();
   private resume?: string;
+  private notifier?: AskNotifier;
   private q?: Query;
   private queue: SDKUserMessage[] = [];
   private waiter?: (v: SDKUserMessage | null) => void;
@@ -63,6 +73,7 @@ export class Conversation {
   private subs = new Set<Sub>();
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
   private pendingAsks = new Map<string, (answer: string) => void>(); // ask_user awaiting a tap
+  private pendingAskMeta = new Map<string, PendingAsk>(); // question/options for each open ask, so a reconnect can re-render it
   private askCounter = 0;
   private askToolUseIds = new Set<string>(); // tool_use ids of ask_user calls — their raw tool card/result are suppressed (the ask card replaces them)
   private runStart = 0; // index in `log` where the CURRENT turn began — new subscribers only
@@ -75,16 +86,25 @@ export class Conversation {
     this.cwd = opts.cwd;
     this.model = opts.model;
     this.resume = opts.resume;
+    this.notifier = opts.notifier;
   }
 
-  subscribe(fn: Sub): () => void {
+  // fromNow: subscribe to FUTURE events only (no buffer replay). Used when a client reopens a
+  // live conversation and has already rebuilt the current turn from the transcript + pending
+  // asks, so replaying the buffer would double-render it.
+  subscribe(fn: Sub, fromNow = false): () => void {
     this.subs.add(fn);
     // Replay only the CURRENT turn (from the last turn boundary), so a client that reopens
     // an already-live conversation doesn't get every prior turn re-injected. The client has
     // the earlier turns from the transcript, and _seq dedupe covers mid-turn reconnects.
-    for (let i = this.runStart; i < this.log.length; i++) fn(this.log[i]);
+    const from = fromNow ? this.log.length : this.runStart;
+    for (let i = from; i < this.log.length; i++) fn(this.log[i]);
     return () => this.subs.delete(fn);
   }
+
+  // Open asks awaiting an answer — lets a reconnecting client re-render them with the correct
+  // (server-assigned) askId so its answer actually unblocks the tool.
+  listPendingAsks(): PendingAsk[] { return [...this.pendingAskMeta.values()]; }
 
   private emit(e: AppEvent) {
     (e as any)._seq = this.seqCounter++;
@@ -121,6 +141,7 @@ export class Conversation {
     const resolve = this.pendingAsks.get(askId);
     if (!resolve) return false;
     this.pendingAsks.delete(askId);
+    this.pendingAskMeta.delete(askId);
     this.emit({ t: "ask_done", askId, answer });
     resolve(answer);
     return true;
@@ -134,17 +155,25 @@ export class Conversation {
       tools: [
         tool(
           "ask_user",
-          "Ask the user a question and let them pick from a few tappable options. PREFER this over asking in plain prose whenever you are offering the user a choice between a small set of options (yes/no, pick one of N, which approach, etc.). Returns the option the user chose.",
+          "Ask the user a question and let them answer in the UI. PREFER this over asking in plain prose whenever you are offering a choice between a small set of options (yes/no, pick one of N, which approach, etc.). By default the user picks ONE tappable option; set multiSelect to let them choose several, and/or allowText to let them type a free-text answer (options may be omitted for a pure free-text prompt). Returns the user's answer as text.",
           {
             question: z.string().describe("The question to ask the user"),
-            options: z.array(z.object({ label: z.string().describe("Short option label the user taps"), description: z.string().optional().describe("Optional one-line clarification") })).min(2).max(6).describe("2-6 options to choose from"),
+            options: z.array(z.object({ label: z.string().describe("Short option label the user taps"), description: z.string().optional().describe("Optional one-line clarification") })).max(6).optional().describe("Up to 6 tappable options. Required unless allowText is true (a pure free-text prompt)."),
+            multiSelect: z.boolean().optional().describe("Let the user select multiple options, then submit. The answer comes back as the chosen labels, comma-separated."),
+            allowText: z.boolean().optional().describe("Show a free-text field so the user can type an answer instead of, or in addition to, tapping an option."),
           },
-          async (args: { question: string; options: { label: string; description?: string }[] }) => {
+          async (args: { question: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean }) => {
             if (this.closed) return { content: [{ type: "text" as const, text: "(conversation closed)" }] };
+            const options = args.options ?? [];
+            if (!options.length && !args.allowText) return { content: [{ type: "text" as const, text: "(ask_user needs at least one option, or allowText: true)" }] };
             const askId = `${this.id}-ask-${this.askCounter++}`;
+            const meta: PendingAsk = { askId, question: args.question, options, multiSelect: args.multiSelect, allowText: args.allowText };
             const answer = await new Promise<string>((resolve) => {
               this.pendingAsks.set(askId, resolve);
-              this.emit({ t: "ask", askId, question: args.question, options: args.options });
+              this.pendingAskMeta.set(askId, meta);
+              this.emit({ t: "ask", askId, question: args.question, options, multiSelect: args.multiSelect, allowText: args.allowText });
+              // No one is streaming this conversation -> ping the owner so the turn doesn't hang unseen.
+              if (!this.hasSubscribers()) { try { this.notifier?.({ sessionId: this.id, question: args.question, multiSelect: args.multiSelect, allowText: args.allowText }); } catch {} }
             });
             return { content: [{ type: "text" as const, text: answer }] };
           },
@@ -159,6 +188,7 @@ export class Conversation {
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); }
     for (const [, resolve] of this.pendingAsks) resolve("(the user did not answer)"); // unblock any pending ask
     this.pendingAsks.clear();
+    this.pendingAskMeta.clear();
     try { this.q?.close(); } catch {}
     this.emit({ t: "closed" });
   }
@@ -300,6 +330,7 @@ setInterval(() => {
 // Parses a session .jsonl into the normalized events the front-end already renders.
 export async function replayTranscript(path: string): Promise<AppEvent[]> {
   const out: AppEvent[] = [];
+  const askToolIds = new Set<string>(); // tool_use ids of ask_user calls -> render as ask cards, not raw tool cards
   let text: string;
   try { text = await Bun.file(path).text(); } catch { return out; }
   for (const line of text.split("\n")) {
@@ -311,7 +342,13 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       const c = msg.content;
       if (Array.isArray(c)) {
         const toolResults = c.filter((b: any) => b?.type === "tool_result");
-        if (toolResults.length) { for (const b of toolResults) out.push({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error }); continue; }
+        if (toolResults.length) {
+          for (const b of toolResults) {
+            if (askToolIds.has(b.tool_use_id)) out.push({ t: "ask_done", askId: b.tool_use_id, answer: textOfContent(b.content) }); // the answer to an ask_user
+            else out.push({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error });
+          }
+          continue;
+        }
       }
       const txt = textOfContent(c);
       if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt });
@@ -320,7 +357,13 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       for (const b of blocks) {
         if (b?.type === "text") out.push({ t: "text", text: b.text });
         else if (b?.type === "thinking") out.push({ t: "thinking", text: b.thinking || "" });
-        else if (b?.type === "tool_use") out.push({ t: "tool_use", id: b.id, name: b.name, input: b.input });
+        else if (b?.type === "tool_use" && b.name === "mcp__app-ui__ask_user") {
+          // reconstruct the ask card from the tool input (askId = tool_use id); a matching
+          // tool_result later becomes its ask_done. Avoids a raw, resultless tool card.
+          const inp: any = b.input || {};
+          askToolIds.add(b.id);
+          out.push({ t: "ask", askId: b.id, question: String(inp.question || ""), options: Array.isArray(inp.options) ? inp.options : [], multiSelect: !!inp.multiSelect, allowText: !!inp.allowText });
+        } else if (b?.type === "tool_use") out.push({ t: "tool_use", id: b.id, name: b.name, input: b.input });
       }
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       out.push({ t: "compact", trigger: o.compact_metadata?.trigger || "auto" });

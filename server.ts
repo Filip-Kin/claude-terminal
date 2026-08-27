@@ -584,6 +584,20 @@ const appCtx: AppCtx = {
   // configured, so a vanilla install (and guest sidecars) simply never show the mic.
   sttUrl: cfg.sttUrl || (cfg.voice ? "http://127.0.0.1:7801" : undefined),
   ttsUrl: cfg.ttsUrl || (cfg.voice ? "http://127.0.0.1:7802" : undefined),
+  // Claude asked a question with no client streaming that conversation: push the owner so the
+  // turn doesn't hang unseen. Suppressed when a device is actively watching that session.
+  notifyAsk: (info) => {
+    if (isWatched(info.sessionId)) return;
+    const body = info.question.length > 160 ? info.question.slice(0, 157) + "…" : info.question;
+    void pushAll({
+      title: "Claude has a question",
+      body,
+      url: "/app?c=" + encodeURIComponent(info.sessionId),
+      tag: "ask-" + info.sessionId,
+      sessionId: info.sessionId,
+      requireInteraction: true,
+    });
+  },
 };
 // #endregion
 
@@ -666,7 +680,9 @@ const server = Bun.serve({
     if (req.method === "GET" && path === "/manifest.webmanifest") {
       return Response.json({
         name: APP_NAME, short_name: APP_SHORT, id: "/",
-        start_url: "/", scope: "/",
+        // "?home=1" marks a cold launch so the overlay can reopen the last surface (terminal or
+        // /app) without bouncing normal in-app navigation. Scope/id stay "/" (same installed app).
+        start_url: "/?home=1", scope: "/",
         display: "standalone", display_override: ["standalone", "fullscreen", "minimal-ui"],
         orientation: "any", background_color: BG_COLOR, theme_color: THEME_COLOR,
         icons: [

@@ -11,6 +11,7 @@
 // Self-contained on purpose: the only coupling to main.tsx is the VoiceBridge props
 // contract below. All styles are injected from here (kept out of styles.css).
 import React, { useEffect, useRef, useState, useCallback } from "react";
+import { AskCard, type AskItem } from "./askcard";
 
 // #region bridge contract (how main.tsx wires voice into the live conversation)
 export type VoiceAppEvent =
@@ -121,7 +122,7 @@ async function pickMime(): Promise<string> {
   return ""; // let the browser choose (iOS often returns "" -> audio/mp4)
 }
 
-export function VoiceMode({ bridge, open, onClose }: { bridge: VoiceBridge; open: boolean; onClose: () => void }) {
+export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer }: { bridge: VoiceBridge; open: boolean; onClose: () => void; pendingAsk?: AskItem; onAnswer?: (askId: string, answer: string) => void }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [heard, setHeard] = useState(""); // last user transcript
   const [caption, setCaption] = useState(""); // live assistant caption (what's being said)
@@ -384,6 +385,9 @@ export function VoiceMode({ bridge, open, onClose }: { bridge: VoiceBridge; open
         <div className="voice-state">{label}</div>
         {err ? <div className="voice-err">{err}</div> : null}
       </div>
+      {pendingAsk && onAnswer ? (
+        <div className="voice-ask"><AskCard it={pendingAsk} onAnswer={onAnswer} /></div>
+      ) : null}
       <div className="voice-transcript">
         {heard ? <div className="voice-heard"><span>You</span>{heard}</div> : null}
         {caption ? <div className="voice-said"><span>Claude</span>{caption}</div> : null}
@@ -437,6 +441,7 @@ function injectVoiceCss() {
   .voice-heard{background:rgba(91,140,255,.14);align-self:flex-end;max-width:88%}
   .voice-said{background:rgba(255,255,255,.05);align-self:flex-start;max-width:92%;color:#dcdce6}
   .voice-heard span,.voice-said span{display:block;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#8f8fa3;margin-bottom:4px;font-weight:600}
+  .voice-ask{width:100%;max-width:640px;margin:0 auto 8px;padding:0 6px}
   .voice-controls{display:flex;justify-content:center;min-height:52px;align-items:center}
   .voice-skip{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#ececf1;border-radius:999px;padding:12px 26px;font-size:15px;font-weight:600;cursor:pointer}
   .voice-skip:active{background:rgba(255,255,255,.16)}

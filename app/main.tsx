@@ -5,6 +5,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
 import { VoiceMode, type VoiceBridge } from "./voice";
+import { AskCard } from "./askcard";
 import * as offline from "./offline";
 
 marked.setOptions({ gfm: true, breaks: true });
@@ -22,7 +23,7 @@ type AppEvent =
   | { t: "tool_use"; id: string; name: string; input: unknown; _seq?: number }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean; _seq?: number }
   | { t: "compact"; trigger: string; _seq?: number }
-  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; _seq?: number }
+  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
   | { t: "user"; text: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; _seq?: number }
@@ -35,7 +36,7 @@ type Item =
   | { kind: "assistant"; text: string }
   | { kind: "thinking"; text: string; tokens?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
-  | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; answered?: string }
+  | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "compact" };
 // #endregion
 
@@ -97,7 +98,10 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       return items;
     }
     case "compact": return [...items, { kind: "compact" }];
-    case "ask": return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options }];
+    case "ask": {
+      if (items.some((it) => it.kind === "ask" && it.askId === e.askId)) return items; // de-dupe (transcript + live)
+      return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText }];
+    }
     case "ask_done": {
       const idx = items.findIndex((it) => it.kind === "ask" && it.askId === e.askId);
       if (idx < 0) return items;
@@ -149,19 +153,7 @@ function MessageBlock({ items, i, onAnswer }: { items: Item[]; i: number; onAnsw
   const it = items[i];
   if (it.kind === "user") return (<div className="msg"><div className="bubble-user">{it.text}</div></div>);
   if (it.kind === "compact") return <div className="compact-div">conversation compacted</div>;
-  if (it.kind === "ask") return (
-    <div className="ask-card">
-      <div className="ask-q">{it.question}</div>
-      <div className="ask-opts">
-        {it.options.map((o, k) => (
-          <button key={k} className={"ask-opt" + (it.answered !== undefined ? " done" : "") + (it.answered === o.label ? " chosen" : "")} disabled={it.answered !== undefined} onClick={() => onAnswer(it.askId, o.label)}>
-            <span className="ask-opt-label">{o.label}</span>
-            {o.description && <span className="ask-opt-desc">{o.description}</span>}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
+  if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") {
     const isLast = i === items.length - 1;
     if (it.text) return (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>);
@@ -278,6 +270,11 @@ function App() {
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/_ct/sw.js", { scope: "/" }).catch(() => {});
   }, []);
 
+  // Record that the app is the surface to reopen on next PWA launch (see the overlay's launch
+  // routing). Deliberately "/app" with no ?c= so a relaunch lands on the default view, not a
+  // specific conversation.
+  useEffect(() => { try { localStorage.setItem("ct-last-surface", "/app"); } catch { /* */ } }, []);
+
   // Force the freshest assets. We do NOT unregister the service worker (it's the shared
   // push worker for the whole PWA); clearing Cache Storage + reloading the no-store shell
   // is what actually pulls the new hashed bundle.
@@ -316,10 +313,10 @@ function App() {
     setItems((it) => applyEvent(it, e));
   }, [refreshConvs]);
 
-  const openStream = useCallback((id: string) => {
+  const openStream = useCallback((id: string, tail = false) => {
     closeStream();
     lastSeq.current = -1;
-    const es = new EventSource(`/app/stream/${encodeURIComponent(id)}`);
+    const es = new EventSource(`/app/stream/${encodeURIComponent(id)}${tail ? "?tail=1" : ""}`);
     esRef.current = es; esOpen.current = true;
     es.onmessage = (ev) => {
       let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
@@ -336,12 +333,25 @@ function App() {
     try { d = await api.conversation(id); offline.cacheConversation(id, d); } // cache for offline
     catch { d = await offline.getCachedConversation(id); } // offline: serve from cache
     if (!d) { setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); setActiveId(id); history.replaceState(null, "", `/app?c=${id}`); return; }
-    const built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+    let built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+    // Reopening a LIVE conversation (e.g. one blocked on an ask_user while you were away):
+    // drop any unanswered ask rebuilt from the transcript (its id can't unblock the tool) and
+    // re-add the server's real pending asks, then stream FUTURE events so the reply flows once
+    // you answer. tail=1 avoids re-rendering the current turn already built from the transcript.
+    if (d.live) {
+      const pending: any[] = Array.isArray(d.pendingAsks) ? d.pendingAsks : [];
+      if (pending.length) {
+        built = built.filter((it: Item) => !(it.kind === "ask" && it.answered === undefined));
+        for (const a of pending) built.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
+      }
+    }
     if (highlight) highlightRef.current = highlight; else forceBottom.current = true; // jump to the match, else to the end
-    setItems(built); setActiveId(id);
+    setItems(built); setActiveId(id); activeIdRef.current = id;
+    setBusy(!!d.busy);
     cwdRef.current = d.cwd || defaultCwd;
     history.replaceState(null, "", `/app?c=${id}`);
-  }, [defaultCwd]);
+    if (d.live) openStream(id, true); // reconnect to a live conversation (streams follow-up + ask answers)
+  }, [defaultCwd, openStream]);
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
 
@@ -408,7 +418,7 @@ function App() {
 
   const doSend = async () => {
     const raw = input.trim();
-    if ((!raw && !attachments.length) || busy) return;
+    if (!raw && !attachments.length) return; // busy is allowed: the turn queues (processed after the current one)
     let text = raw;
     if (attachments.length) text = "Attached files:\n" + attachments.map((a) => a.path).join("\n") + (raw ? "\n\n" + raw : "");
     setInput(""); setAttachments([]);
@@ -429,6 +439,22 @@ function App() {
     setItems((its) => its.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)));
     if (activeIdRef.current) api.answerAsk(activeIdRef.current, askId, answer).catch(() => {});
   }, []);
+
+  // Tapping a PWA push (e.g. "Claude has a question") posts this from the service worker;
+  // open that conversation so the ask card is right there to answer.
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const onMsg = (ev: MessageEvent) => {
+      const d: any = ev.data;
+      if (d?.type === "ct-notification-click" && d.sessionId) void loadConv(String(d.sessionId));
+    };
+    navigator.serviceWorker.addEventListener("message", onMsg);
+    return () => navigator.serviceWorker.removeEventListener("message", onMsg);
+  }, [loadConv]);
+
+  // The first unanswered ask — surfaced on top of voice mode (a tappable card can't be used
+  // hands-free, but at least it's visible and answerable instead of hidden behind the overlay).
+  const pendingAsk = useMemo(() => items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined, [items]);
 
   const onPickModel = async (m: string) => {
     setModel(m); localStorage.setItem("ct-app-model", m); setMenuOpen(false); setOtherOpen(false);
@@ -637,21 +663,20 @@ function App() {
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z" stroke="currentColor" strokeWidth="1.7" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /></svg>
                 </button>
               )}
-              {busy ? (
-                <button className="send-btn stop-btn" onClick={stop} title="Stop">
+              {busy && (
+                <button className="send-btn stop-btn" onClick={stop} title="Stop the current turn">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
                 </button>
-              ) : (
-                <button className="send-btn" onClick={doSend} disabled={!input.trim() && !attachments.length} title="Send">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 20V5M6 11l6-6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                </button>
               )}
+              <button className="send-btn" onClick={doSend} disabled={!input.trim() && !attachments.length} title={busy ? "Queue this message (sent after the current turn)" : "Send"}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 20V5M6 11l6-6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              </button>
             </div>
           </div>
           <div className="hint">Claude runs with tools enabled in {cwdRef.current || "the default folder"}. Enter to send, Shift+Enter for a new line.</div>
         </div>
       </main>
-      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} />
+      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} />
     </div>
   );
 }

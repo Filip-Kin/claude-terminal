@@ -2,6 +2,21 @@
   const log = (...a) => console.log("[claude-paste]", ...a);
   log("overlay loaded");
 
+  // #region PWA launch routing — reopen the surface you left off on (terminal vs app).
+  // The manifest start_url is "/?home=1"; that marker only appears on a cold PWA launch, so a
+  // normal in-app navigation to the terminal never bounces. If the app ("/app") was the last
+  // surface, jump there (its default view, NOT a specific conversation). Otherwise stay here.
+  try {
+    var _sp = new URLSearchParams(location.search);
+    if (_sp.get("home") === "1") {
+      var _last = null; try { _last = localStorage.getItem("ct-last-surface"); } catch (e) {}
+      if (_last === "/app") { location.replace("/app"); return; }
+      try { history.replaceState(null, "", location.pathname); } catch (e) {} // drop the marker
+    }
+    try { localStorage.setItem("ct-last-surface", "/"); } catch (e) {} // we're on the terminal now
+  } catch (e) {}
+  // #endregion
+
   // #region ttyd WebSocket capture
   // ttyd negotiates with the 'tty' subprotocol. Patch WebSocket so we can
   // grab the live connection and inject input directly (ttyd input frame =
