@@ -372,11 +372,9 @@ export function VoiceMode({ bridge, open, onClose }: { bridge: VoiceBridge; open
         {caption ? <div className="voice-said"><span>Claude</span>{caption}</div> : null}
       </div>
       <div className="voice-controls">
-        {phase === "speaking" || phase === "thinking" ? (
+        {(phase === "speaking" || phase === "thinking") && (
           <button className="voice-skip" onClick={() => { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; startListening(); }}>Interrupt</button>
-        ) : phase === "listening" ? (
-          <button className="voice-skip" onClick={() => { /* force-send now */ try { recRef.current && (recRef.current as any)._force?.(); } catch {}; }} style={{ visibility: "hidden" }}>.</button>
-        ) : null}
+        )}
       </div>
     </div>
   );
