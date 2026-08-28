@@ -687,14 +687,21 @@ function App() {
     if (!its.length) return;
     void offline.cacheConversation(cid, { items: its, busy: busyRef.current, cwd: cwdRef.current, live: busyRef.current, at: Date.now() });
   }, []);
-  // Keep the offline cache warm DURING a turn (not just when it finishes): snapshot every ~2s while
-  // busy, and immediately when the page is hidden (phone lock / app switch). So a reload mid-stream or
-  // a return-from-lock restores the in-progress conversation instead of jumping back to before you spoke.
+  // Persist to the offline cache AS the conversation changes (not on a timer). Streaming updates
+  // `items` on every token, and each write stores the whole conversation, so we coalesce a burst of
+  // tokens into at most one write per second (a leading write, then a trailing write for whatever
+  // arrived during the gap) — event-driven, nothing runs while idle. A reload mid-stream or a
+  // return-from-lock then restores the in-progress conversation instead of the last completed snapshot.
+  const cacheThrottle = useRef<{ timer: ReturnType<typeof setTimeout> | null; last: number }>({ timer: null, last: 0 });
   useEffect(() => {
-    if (!busy) return;
-    const t = setInterval(() => cacheActive(), 2000);
-    return () => clearInterval(t);
-  }, [busy, cacheActive]);
+    const tc = cacheThrottle.current;
+    if (tc.timer) return; // a trailing write is already scheduled; it'll pick up the latest items
+    const since = Date.now() - tc.last;
+    if (since >= 1000) { tc.last = Date.now(); cacheActive(); }
+    else { tc.timer = setTimeout(() => { tc.timer = null; tc.last = Date.now(); cacheActive(); }, 1000 - since); }
+  }, [items, cacheActive]);
+  // Guarantee the newest state is saved the instant the page is hidden (phone lock / app switch),
+  // even if a coalesced write was still pending.
   useEffect(() => {
     const flush = () => { if (document.visibilityState === "hidden") cacheActive(); };
     document.addEventListener("visibilitychange", flush);
@@ -843,7 +850,7 @@ function App() {
       } else refreshContext(id);
       return;
     } // compaction finished -> send anything held
-    if (e.t === "result") { setBusy(false); setItems((it) => { const n = applyEvent(it, e); setTimeout(() => cacheActive(), 0); return n; }); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage; snapshot the finished turn to cache
+    if (e.t === "result") { setBusy(false); setItems((it) => applyEvent(it, e)); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage (the items-change writer caches it)
     if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
     if (e.t === "closed") { return; }
     setItems((it) => applyEvent(it, e));
