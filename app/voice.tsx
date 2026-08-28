@@ -261,7 +261,7 @@ async function pickMime(): Promise<string> {
   return ""; // let the browser choose (iOS often returns "" -> audio/mp4)
 }
 
-export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFinalOnly, ttsVoice }: { bridge: VoiceBridge; open: boolean; onClose: () => void; pendingAsk?: AskItem; onAnswer?: (askId: string, answer: string) => void; speakFinalOnly?: boolean; ttsVoice?: string }) {
+export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFinalOnly, ttsVoice, tapToTalk }: { bridge: VoiceBridge; open: boolean; onClose: () => void; pendingAsk?: AskItem; onAnswer?: (askId: string, answer: string) => void; speakFinalOnly?: boolean; ttsVoice?: string; tapToTalk?: boolean }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [heard, setHeard] = useState(""); // last user transcript
   const [caption, setCaption] = useState(""); // live assistant caption (what's being said)
@@ -274,10 +274,18 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   useEffect(() => { speakFinalRef.current = !!speakFinalOnly; }, [speakFinalOnly]);
   const ttsVoiceRef = useRef(ttsVoice); // latest chosen Kokoro voice for the stable speakSentence closure
   useEffect(() => { ttsVoiceRef.current = ttsVoice; }, [ttsVoice]);
+  // Tap-to-talk: mic is opened only while the user is actually speaking (one tap per turn), released
+  // the rest of the time. That keeps the phone off the call-type audio session between turns, so the
+  // car stays on media (A2DP) — playback is loud and the music can duck/resume, unlike always-on mode.
+  const pttRef = useRef(!!tapToTalk);
+  useEffect(() => { pttRef.current = !!tapToTalk; }, [tapToTalk]);
+  const sinkRef = useRef<MediaSink | null>(null); // media sink used in tap-to-talk (no persistent mic)
 
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const srcNodeRef = useRef<MediaStreamAudioSourceNode | null>(null); // mic source, so tap-to-talk can disconnect it between turns
+  const onstopSendRef = useRef(false); // whether the current recording should be transcribed (vs a silence-only segment)
   const playerRef = useRef<SpeechPlayer | null>(null);
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -301,12 +309,24 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     try { recRef.current?.state !== "inactive" && recRef.current?.stop(); } catch {}
     recRef.current = null;
     playerRef.current?.stop();
+    try { sinkRef.current?.release(); sinkRef.current?.destroy(); } catch {}
+    sinkRef.current = null;
+    try { srcNodeRef.current?.disconnect(); } catch {}
+    srcNodeRef.current = null;
     try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
     streamRef.current = null;
     try { ctxRef.current?.close(); } catch {}
     ctxRef.current = null; analyserRef.current = null; playerRef.current = null;
     setPhaseR("idle"); setLevel(0);
   }, []);
+
+  // Tap-to-talk only: duck the user's music while Claude speaks (grab audio focus), release it when he
+  // stops so music resumes. Safe here because there's no live mic fighting for the audio session.
+  useEffect(() => {
+    if (!pttRef.current) return;
+    const sink = sinkRef.current; if (!sink) return;
+    if (phase === "speaking") sink.acquire(); else sink.release();
+  }, [phase]);
 
   // #region listening + VAD
   const startListening = useCallback(() => {
@@ -324,12 +344,13 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     catch { try { rec = new MediaRecorder(stream); } catch { setErr("recorder unavailable"); setPhaseR("error"); return; } }
     recRef.current = rec;
     rec.ondataavailable = (e) => { if (e.data && e.data.size) chunksRef.current.push(e.data); };
-    let onstopSend = false;
+    onstopSendRef.current = false;
     rec.onstop = () => {
       const blob = new Blob(chunksRef.current, { type: mimeRef.current || (chunksRef.current[0] as any)?.type || "audio/webm" });
       chunksRef.current = [];
-      if (onstopSend && blob.size > 1200) void transcribeAndSubmit(blob);
-      else if (activeRef.current && phaseRef.current === "listening") startListening(); // was a silence-only segment: keep listening
+      if (onstopSendRef.current && blob.size > 1200) void transcribeAndSubmit(blob);
+      else if (pttRef.current) { releaseMic(); setPhaseR("idle"); } // tap-to-talk: no speech -> wait for the next tap
+      else if (activeRef.current && phaseRef.current === "listening") startListening(); // continuous: was a silence-only segment, keep listening
     };
     rec.start();
 
@@ -349,7 +370,7 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
       if (floorN < 12) { floor = (floor * floorN + rms) / (floorN + 1); floorN++; } // ambient calibration
       const thr = Math.max(0.05, floor * 2.2);
       if (rms > thr) { if (!speech) speech = true; lastVoice = now; }
-      const finish = (send: boolean) => { onstopSend = send; clearRaf(); if (send) setPhaseR("transcribing"); try { rec.stop(); } catch {} };
+      const finish = (send: boolean) => { onstopSendRef.current = send; clearRaf(); if (send) setPhaseR("transcribing"); try { rec.stop(); } catch {} };
       if (speech && now - lastVoice > SIL_MS) return finish(true);
       if (speech && now - segStart > MAX_UTTER_MS) return finish(true);
       if (!speech && now - segStart > MAX_IDLE_MS) return finish(false); // restart segment, drop buffer
@@ -357,11 +378,48 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     };
     rafRef.current = requestAnimationFrame(tick);
   }, []);
+
+  // Close the mic between turns (tap-to-talk) so the phone drops the call-type audio session.
+  const releaseMic = useCallback(() => {
+    clearRaf();
+    try { recRef.current?.state !== "inactive" && recRef.current?.stop(); } catch {}
+    recRef.current = null;
+    try { srcNodeRef.current?.disconnect(); } catch {}
+    srcNodeRef.current = null;
+    try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
+    streamRef.current = null; analyserRef.current = null;
+    setLevel(0);
+  }, []);
+
+  // Tap-to-talk button: idle -> open the mic + start a listening segment; while listening -> a second
+  // tap force-sends what's captured. Acquires the mic on demand instead of holding it open.
+  const pttTap = useCallback(async () => {
+    if (!activeRef.current) return;
+    if (phaseRef.current === "listening") { clearRaf(); onstopSendRef.current = true; setPhaseR("transcribing"); try { recRef.current?.stop(); } catch {} return; }
+    if (phaseRef.current === "speaking" || phaseRef.current === "thinking") { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; sinkRef.current?.release(); }
+    const ctx = ctxRef.current; if (!ctx) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      if (!activeRef.current) { stream.getTracks().forEach((t) => t.stop()); return; }
+      streamRef.current = stream;
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.3;
+      src.connect(analyser);
+      srcNodeRef.current = src; analyserRef.current = analyser;
+      try { await ctx.resume(); } catch { /* */ }
+      startListening();
+    } catch (e: any) {
+      setErr(e?.name === "NotAllowedError" ? "microphone permission denied" : "mic error: " + (e?.message || e));
+      setPhaseR("idle");
+    }
+  }, [startListening]);
   // #endregion
 
   // #region STT -> submit turn
   const transcribeAndSubmit = useCallback(async (blob: Blob) => {
     setPhaseR("transcribing");
+    if (pttRef.current) releaseMic(); // tap-to-talk: close the mic now so playback is media (loud, music can duck)
     const ext = (mimeRef.current.includes("mp4") || mimeRef.current.includes("aac")) ? "mp4" : mimeRef.current.includes("ogg") ? "ogg" : "webm";
     const fd = new FormData();
     fd.append("file", blob, `utt.${ext}`);
@@ -444,13 +502,19 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     let loud = 0;
     const loop = () => {
       raf = requestAnimationFrame(loop);
-      const analyser = analyserRef.current, player = playerRef.current;
-      if (!analyser || !player) return;
-      const speakingOrThinking = phaseRef.current === "speaking" || phaseRef.current === "thinking";
-      // move thinking -> speaking once audio actually starts
+      const player = playerRef.current;
+      if (!player) return;
+      // move thinking -> speaking once audio actually starts (works with or without a live mic)
       if (phaseRef.current === "thinking" && player.isActive) setPhaseR("speaking");
-      // hands-free: assistant done + audio drained -> listen again
-      if (phaseRef.current === "speaking" && turnDoneRef.current && !player.isActive) { startListening(); return; }
+      // turn done + audio drained: hands-free listens again; tap-to-talk goes idle (music resumes) to wait for a tap
+      if (phaseRef.current === "speaking" && turnDoneRef.current && !player.isActive) {
+        if (pttRef.current) { sinkRef.current?.release(); setPhaseR("idle"); }
+        else startListening();
+        return;
+      }
+      const analyser = analyserRef.current;
+      if (!analyser) return; // no live mic (tap-to-talk between turns) -> no barge-in
+      const speakingOrThinking = phaseRef.current === "speaking" || phaseRef.current === "thinking";
       if (!speakingOrThinking) return;
       // barge-in detection (higher bar than listening; echoCancellation removes most TTS bleed)
       analyser.getByteTimeDomainData(data);
@@ -476,28 +540,33 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
       setErr("");
       try {
         mimeRef.current = await pickMime();
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
-        streamRef.current = stream;
         const AC: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
         const ctx = new AC();
         try { await ctx.resume(); } catch {}
+        if (cancelled) { try { ctx.close(); } catch {} return; }
         ctxRef.current = ctx;
-        const src = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.3;
-        src.connect(analyser);
-        analyserRef.current = analyser;
-        // NB: hands-free needs the mic open, which makes the phone hold a CALL-type audio session
-        // (over car Bluetooth the head unit mutes media and routes to the earpiece/HFP path). A media
-        // element + MediaSession can't override that while the mic is live, so voice mode just plays to
-        // the default output; the call-vs-media tradeoff is inherent to always-on listening.
-        const player = new SpeechPlayer(ctx);
-        playerRef.current = player;
         activeRef.current = true;
-        startListening();
+        if (pttRef.current) {
+          // Tap-to-talk: no persistent mic. Route TTS through a media sink so playback is loud media
+          // that ducks the user's music; the mic only opens on a tap (pttTap). Wait in idle for the tap.
+          const sink = makeMediaSink(ctx); sinkRef.current = sink; sink?.prime();
+          playerRef.current = new SpeechPlayer(ctx, sink?.node);
+          setPhaseR("idle");
+        } else {
+          // Always-on: the open mic makes the phone hold a CALL-type audio session (over car Bluetooth
+          // the head unit mutes media / routes to HFP). A media element can't override that while the
+          // mic is live, so we just play to the default output — inherent to hands-free listening.
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+          if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+          streamRef.current = stream;
+          const src = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.3;
+          src.connect(analyser);
+          srcNodeRef.current = src; analyserRef.current = analyser;
+          playerRef.current = new SpeechPlayer(ctx);
+          startListening();
+        }
       } catch (e: any) {
         if (cancelled) return;
         setErr(e?.name === "NotAllowedError" ? "microphone permission denied" : "could not start audio: " + (e?.message || e));
@@ -512,15 +581,19 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   useEffect(() => { injectVoiceCss(); }, []);
 
   if (!open) return null;
-  const label = phase === "listening" ? "Listening…" : phase === "transcribing" ? "…" : phase === "thinking" ? "Thinking…" : phase === "speaking" ? "Speaking…" : phase === "error" ? "Problem" : "";
+  const ptt = !!tapToTalk;
+  const label = ptt && phase === "idle" ? "Tap to talk"
+    : phase === "listening" ? (ptt ? "Listening… tap to send" : "Listening…")
+    : phase === "transcribing" ? "…" : phase === "thinking" ? "Thinking…" : phase === "speaking" ? "Speaking…" : phase === "error" ? "Problem" : "";
+  const interrupt = () => { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; if (ptt) { sinkRef.current?.release(); setPhaseR("idle"); } else startListening(); };
   return (
     <div className="voice-overlay" role="dialog" aria-label="Voice mode">
       <div className="voice-top">
-        <span className="voice-badge">Voice</span>
+        <span className="voice-badge">Voice{ptt ? " · tap" : ""}</span>
         <button className="voice-x" onClick={onClose} aria-label="Exit voice mode">Done</button>
       </div>
       <div className="voice-center">
-        <div className={"voice-orb voice-" + phase}>
+        <div className={"voice-orb voice-" + phase + (ptt ? " voice-orb-tap" : "")} onClick={ptt ? () => void pttTap() : undefined} role={ptt ? "button" : undefined} aria-label={ptt ? label : undefined}>
           <span className="vo-ring vo-ring1" />
           <span className="vo-ring vo-ring2" />
           <div className="voice-orb-blob" style={{ transform: `scale(${1 + (phase === "listening" ? level * 0.5 : phase === "speaking" ? 0.14 : 0)})` }}>
@@ -539,8 +612,11 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
         {caption ? <div className="voice-said"><span>Claude</span>{caption}</div> : null}
       </div>
       <div className="voice-controls">
+        {ptt && (phase === "idle" || phase === "listening") && (
+          <button className="voice-talk" onClick={() => void pttTap()}>{phase === "listening" ? "Tap to send" : "Tap to talk"}</button>
+        )}
         {(phase === "speaking" || phase === "thinking") && (
-          <button className="voice-skip" onClick={() => { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; startListening(); }}>Interrupt</button>
+          <button className="voice-skip" onClick={interrupt}>Interrupt</button>
         )}
       </div>
     </div>
@@ -591,6 +667,9 @@ function injectVoiceCss() {
   .voice-controls{display:flex;justify-content:center;min-height:52px;align-items:center}
   .voice-skip{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#ececf1;border-radius:999px;padding:12px 26px;font-size:15px;font-weight:600;cursor:pointer}
   .voice-skip:active{background:rgba(255,255,255,.16)}
+  .voice-orb-tap{cursor:pointer}
+  .voice-talk{background:#d97757;border:none;color:#fff;border-radius:999px;padding:15px 40px;font-size:17px;font-weight:600;cursor:pointer;box-shadow:0 6px 20px rgba(217,119,87,.4)}
+  .voice-talk:active{background:#c76644}
   @media (min-width:720px){.voice-transcript{max-width:640px;margin:0 auto;width:100%}}
   /* composer mic button: static (no constant animation); the icon just reacts on tap */
   .voice-open-btn{position:relative;transform-origin:center}

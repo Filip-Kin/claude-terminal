@@ -525,6 +525,8 @@ function App() {
   const [convMenu, setConvMenu] = useState<{ x: number; y: number; id: string; title: string; fav: boolean } | null>(null);
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
   const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
+  const [tapToTalk, setTapToTalkState] = useState(() => { try { return localStorage.getItem("ct-voice-ptt") === "1"; } catch { return false; } });
+  const setTapToTalk = (v: boolean) => { setTapToTalkState(v); try { localStorage.setItem("ct-voice-ptt", v ? "1" : "0"); } catch { /* */ } };
   const [voiceAvail, setVoiceAvail] = useState(false);
   const [voices, setVoices] = useState<{ id: string; label: string }[]>([]); // available Kokoro voices
   const [ttsVoice, setTtsVoiceState] = useState<string>(() => { try { return localStorage.getItem("ct-voice-name") || ""; } catch { return ""; } });
@@ -1200,6 +1202,13 @@ function App() {
                 </span>
                 <button role="switch" aria-checked={speakFinalOnly} className={"toggle" + (speakFinalOnly ? " on" : "")} onClick={() => setSpeakFinal(!speakFinalOnly)}><span className="knob" /></button>
               </label>
+              <label className="settings-row">
+                <span className="settings-row-main">
+                  <span className="settings-row-title">Tap to talk</span>
+                  <span className="settings-row-desc">Open the mic only when you tap, instead of listening the whole time. Better in the car: the phone stays off the hands-free call profile between turns, so replies play as loud media and your music can duck and resume.</span>
+                </span>
+                <button role="switch" aria-checked={tapToTalk} className={"toggle" + (tapToTalk ? " on" : "")} onClick={() => setTapToTalk(!tapToTalk)}><span className="knob" /></button>
+              </label>
               {voices.length > 0 && (
                 <label className="settings-row">
                   <span className="settings-row-main">
@@ -1435,7 +1444,7 @@ function App() {
           </div>
         </>
       )}
-      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} ttsVoice={ttsVoice || undefined} />
+      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} ttsVoice={ttsVoice || undefined} tapToTalk={tapToTalk} />
     </div>
   );
 }
