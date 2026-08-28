@@ -33,14 +33,17 @@ const saveLastRead = (m: Record<string, number>) => { try { localStorage.setItem
 // (x, y). Returns handlers to spread onto the target element.
 function longPressBind(open: (x: number, y: number) => void) {
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let sx = 0, sy = 0, fired = false;
+  let sx = 0, sy = 0, fired = false, firedAt = 0;
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   return {
     onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); open(e.clientX, e.clientY); },
-    onTouchStart: (e: React.TouchEvent) => { const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; open(sx, sy); }, 500); },
-    onTouchMove: (e: React.TouchEvent) => { const t = e.touches[0]; if (t && (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10)) clear(); },
-    onTouchEnd: (e: React.TouchEvent) => { clear(); if (fired) { e.preventDefault(); fired = false; } }, // swallow the click that a long-press would otherwise fire
+    // 600ms hold, cancelled by any real movement (a scroll or a normal tap never opens the menu).
+    onTouchStart: (e: React.TouchEvent) => { const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy); }, 600); },
+    onTouchMove: (e: React.TouchEvent) => { const t = e.touches[0]; if (t && (Math.abs(t.clientX - sx) > 8 || Math.abs(t.clientY - sy) > 8)) clear(); },
+    onTouchEnd: (e: React.TouchEvent) => { clear(); if (fired) e.preventDefault(); },
     onTouchCancel: clear,
+    // Swallow the click the browser fires after a long-press so the row doesn't ALSO navigate/open.
+    onClickCapture: (e: React.MouseEvent) => { if (fired || Date.now() - firedAt < 700) { e.preventDefault(); e.stopPropagation(); fired = false; } },
   };
 }
 
@@ -115,6 +118,17 @@ const api = {
 type SearchHit = { sessionId: string; title: string; snippet: string; count: number; mtime: number; cwd: string | null };
 // #endregion
 
+// Strip machine-added noise from a user turn before it's shown or compared: the hidden voice-mode
+// directive we append to voice turns, and the harness's "[Image: original …]" attachment note. Done
+// on the client so the directive never leaks into a bubble and so optimistic vs echoed turns match
+// for dedup, regardless of whether the server build already strips them.
+function sanitizeUserText(t: string): string {
+  return (t || "")
+    .replace(/\s*<voice-mode>[\s\S]*?<\/voice-mode>\s*/g, "")
+    .replace(/\s*\[Image[^\]]*\]\s*/g, " ")
+    .trim();
+}
+
 // A loaded skill is injected as a user message starting with "Base directory for this skill:
 // <path>/<name>". Pull the skill name out so we can show a small card instead of the raw file.
 function skillLoadName(txt: string): string | null {
@@ -142,7 +156,7 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       // covers transcripts replayed before that backend build ships, so no restart is needed.)
       const sk = skillLoadName(e.text);
       if (sk) return [...items, { kind: "notice", noticeKind: "skill", text: sk }];
-      return [...items, { kind: "user", text: e.text }];
+      return [...items, { kind: "user", text: sanitizeUserText(e.text) }];
     }
     case "text":
     case "text_delta":
@@ -369,11 +383,11 @@ const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|heic|heif|svg|avif)$/i;
 // A user turn that carried attachments is stored as "Attached files:\n<path>\n...\n\n<message>".
 // Split it back out so image paths render as thumbnails and the typed message shows on its own.
 function parseUserText(text: string): { images: string[]; files: string[]; body: string } {
-  if (!text.startsWith("Attached files:\n")) return { images: [], files: [], body: text };
+  if (!text.startsWith("Attached files:\n")) return { images: [], files: [], body: sanitizeUserText(text) };
   const rest = text.slice("Attached files:\n".length);
   const nl = rest.indexOf("\n\n");
   const block = nl >= 0 ? rest.slice(0, nl) : rest;
-  const body = nl >= 0 ? rest.slice(nl + 2) : "";
+  const body = nl >= 0 ? sanitizeUserText(rest.slice(nl + 2)) : "";
   const paths = block.split("\n").map((s) => s.trim()).filter(Boolean);
   return { images: paths.filter((p) => IMG_RE.test(p)), files: paths.filter((p) => !IMG_RE.test(p)), body };
 }
@@ -765,9 +779,12 @@ function App() {
     // user echo: drop it if we already rendered this turn optimistically (match by value, any
     // position), and guard against a stream reopen replaying a turn already at the tail.
     if (e.t === "user") {
-      const idx = pendingUser.current.indexOf(e.text);
+      // Compare the CLEANED text (directive/image-note removed) so an echoed decorated turn dedupes
+      // against the optimistic clean one, instead of rendering a second bubble with the directive in it.
+      const clean = sanitizeUserText(e.text);
+      const idx = pendingUser.current.indexOf(clean);
       if (idx !== -1) { pendingUser.current.splice(idx, 1); return; }
-      setItems((it) => { const last = it[it.length - 1]; return last && last.kind === "user" && last.text === e.text ? it : applyEvent(it, e); });
+      setItems((it) => { const last = it[it.length - 1]; return last && last.kind === "user" && sanitizeUserText(last.text) === clean ? it : applyEvent(it, e); });
       return;
     }
     if (e.t === "busy") { setBusy(e.busy); return; }
@@ -942,10 +959,11 @@ function App() {
       const quietFor = Date.now() - lastEventAt.current;
       const st = statuses[id];
       const serverDone = st ? !st.busy : false; // server knows this conv and says the turn ended
-      // Missed the ending (server done but we still show busy) -> resync fast. Otherwise only after a
-      // longer silence, so a genuinely long, quiet tool run isn't interrupted.
-      if ((serverDone && quietFor > 8000) || quietFor > 30000) { lastEventAt.current = Date.now(); void loadConv(id); }
-    }, 5000);
+      // Missed the ending (server done but we still show busy) -> resync fast. Otherwise resync after a
+      // shorter silence so a weak-signal stall recovers on its own instead of looking hung. A genuinely
+      // long, quiet tool run just re-attaches the stream (loadConv reopens it if still live).
+      if ((serverDone && quietFor > 6000) || quietFor > 15000) { lastEventAt.current = Date.now(); void loadConv(id); }
+    }, 4000);
     return () => clearInterval(t);
   }, [busy, statuses, loadConv]);
 

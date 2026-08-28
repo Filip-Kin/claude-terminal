@@ -279,7 +279,6 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   const ctxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const playerRef = useRef<SpeechPlayer | null>(null);
-  const sinkRef = useRef<MediaSink | null>(null); // media element that ducks music + plays loud in the car
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const rafRef = useRef<number | null>(null);
@@ -302,21 +301,12 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     try { recRef.current?.state !== "inactive" && recRef.current?.stop(); } catch {}
     recRef.current = null;
     playerRef.current?.stop();
-    try { sinkRef.current?.release(); sinkRef.current?.destroy(); } catch {}
-    sinkRef.current = null;
     try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
     streamRef.current = null;
     try { ctxRef.current?.close(); } catch {}
     ctxRef.current = null; analyserRef.current = null; playerRef.current = null;
     setPhaseR("idle"); setLevel(0);
   }, []);
-
-  // Duck the user's music: grab audio focus while Claude is speaking, hand it back the moment he
-  // stops (thinking/listening/idle) so music resumes between replies. Driven by the phase machine.
-  useEffect(() => {
-    const sink = sinkRef.current; if (!sink) return;
-    if (phase === "speaking") sink.acquire(); else sink.release();
-  }, [phase]);
 
   // #region listening + VAD
   const startListening = useCallback(() => {
@@ -500,12 +490,11 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
         analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.3;
         src.connect(analyser);
         analyserRef.current = analyser;
-        // Route TTS through a media sink (loud car audio + pause the user's music while Claude talks).
-        // prime() runs inside this open-gesture so a later acquire() isn't blocked by autoplay policy.
-        const sink = makeMediaSink(ctx);
-        sinkRef.current = sink;
-        sink?.prime();
-        const player = new SpeechPlayer(ctx, sink?.node);
+        // NB: hands-free needs the mic open, which makes the phone hold a CALL-type audio session
+        // (over car Bluetooth the head unit mutes media and routes to the earpiece/HFP path). A media
+        // element + MediaSession can't override that while the mic is live, so voice mode just plays to
+        // the default output; the call-vs-media tradeoff is inherent to always-on listening.
+        const player = new SpeechPlayer(ctx);
         playerRef.current = player;
         activeRef.current = true;
         startListening();
