@@ -675,6 +675,18 @@ function parseUserText(text: string): { images: string[]; files: string[]; body:
   return { images: paths.filter((p) => IMG_RE.test(p)), files: paths.filter((p) => !IMG_RE.test(p)), body };
 }
 
+// Inter-agent messages arrive as a raw <cross-session-message from-name="…">…</cross-session-message>
+// turn (another Claude session messaging this one). Pull out the sender and the message body so we can
+// render a tidy card instead of the raw XML. The harness prose around the tag ("Another Claude session
+// sent a message:" / the "this came from another session" note) sits OUTSIDE the tag, so taking the
+// inner body drops it. Returns null for an ordinary user turn.
+function parseAgentMessage(text: string): { from: string; body: string } | null {
+  const m = text.match(/<cross-session-message\b([^>]*)>([\s\S]*?)<\/cross-session-message>/);
+  if (!m) return null;
+  const name = (m[1] || "").match(/from-name="([^"]*)"/);
+  return { from: (name?.[1] || "another session").trim(), body: m[2].trim() };
+}
+
 // Google-Messages-style delivery ticks, shown only under the bottom-most turn you sent: one tick while
 // sending, two ticks once the server has it, two FILLED (accent) ticks once the agent reads it + starts.
 function SendTicks({ state }: { state: ConvStore["sendState"] }) {
@@ -716,6 +728,22 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, send
     return { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
   };
   if (it.kind === "user") {
+    // A message from another Claude session -> a tidy card, not the raw XML tag.
+    const agent = parseAgentMessage(it.text);
+    if (agent) {
+      return (
+        <div className="msg">
+          <div className="agent-msg" {...menuBind(agent.body, "user")}>
+            <div className="agent-msg-head">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M17 8l4 4-4 4" /><path d="M7 8l-4 4 4 4" /><path d="M14 4l-4 16" /></svg>
+              <span>{agent.from}</span>
+            </div>
+            <AssistantContent text={agent.body} convId={convId} onOpenArtifact={onOpenArtifact} />
+          </div>
+          {raPill}
+        </div>
+      );
+    }
     const { images, files, body } = parseUserText(it.text);
     return (
       <div className="msg">

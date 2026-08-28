@@ -188,6 +188,11 @@ a { color: var(--accent-2); }
   padding: 11px 15px; border-radius: 16px 16px 5px 16px; white-space: pre-wrap; word-wrap: break-word;
 }
 .bubble-assistant { align-self: stretch; }
+/* Message from another Claude session: a distinct inbound note (accent left rule), not a user bubble. */
+.agent-msg { align-self: stretch; max-width: 100%; background: var(--bg-2); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 10px; padding: 9px 13px; }
+.agent-msg-head { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--text-3); margin-bottom: 3px; }
+.agent-msg-head svg { color: var(--accent); flex: 0 0 auto; }
+.agent-msg .md { font-size: 14px; color: var(--text-2); }
 .md { word-wrap: break-word; }
 .md > *:first-child { margin-top: 0; } .md > *:last-child { margin-bottom: 0; }
 .md p { margin: 0 0 12px; } .md ul, .md ol { margin: 0 0 12px; padding-left: 22px; } .md li { margin: 3px 0; }
