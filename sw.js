@@ -76,7 +76,9 @@ self.addEventListener("sync", (event) => {
 function idbOpenApp() {
   return new Promise((resolve, reject) => {
     let r;
-    try { r = indexedDB.open("ct-app", 1); } catch (e) { reject(e); return; }
+    // Open WITHOUT a version: attach to whatever version the app has created (the app owns the schema
+    // and bumps DB_VERSION). Pinning a number here would VersionError once the app upgrades the DB.
+    try { r = indexedDB.open("ct-app"); } catch (e) { reject(e); return; }
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
   });

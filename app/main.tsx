@@ -565,6 +565,27 @@ function App() {
   // Merge conversation pages, keeping the first row seen per session id (favorites, prepended on
   // page 0, win over a later recency-page duplicate).
   const dedupeConvs = (list: Conv[]) => { const seen = new Set<string>(); const out: Conv[] = []; for (const c of list) { if (seen.has(c.sessionId)) continue; seen.add(c.sessionId); out.push(c); } return out; };
+  // Background cache warming: after the list loads, quietly fetch + cache the top conversations that
+  // aren't cached yet, one at a time and gently, so switching to any of them is instant (paints from
+  // cache) instead of showing a loader. Skips the active chat, backs off during a live turn.
+  const prewarmedRef = useRef(false);
+  const prewarmCache = useCallback((list: Conv[]) => {
+    if (typeof navigator !== "undefined" && !navigator.onLine) return;
+    const targets = list.filter((c) => !c.pending && !c.sessionId.startsWith("pending-")).slice(0, 12);
+    void (async () => {
+      for (const c of targets) {
+        if (c.sessionId === activeIdRef.current) continue;
+        if (busyRef.current) return; // don't compete with a live turn for bandwidth
+        try {
+          if (await offline.hasConv(c.sessionId)) continue; // already cached
+          const d = await api.conversation(c.sessionId);
+          const built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+          await offline.saveConvItems(c.sessionId, built, 0, { busy: !!d.busy, cwd: d.cwd, live: !!d.live });
+        } catch { /* skip this one */ }
+        await new Promise((r) => setTimeout(r, 500)); // gentle on a weak link
+      }
+    })();
+  }, []);
   const refreshConvs = useCallback(() => {
     api.convs(0)
       .then((d) => {
@@ -574,9 +595,10 @@ function App() {
         setConvs(merged); offline.cacheList(merged);
         nextOffsetRef.current = typeof d.nextOffset === "number" ? d.nextOffset : list.length;
         setHasMore(!!d.hasMore);
+        if (!prewarmedRef.current && merged.length) { prewarmedRef.current = true; setTimeout(() => prewarmCache(merged), 1500); }
       })
       .catch(async () => { const cached = await offline.getCachedList<Conv[]>(); if (cached) setConvs(cached); }); // offline: serve the last cached list
-  }, []);
+  }, [prewarmCache]);
   const loadMoreConvs = useCallback(() => {
     if (loadingMoreRef.current || !hasMore) return;
     loadingMoreRef.current = true;
@@ -677,15 +699,27 @@ function App() {
   useEffect(() => { itemsRef.current = items; }, [items]); // for the context estimate
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
-  // Snapshot the on-screen conversation (partial turns and all) into the offline cache, so a reload
-  // mid-stream or a switch-and-return restores exactly what was there instead of the last completed
-  // snapshot. Cheap and best-effort; skips brand-new/empty views.
-  const cacheActive = useCallback((id?: string | null) => {
+  // Snapshot the on-screen conversation into the per-message cache. We diff against what we last
+  // wrote and store ONLY the changed tail (a streaming token that grows the last bubble writes one
+  // record, not the whole conversation). `immediate` writes now (page hide / switch); otherwise the
+  // write is handed to requestIdleCallback so it lands in the background, off the render path.
+  const lastCache = useRef<{ cid: string; items: Item[] }>({ cid: "", items: [] });
+  const cacheActive = useCallback((id?: string | null, immediate = false) => {
     const cid = id ?? activeIdRef.current;
     if (!cid || cid.startsWith("pending-")) return;
     const its = itemsRef.current;
     if (!its.length) return;
-    void offline.cacheConversation(cid, { items: its, busy: busyRef.current, cwd: cwdRef.current, live: busyRef.current, at: Date.now() });
+    const prev = lastCache.current;
+    let fromIdx = 0;
+    if (prev.cid === cid) { // same conversation as last write -> only the changed tail
+      const n = Math.min(prev.items.length, its.length);
+      let i = 0; while (i < n && its[i] === prev.items[i]) i++;
+      fromIdx = i;
+    }
+    lastCache.current = { cid, items: its };
+    const write = () => { void offline.saveConvItems(cid, its, fromIdx, { busy: busyRef.current, cwd: cwdRef.current, live: busyRef.current }); };
+    if (!immediate && typeof requestIdleCallback === "function") requestIdleCallback(write, { timeout: 1500 });
+    else write();
   }, []);
   // Persist to the offline cache AS the conversation changes (not on a timer). Streaming updates
   // `items` on every token, and each write stores the whole conversation, so we coalesce a burst of
@@ -703,10 +737,11 @@ function App() {
   // Guarantee the newest state is saved the instant the page is hidden (phone lock / app switch),
   // even if a coalesced write was still pending.
   useEffect(() => {
-    const flush = () => { if (document.visibilityState === "hidden") cacheActive(); };
+    const flush = () => { if (document.visibilityState === "hidden") cacheActive(undefined, true); }; // write NOW, before the page freezes
+    const flushNow = () => cacheActive(undefined, true);
     document.addEventListener("visibilitychange", flush);
-    window.addEventListener("pagehide", cacheActive as any);
-    return () => { document.removeEventListener("visibilitychange", flush); window.removeEventListener("pagehide", cacheActive as any); };
+    window.addEventListener("pagehide", flushNow);
+    return () => { document.removeEventListener("visibilitychange", flush); window.removeEventListener("pagehide", flushNow); };
   }, [cacheActive]);
   useEffect(() => { compactingRef.current = compacting; }, [compacting]);
   const flushCompactRef = useRef<() => void>(() => {}); // assigned after openStream is defined
@@ -910,7 +945,7 @@ function App() {
   }, [defaultCwd, openStream]);
 
   const loadConv = useCallback(async (id: string, highlight?: string) => {
-    cacheActive(); // snapshot the conversation we're leaving so returning to it is instant
+    cacheActive(undefined, true); // snapshot the conversation we're leaving NOW so returning to it is instant
     closeStream();
     setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
     stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
@@ -920,16 +955,18 @@ function App() {
     // that made switching feel frozen.
     setActiveId(id); activeIdRef.current = id;
     history.replaceState(null, "", `/app?c=${id}`);
-    const cached = await offline.getCachedConversation(id).catch(() => null);
+    // Reset the tail-diff baseline so the first cache write for this conversation is a full snapshot.
+    lastCache.current = { cid: "", items: [] };
+    const cached = await offline.getConv(id).catch(() => null);
     if (cached) applyConv(id, cached, highlight);
     else setItems([]);
     if (!navigator.onLine) { if (!cached) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
     setLoadingConv(true);
     try {
       const d = await api.conversation(id);
-      offline.cacheConversation(id, d);
       // reconcile (not first paint) when we already showed a cached copy, so the network refresh
-      // doesn't yank the scroll to the bottom while you're reading.
+      // doesn't yank the scroll to the bottom while you're reading. applyConv -> items change ->
+      // the cache writer persists the reconciled copy (tool uses and all).
       if (activeIdRef.current === id) applyConv(id, d, highlight, !!cached); // ignore if the user already switched away
     } catch {
       if (!cached && activeIdRef.current === id) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
@@ -969,6 +1006,7 @@ function App() {
   useEffect(() => {
     const goOnline = () => {
       setOnline(true);
+      prewarmedRef.current = false; // re-warm the cache once we're back on a connection
       void (async () => {
         await drainQueueUI();
         refreshFavs(); // flush favourite toggles made while offline
@@ -1083,6 +1121,7 @@ function App() {
   const deleteConv = useCallback(async (id: string) => {
     setConvMenu(null);
     setConvs((cs) => cs.filter((c) => c.sessionId !== id)); // optimistic
+    void offline.deleteConvCache(id); // drop its cached messages too
     try { await api.del(id); } catch { refreshConvs(); return; }
     if (activeIdRef.current === id) newChatRef.current?.();
   }, [refreshConvs]);
