@@ -24,8 +24,11 @@
 #                            unless --prompt-file is given.
 #   -f, --prompt-file FILE   read the prompt from FILE (preferred for long/multi-line
 #                            prompts). Use "-" to read stdin.
-#   -n, --name NAME          tab/tmux session name. Sanitised to [A-Za-z0-9_-].
-#                            Default: a generated "spawn-<time>-<rand>" id.
+#   -n, --name NAME          tab/tmux session name AND the spawned Claude's display name
+#                            (what peers see in ListAgents / a cross-session message header),
+#                            so a task-descriptive name shows instead of a derived one.
+#                            Sanitised to [A-Za-z0-9_-]. Default: a generated
+#                            "spawn-<time>-<rand>" id.
 #   -c, --cwd DIR            working directory for the spawned Claude. Default: $PWD.
 #   -h, --help               this help.
 #
@@ -133,9 +136,11 @@ PY
 # ~/.local/bin so the spawned Claude finds its tools (claude-notify, gh, ...) even when
 # the tmux server's inherited PATH is bare, and resolves `claude` via PATH so it works on
 # the host (~/.local/bin/claude) and inside guests (/config/.local/bin/claude) alike.
+# The tab name is also passed as the spawned Claude's --name, so its cross-session/peer
+# identity is task-descriptive (the name peers see) instead of a derived cwd-based one.
 TMUX_TMPDIR="$sockdir" tmux new-session -d -s "$name" -c "$cwd" \
-    /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec claude "$1" --dangerously-skip-permissions' \
-    claude-spawn "$prompt" \
+    /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec claude "$1" --name "$2" --dangerously-skip-permissions' \
+    claude-spawn "$prompt" "$name" \
     || die "tmux new-session failed"
 
 echo "$name"
