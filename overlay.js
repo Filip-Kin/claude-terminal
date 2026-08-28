@@ -1491,19 +1491,89 @@
   }
   // #endregion
 
-  // #region mobile keyboard: slide the terminal up (no resize) + no auto-keyboard
+  // #region mobile keyboard: slide the terminal up (no resize) + key bar + no auto-keyboard
   // When the on-screen keyboard opens, slide the ttyd frame up by the keyboard height
   // so the input line clears the keyboard — a transform, NOT a resize (xterm doesn't
   // reflow), and the fixed tab bar stays put at the top.
   const vv = window.visualViewport;
+
+  // #region soft key bar (arrows + esc) above the on-screen keyboard
+  // A row of keys the touch keyboard doesn't offer — Escape and the four arrows —
+  // sitting just above the keyboard. It auto shows/hides with the keyboard (driven
+  // from applyKeyboardShift: shown only while a keyboard is open, kb > 120px). Keys
+  // go straight to the pty via sendToTerminal (ttyd input frame), sending the normal
+  // xterm escape sequences, so they work in the shell and in Claude Code. Mounted on
+  // <html> like the tab bar so ttyd's Preact render can't evict it, and pointerdown is
+  // preventDefault'd so tapping a key never blurs the terminal (the keyboard stays up).
+  const KB_BAR_H = 40; // px; the terminal is lifted this much extra so its input line clears the bar
+  const KEYSEQ = { esc: "\x1b", up: "\x1b[A", down: "\x1b[B", left: "\x1b[D", right: "\x1b[C" };
+  let keybar = null;
+  (function injectKeybarStyle() {
+    const s = document.createElement("style");
+    s.textContent = [
+      "#ct-keybar{position:fixed;left:0;right:0;z-index:48;display:none;align-items:stretch;gap:6px;",
+      "padding:5px 8px;box-sizing:border-box;height:" + KB_BAR_H + "px;background:#181818;border-top:1px solid #2e2e2e;",
+      "font:15px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:#dcdcdc;user-select:none;-webkit-user-select:none;touch-action:manipulation}",
+      "#ct-keybar button{flex:1 1 0;min-width:0;display:flex;align-items:center;justify-content:center;background:#252525;",
+      "border:1px solid #383838;border-radius:7px;color:#e6e6e6;font-size:16px;font-weight:600;line-height:1;padding:0;margin:0;",
+      "-webkit-tap-highlight-color:transparent;touch-action:manipulation;cursor:pointer}",
+      "#ct-keybar button.ct-esc{flex:0 0 58px;font-size:12px;letter-spacing:.03em;text-transform:uppercase}",
+      "#ct-keybar button.ct-press,#ct-keybar button:active{background:#3d3d3d;border-color:#4a4a4a}",
+    ].join("");
+    (document.head || document.documentElement).appendChild(s);
+  })();
+  function buildKeybar() {
+    const el = document.createElement("div");
+    el.id = "ct-keybar";
+    el.innerHTML =
+      '<button class="ct-esc" data-k="esc" tabindex="-1" aria-label="Escape">esc</button>' +
+      '<button data-k="left" tabindex="-1" aria-label="Left">←</button>' +
+      '<button data-k="up" tabindex="-1" aria-label="Up">↑</button>' +
+      '<button data-k="down" tabindex="-1" aria-label="Down">↓</button>' +
+      '<button data-k="right" tabindex="-1" aria-label="Right">→</button>';
+    // pointerdown (not click): fire immediately AND preventDefault so focus never leaves
+    // the xterm textarea — otherwise the tap would dismiss the on-screen keyboard.
+    el.addEventListener("pointerdown", (e) => {
+      const btn = e.target.closest && e.target.closest("button[data-k]");
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const seq = KEYSEQ[btn.dataset.k];
+      if (seq) sendToTerminal(seq);
+      btn.classList.add("ct-press");
+      setTimeout(() => btn.classList.remove("ct-press"), 120);
+    });
+    return el;
+  }
+  function ensureKeybar() {
+    if (keybar && document.documentElement.contains(keybar)) return;
+    keybar = buildKeybar();
+    document.documentElement.appendChild(keybar); // <html>, survives ttyd's Preact render
+  }
+  function positionKeybar(kbHeight) {
+    if (!vv) return;
+    ensureKeybar();
+    if (kbHeight > 120) {
+      // sit the bar at the bottom of the visible (visual) viewport, just above the keyboard
+      keybar.style.top = Math.round((vv.offsetTop || 0) + vv.height - KB_BAR_H) + "px";
+      keybar.style.display = "flex";
+    } else {
+      keybar.style.display = "none";
+    }
+  }
+  // #endregion
+
   function applyKeyboardShift() {
     if (!vv) return;
     const tc = document.getElementById("terminal-container");
     if (!tc) return;
     const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
-    tc.style.transform = kb > 120 ? "translateY(-" + kb + "px)" : "";
+    // lift the terminal by the keyboard height PLUS the key bar so the input line clears both
+    const lift = kb > 120 ? kb + KB_BAR_H : 0;
+    tc.style.transform = lift ? "translateY(-" + lift + "px)" : "";
     // if the browser scrolled the visual viewport, keep the fixed bar on the visible top
     bar.style.transform = vv.offsetTop ? "translateY(" + Math.round(vv.offsetTop) + "px)" : "";
+    positionKeybar(kb);
   }
   if (vv && isMobile()) {
     vv.addEventListener("resize", applyKeyboardShift);
