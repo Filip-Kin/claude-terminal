@@ -42,6 +42,21 @@ export interface AppCtx {
   ownerUsage?: () => { output5h: number; url: string } | null; // rolling 5h output + link to the usage page
 }
 
+// #region send idempotency — dedupe a retried/redelivered turn by its client-supplied cid, so a flaky
+// link (a timeout requeue, the offline drain, or Background Sync) can never post the same message
+// twice. In-memory + short TTL: a redelivery only races within a few seconds of the original.
+const seenSends = new Map<string, { at: number; id: string }>();
+const SEND_DEDUP_TTL_MS = 2 * 60 * 1000;
+function dedupSeen(cid: unknown): { id: string } | null {
+  if (typeof cid !== "string" || !cid) return null;
+  const now = Date.now();
+  for (const [k, v] of seenSends) if (now - v.at > SEND_DEDUP_TTL_MS) seenSends.delete(k); // prune stale
+  const hit = seenSends.get(cid);
+  return hit ? { id: hit.id } : null;
+}
+function dedupRecord(cid: unknown, id: string) { if (typeof cid === "string" && cid) seenSends.set(cid, { at: Date.now(), id }); }
+// #endregion
+
 // #region favorites (starred conversations) — server-side, shared across the owner's devices
 let favSet: Set<string> | null = null;
 async function loadFavs(file: string): Promise<Set<string>> {
@@ -444,6 +459,8 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     let b: any = {}; try { b = await req.json(); } catch {}
     const rawText = String(b.text ?? "").trim();
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
+    const dup = dedupSeen(b.cid); // a redelivery of an already-processed turn -> ack, do not send again
+    if (dup) return jsonRes({ id: dup.id, deduped: true }, ctx, req);
     const text = b.voice ? decorateVoiceTurn(rawText) : rawText; // voice mode -> append the brief/TTS directive
     const resume: string | undefined = b.resume && /^[A-Za-z0-9-]{6,}$/.test(b.resume) ? b.resume : undefined;
     let cwd: string = ctx.defaultCwd;
@@ -452,9 +469,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const model: string | undefined = typeof b.model === "string" && b.model ? b.model : undefined;
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
-    if (existing) { existing.send(text); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
+    if (existing) { existing.send(text); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
     const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk });
     void conv.run(text);
+    dedupRecord(b.cid, conv.id);
     return jsonRes({ id: conv.id, cwd, model: model || null }, ctx, req);
   }
 
@@ -465,7 +483,9 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!conv) return jsonRes({ error: "no live conversation for id (start or resume it first)" }, ctx, req, 409);
     const rawText = String(b.text ?? "").trim();
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
+    if (dedupSeen(b.cid)) return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); // redelivery -> ack, don't re-send
     conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText); // voice mode -> append the brief/TTS directive
+    dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
   }
 

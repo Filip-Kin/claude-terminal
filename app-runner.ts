@@ -51,6 +51,22 @@ type Sub = (e: AppEvent) => void;
 // so replay strips it from the visible transcript; the live UI already renders the user's own words.
 const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; your reply will be read aloud by text-to-speech. Keep it brief and conversational: lead with the answer in one or two spoken sentences. Do not use markdown, bullet or numbered lists, tables, code blocks, headings, or URLs unless explicitly asked. Write times and numbers as words a voice would say (for example 'five thirty PM', not '5:30 PM'). Only expand if the user asks for detail.";
 export function decorateVoiceTurn(text: string): string { return `${text}\n\n<voice-mode>${VOICE_DIRECTIVE}</voice-mode>`; }
+
+// Appended to the Claude Code system prompt for /app chats so Claude actually USES the chat UI's rich
+// rendering (it otherwise defaults to terminal-style plain text). The UI renders these inline.
+const APP_UI_SYSTEM_APPEND = [
+  "You are replying inside a rich chat UI (not a terminal), so use its rendering:",
+  "- Images/plots/screenshots you create render inline. Reference a file you wrote under the working",
+  "  directory with markdown, e.g. ![chart](chart.png), and it shows in the chat. Prefer this over",
+  "  describing an image or dumping base64.",
+  "- Files you produce (CSV, PDF, zip, logs) render as download cards when you link them, e.g.",
+  "  [results.csv](out/results.csv).",
+  "- Fenced code blocks are syntax-highlighted with a copy button. A fenced ```html, ```svg, or",
+  "  ```jsx/tsx/react block renders as a LIVE preview in a split-screen artifact panel, so when the",
+  "  user asks for a webpage, diagram, chart, SVG, or a small interactive component, return it as one",
+  "  of those fenced blocks rather than only describing it.",
+  "Keep normal prose in plain markdown; only reach for an artifact when a live preview genuinely helps.",
+].join("\n");
 const VOICE_STRIP = /\s*<voice-mode>[\s\S]*?<\/voice-mode>\s*$/;
 // #endregion
 
@@ -274,6 +290,7 @@ export class Conversation {
         includePartialMessages: true, // stream text + thinking tokens live
         thinking: { type: "adaptive" }, // let Claude think; we render it streaming
         autoCompactEnabled: true, // compact automatically before the context window fills (default, set explicit)
+        systemPrompt: { type: "preset", preset: "claude_code", append: APP_UI_SYSTEM_APPEND }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
         mcpServers: { "app-ui": this.makeAskServer() }, // ask_user tool -> tappable options in the UI
       },
     });

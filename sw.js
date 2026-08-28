@@ -22,7 +22,33 @@ self.addEventListener("activate", (event) => {
     const keys = await caches.keys();
     await Promise.all(keys.filter((k) => k.startsWith("ct-app-shell-") && k !== APP_CACHE).map((k) => caches.delete(k)));
     await self.clients.claim();
+    // Proactively cache the CURRENT build (shell + its content-hashed assets) so a cold launch with
+    // NO connection always boots. Opportunistic fetch-caching alone isn't enough: every deploy changes
+    // the asset hashes and a hard-refresh wipes Cache Storage, so without this a fresh offline open
+    // (exactly the mountain case) would just spin. Best-effort — never let it fail activation.
+    try { await precacheApp(); } catch { /* offline during activate — the page will re-trigger it */ }
   })());
+});
+
+// Fetch /app (index.html) + every /app/assets/... it references, and cache them together so the shell
+// and its assets are always a consistent set. Called on activate and whenever the page pings us
+// (after load + after a version change), so the latest build is ready to serve offline.
+async function precacheApp() {
+  const cache = await caches.open(APP_CACHE);
+  const res = await fetch("/app", { cache: "no-store" });
+  if (!res.ok) return;
+  const html = await res.clone().text();
+  await cache.put("/app", res);
+  const assets = new Set((html.match(/\/app\/assets\/[A-Za-z0-9._-]+/g) || []));
+  await Promise.all([...assets].map(async (a) => {
+    try { const r = await fetch(a); if (r.ok) await cache.put(a, r.clone()); } catch { /* best effort */ }
+  }));
+}
+
+// The page asks us to (re)precache after it loads and when it detects a new version.
+self.addEventListener("message", (event) => {
+  const d = event.data || {};
+  if (d.type === "ct-precache") event.waitUntil(precacheApp().catch(() => {}));
 });
 
 // Serve the chat-app shell + hashed assets from cache so /app loads offline. We ONLY act on
@@ -36,10 +62,16 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
   const p = url.pathname;
   if (p === "/app" || p === "/app/") {
-    // shell: network-first (so updates flow), cache fallback when offline
+    // shell: STALE-WHILE-REVALIDATE. Serve the cached shell instantly (so it opens the same on 5G, on
+    // one bar, or fully offline — never "loads and loads"), and refresh the cache in the background.
+    // A new build is picked up by the app's own version poll -> reload toast, so serving a slightly
+    // stale shell for one launch is fine and buys a guaranteed-instant, offline-proof open.
     event.respondWith((async () => {
-      try { const res = await fetch(req); if (res.ok) (await caches.open(APP_CACHE)).put("/app", res.clone()); return res; }
-      catch { return (await caches.match("/app")) || new Response("Offline", { status: 503, headers: { "content-type": "text/plain" } }); }
+      const cached = await caches.match("/app");
+      const netUpdate = fetch(req).then((res) => { if (res.ok) caches.open(APP_CACHE).then((c) => c.put("/app", res.clone())); return res; }).catch(() => null);
+      if (cached) { netUpdate; return cached; }              // instant, even offline
+      const res = await netUpdate;                            // first ever load (nothing cached yet)
+      return res || new Response("Offline", { status: 503, headers: { "content-type": "text/plain" } });
     })());
     return;
   }

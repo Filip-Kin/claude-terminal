@@ -243,7 +243,7 @@ export async function cacheUsage(): Promise<{ count: number; bytes: number }> {
 // #endregion
 
 // #region outbound send-queue
-export interface QueuedSend { qid?: number; body: { text: string; resume?: string; model?: string; cwd?: string }; createdAt: number }
+export interface QueuedSend { qid?: number; body: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean }; createdAt: number }
 
 // We always queue as a /app/api/start body (resume + text): it resumes-or-creates and sends
 // in one request, so replay never depends on a live server-side session that offline killed.

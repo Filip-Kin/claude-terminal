@@ -7,6 +7,8 @@ import { marked } from "marked";
 import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
+import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
+import { isAgentTool, AgentToolCard } from "./agents";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -88,13 +90,21 @@ type Item =
 
 // #region api
 const J = (r: Response) => r.json();
+// Reject a request that hasn't resolved within `ms`. A hung POST on a weak link never rejects on its
+// own, so without this a send would sit "sending" forever and never fall back to the offline queue.
+function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
 const api = {
   models: () => fetch("/app/api/models").then(J),
   convs: (offset = 0) => fetch(`/app/api/conversations?offset=${offset}`).then(J),
   conversation: (id: string) => fetch(`/app/api/conversation/${encodeURIComponent(id)}`).then(J),
-  start: (b: { text: string; resume?: string; model?: string; cwd?: string }) =>
+  start: (b: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean }) =>
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
-  send: (b: { id: string; text: string }) =>
+  send: (b: { id: string; text: string; cid?: string }) =>
     fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   setModel: (b: { id: string; model: string }) =>
     fetch("/app/api/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
@@ -264,6 +274,8 @@ class ConvStore {
   touched = Date.now(); // LRU key for evicting idle in-memory stores
   es: EventSource | null = null;
   private pendingEcho: string[] = []; // optimistic user turns awaiting their SSE echo
+  sendState: "sending" | "sent" | "queued" | "failed" | null = null; // status of the latest sent turn (iMessage-style)
+  private sendClear: ReturnType<typeof setTimeout> | null = null;
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
   private cachedItems: Item[] = [];   // tail-diff baseline for the cache writer
   private lastWrite = 0;
@@ -309,7 +321,7 @@ class ConvStore {
       case "user": {
         const clean = sanitizeUserText(e.text);
         const i = this.pendingEcho.indexOf(clean);
-        if (i !== -1) { this.pendingEcho.splice(i, 1); return; }             // our own optimistic turn echoed back
+        if (i !== -1) { this.pendingEcho.splice(i, 1); this.setSendState("sent"); return; } // our own optimistic turn echoed back = confirmed delivered
         const last = this.items[this.items.length - 1];
         if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) return;
         this.items = applyEvent(this.items, e); this.touch(); return;
@@ -325,7 +337,15 @@ class ConvStore {
   }
 
   // ---- mutations from the UI ----
-  addOptimisticUser(text: string) { this.pendingEcho.push(text); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.touch(); }
+  addOptimisticUser(text: string) { this.pendingEcho.push(text); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
+  // Delivery status for the most-recent turn. "sent" auto-clears after a moment (like a fading
+  // "Delivered"); "queued"/"failed" persist so you can see the message is waiting, not lost.
+  setSendState(s: ConvStore["sendState"]) {
+    this.sendState = s;
+    if (this.sendClear) { clearTimeout(this.sendClear); this.sendClear = null; }
+    if (s === "sent") this.sendClear = setTimeout(() => { this.sendState = null; this.sendClear = null; this.signal(); }, 2500);
+    this.signal();
+  }
   answerAsk(askId: string, answer: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)); this.touch(); }
   setBusy(b: boolean) { if (this.busy === b) return; this.busy = b; this.signal(); }
   beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
@@ -623,7 +643,7 @@ function parseUserText(text: string): { images: string[]; files: string[]; body:
   return { images: paths.filter((p) => IMG_RE.test(p)), files: paths.filter((p) => !IMG_RE.test(p)), body };
 }
 
-function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant") => void }) {
+function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant") => void; onOpenArtifact?: (a: Artifact) => void }) {
   const it = items[i];
   // Messages stay natively selectable (so you can highlight part of one to copy). The copy/edit
   // menu is therefore RIGHT-CLICK only (desktop); a mobile long-press does OS text selection, not
@@ -662,7 +682,7 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   }
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
-  if (it.kind === "tool") return <ToolCard it={it} />;
+  if (it.kind === "tool") return isAgentTool(it.name, it.input) ? <AgentToolCard it={it} /> : <ToolCard it={it} />;
   if (it.kind === "notice") {
     if (it.noticeKind === "skill") {
       return (
@@ -703,7 +723,7 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   return (
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
       {showRole && <div className="role">Claude</div>}
-      <Assistant text={it.text} convId={convId} />
+      <AssistantContent text={it.text} convId={convId} onOpenArtifact={onOpenArtifact} />
       {summary && <div className="turn-think" title={tip}>{summary}</div>}
     </div>
   );
@@ -776,7 +796,12 @@ function App() {
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
   const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  // navigator.onLine lies on flaky mobile (says "online" with no working link). `reachable` is the
+  // truth from an actual 4s request heartbeat: false when requests are failing, which lets the banner
+  // show "connection unstable" even while the browser insists it's online.
+  const [reachable, setReachable] = useState(true);
   const [queued, setQueued] = useState(0);
+  const [artifact, setArtifact] = useState<Artifact | null>(null); // the artifact open in the split-screen / sheet viewer
 
   const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the active stream last speak
   const compactQueue = useRef<string[]>([]); // messages typed DURING compaction, sent once it finishes
@@ -910,6 +935,10 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Paint the last cached conversation list INSTANTLY (before any network), so a cold open on a slow
+    // or flaky link shows your chats immediately instead of an empty sidebar until the network answers.
+    // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
+    void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
     api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
     refreshConvs();
     refreshFavs();
@@ -934,7 +963,12 @@ function App() {
   }, []);
   // Live conversation statuses (thinking / waiting) for the list indicators + queued-message set.
   useEffect(() => {
-    const pull = () => { if (navigator.onLine) api.statuses().then((d) => setStatuses(d?.statuses || {})).catch(() => {}); void refreshQueue(); };
+    const pull = () => {
+      if (navigator.onLine) api.statuses()
+        .then((d) => { setStatuses(d?.statuses || {}); setReachable(true); })   // a real response = link works
+        .catch(() => setReachable(false));                                       // request failed = link is down despite navigator.onLine
+      void refreshQueue();
+    };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
   }, [refreshQueue]);
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
@@ -968,6 +1002,9 @@ function App() {
         if (!v) return;
         if (baseline === null) { baseline = v; return; }
         if (v !== baseline) {
+          // Cache the NEW build's shell + assets NOW (before the reload) so the post-update launch is
+          // offline-safe too, not just the build we loaded with.
+          try { navigator.serviceWorker?.ready.then((reg) => (reg.active || navigator.serviceWorker.controller)?.postMessage({ type: "ct-precache" })).catch(() => {}); } catch { /* */ }
           // On returning to the foreground (app was backgrounded/asleep), auto-update immediately —
           // unless there's an unsent draft, in which case just offer the reload toast.
           if (foreground && !(taRef.current?.value || "").trim()) { void hardRefresh(); return; }
@@ -986,7 +1023,12 @@ function App() {
   // other place that does, so an /app-only PWA install needs this for offline load + Background
   // Sync. Same script + scope as the terminal, so it's idempotent (no double registration).
   useEffect(() => {
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/_ct/sw.js", { scope: "/" }).catch(() => {});
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("/_ct/sw.js", { scope: "/" }).catch(() => {});
+    // Ask the SW to (re)cache THIS build's shell + assets now that we've loaded, so a later cold
+    // offline launch always opens. The SW also precaches on activate, but an already-active worker
+    // won't re-run activate for a new build — this ping covers that.
+    navigator.serviceWorker.ready.then((reg) => { (reg.active || navigator.serviceWorker.controller)?.postMessage({ type: "ct-precache" }); }).catch(() => {});
   }, []);
 
   // Record that the app is the surface to reopen on next PWA launch (see the overlay's launch
@@ -1256,8 +1298,11 @@ function App() {
     let s = activeStoreRef.current;
     const isNewChat = !s || s.id.startsWith("pending-");
     if (isNewChat) { s = manager.ensure("new-" + Date.now().toString(36) + Math.floor(performance.now())); setActiveStore(s); activeStoreRef.current = s; }
-    s!.addOptimisticUser(text);
-    const body = { text, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
+    s!.addOptimisticUser(text); // renders the turn, flips busy, sets sendState "sending"
+    // Stable client id so a redelivery (offline queue OR a timeout requeue) is deduped server-side
+    // instead of posting the same turn twice.
+    const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
     const queue = async () => {
       await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued);
       // A chat STARTED offline has no server id yet, so it wouldn't show anywhere. Drop a local
@@ -1267,18 +1312,20 @@ function App() {
         const pid = "pending-" + Date.now();
         setConvs((cs) => [{ sessionId: pid, title: firstLine, cwd: cwdRef.current || null, mtime: Date.now(), pending: true, queuedText: text }, ...cs]);
       }
-      s!.setBusy(false);
+      s!.setBusy(false); s!.setSendState("queued"); // visibly waiting to send, not lost
     };
     if (typeof navigator !== "undefined" && !navigator.onLine) { await queue(); return null; } // offline: hold it, send on reconnect
     // During compaction, hold the message (already rendered optimistically) and send it once the
     // compaction finishes, so it isn't lost or racing the /compact turn.
     if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push(text); return s!.id; }
     try {
-      if (s!.connected && !s!.id.startsWith("new-")) { await api.send({ id: s!.id, text }); return s!.id; }
-      const r = await api.start(body);
-      if (r?.id) { manager.rebind(s!, r.id); activeIdRef.current = r.id; s!.connect(false); return r.id; }
+      // withTimeout so a hung request on a weak link fails fast into the queue instead of sitting
+      // "sending" forever. A redelivery is deduped by cid, so the timeout can't double-send.
+      if (s!.connected && !s!.id.startsWith("new-")) { await withTimeout(api.send({ id: s!.id, text, cid })); s!.setSendState("sent"); return s!.id; }
+      const r = await withTimeout(api.start(body));
+      if (r?.id) { manager.rebind(s!, r.id); activeIdRef.current = r.id; s!.connect(false); s!.setSendState("sent"); return r.id; }
       s!.setBusy(false); return null;
-    } catch { await queue(); return null; } // network died mid-send -> queue for reconnect
+    } catch { await queue(); return null; } // network died / timed out mid-send -> queue for reconnect
   }, []);
 
   const doSend = async () => {
@@ -1574,11 +1621,13 @@ function App() {
         </div>
         {loadingConv && <div className="load-bar" aria-label="Loading conversation" />}
 
-        {(!online || queued > 0) && (
-          <div className={"net-banner" + (online ? " sending" : "")}>
+        {(!online || !reachable || queued > 0) && (
+          <div className={"net-banner" + (!online ? "" : !reachable ? " warn" : " sending")}>
             {!online
               ? (queued > 0 ? `Offline — ${queued} message${queued > 1 ? "s" : ""} queued, will send when you reconnect` : "You're offline — cached conversations available")
-              : `Sending ${queued} queued message${queued > 1 ? "s" : ""}…`}
+              : !reachable
+                ? (queued > 0 ? `Connection unstable — retrying ${queued} queued message${queued > 1 ? "s" : ""}…` : "Connection unstable — retrying…")
+                : `Sending ${queued} queued message${queued > 1 ? "s" : ""}…`}
           </div>
         )}
         <div className="scroll" ref={scrollRef} onScroll={onThreadScroll}>
@@ -1591,21 +1640,32 @@ function App() {
             <div className="thread">
               {(() => {
                 const nodes: React.ReactNode[] = [];
+                // Plain tools collapse into an accordion; subagent/workflow (Task) tools stay standalone
+                // so they render as their own rich activity card.
+                const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input);
                 for (let i = 0; i < items.length; i++) {
-                  if (items[i].kind === "tool") {
+                  if (isPlainTool(items[i])) {
                     let j = i; const run: Extract<Item, { kind: "tool" }>[] = [];
-                    while (j < items.length && items[j].kind === "tool") { run.push(items[j] as Extract<Item, { kind: "tool" }>); j++; }
+                    while (j < items.length && isPlainTool(items[j])) { run.push(items[j] as Extract<Item, { kind: "tool" }>); j++; }
                     if (run.length >= 2) { // collapse a run of tools into one accordion
                       nodes.push(<ToolGroup key={"tg" + i} tools={run} live={busy && j === items.length} />);
                       i = j - 1; continue;
                     }
                   }
-                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} />);
+                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} />);
                 }
                 return nodes;
               })()}
               {compacting && <CompactionBanner start={activeStore?.compactStart ?? 0} />}
               {busy && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
+              {activeStore?.sendState && items[items.length - 1]?.kind === "user" && (
+                <div className={"send-status " + activeStore.sendState}>
+                  {activeStore.sendState === "sending" ? "Sending…"
+                    : activeStore.sendState === "sent" ? "Sent"
+                    : activeStore.sendState === "queued" ? "Queued — sends when you reconnect"
+                    : "Not sent — will retry"}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1686,6 +1746,11 @@ function App() {
           </div>
         </div>
       </main>
+      {artifact && (
+        window.matchMedia("(max-width: 820px)").matches
+          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={() => setArtifact(null)} />
+          : <div className="artifact-panel"><ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} /></div>
+      )}
       {msgMenu && (
         <>
           <div className="ctx-scrim" onClick={() => setMsgMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMsgMenu(null); }} />
