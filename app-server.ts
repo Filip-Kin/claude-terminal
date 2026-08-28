@@ -7,7 +7,7 @@
 
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getPlanUsage, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -133,6 +133,8 @@ function findTranscript(ctx: AppCtx, sessionId: string): { path: string; project
 // #region SSE
 function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Request, fromNow = false): Response {
   let unsub = () => {};
+  let ping: ReturnType<typeof setInterval> | null = null;
+  const cleanup = () => { if (ping) { clearInterval(ping); ping = null; } unsub(); unsub = () => {}; };
   const stream = new ReadableStream({
     start(controller) {
       const enc2 = new TextEncoder();
@@ -141,10 +143,11 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
       };
       controller.enqueue(enc2.encode(`retry: 3000\n\n`));
       unsub = conv.subscribe(write, fromNow); // replays this run's buffer (unless fromNow), then live
-      const ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch {} }, 20_000);
-      (controller as any)._ping = ping;
+      // Keepalive ping. If the client is gone the enqueue throws (caught); when it does, tear the whole
+      // stream down so neither the interval nor the subscriber outlives the connection (was a leak).
+      ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch { cleanup(); } }, 20_000);
     },
-    cancel() { unsub(); },
+    cancel() { cleanup(); },
   });
   return new Response(stream, {
     headers: { ...ctx.cors(req), "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
@@ -264,10 +267,13 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   if (req.method === "GET" && path === "/app/api/statuses") {
     return jsonRes({ statuses: liveStatuses() }, ctx, req);
   }
-  // Owner's rolling 5-hour output tokens + a link to the full usage page (terminal-side dashboard).
+  // Owner's rolling 5-hour output tokens + a link to the full usage page (terminal-side dashboard),
+  // plus the claude.ai plan rate-limit windows (the real "session limit" — 5-hour + weekly), sourced
+  // live from the SDK /usage API. `plan` is null until the first background fetch lands.
   if (req.method === "GET" && path === "/app/api/usage") {
     const u = ctx.ownerUsage?.();
-    return jsonRes(u ? { available: true, ...u } : { available: false }, ctx, req);
+    const plan = getPlanUsage();
+    return jsonRes({ ...(u ? { available: true, ...u } : { available: false }), plan }, ctx, req);
   }
 
   if (req.method === "GET" && path === "/app/api/favorites") {

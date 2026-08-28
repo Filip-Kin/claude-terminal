@@ -1,7 +1,7 @@
 // Chat-app front-end. A Claude-app-style UI that drives Claude Code through the
 // headless Agent SDK via the /app* routes in app-server.ts. The terminal stays one
 // click away (the "Terminal" link -> "/").
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
 import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
@@ -59,7 +59,8 @@ type AppEvent =
   | { t: "thinking_progress"; tokens: number; _seq?: number }
   | { t: "tool_use"; id: string; name: string; input: unknown; _seq?: number }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean; _seq?: number }
-  | { t: "compact"; trigger: string; _seq?: number }
+  | { t: "compact"; trigger: string; preTokens?: number; postTokens?: number; durationMs?: number; _seq?: number }
+  | { t: "compacting"; active: boolean; _seq?: number }
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
   | { t: "user"; text: string; _seq?: number }
@@ -70,6 +71,10 @@ type AppEvent =
   | { t: "closed"; _seq?: number };
 
 type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
+
+// claude.ai plan rate-limit windows (the real "session limit"), from the SDK /usage API.
+type PlanWin = { utilization: number | null; resetsAt: string | null };
+type Plan = { available: boolean; subscription: string | null; fiveHour: PlanWin | null; sevenDay: PlanWin | null } | null;
 
 type Item =
   | { kind: "user"; text: string }
@@ -139,6 +144,10 @@ function skillLoadName(txt: string): string | null {
   return p.split(/[/\\]/).pop() || p;
 }
 
+// Last-known context window size (persisted on every context fetch), for turning the compaction
+// metadata's pre/post token counts into a percentage. Falls back to the default window.
+function ctxMax(): number { try { return Number(localStorage.getItem("ct-app-ctxmax")) || DEFAULT_CTX; } catch { return DEFAULT_CTX; } }
+
 function applyEvent(items: Item[], e: AppEvent): Item[] {
   // Freeze a live "thinking" block's duration the instant the first non-thinking event lands, so
   // "Thought for Ns" is fixed once the model stops reasoning (and survives reconnects in state).
@@ -192,7 +201,15 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       }
       return items;
     }
-    case "compact": return [...items, { kind: "compact" }];
+    case "compact": {
+      // Build the persistent "freed Nk tokens" card straight from the SDK's compact_metadata (works
+      // for manual AND auto compaction, live or replayed — no fragile post-hoc context diffing).
+      const saved = e.preTokens != null && e.postTokens != null ? Math.max(0, e.preTokens - e.postTokens) : 0;
+      const max = ctxMax();
+      const pctBefore = max && e.preTokens != null ? (e.preTokens / max) * 100 : undefined;
+      const pctAfter = max && e.postTokens != null ? (e.postTokens / max) * 100 : undefined;
+      return [...items, { kind: "compact", savedTokens: saved || undefined, durationMs: e.durationMs, pctBefore, pctAfter }];
+    }
     case "notice": return [...items, { kind: "notice", noticeKind: e.kind, text: e.text, from: e.from, status: e.status }];
     case "result": {
       // Stamp the turn's real token usage onto the most recent assistant block so the summary can
@@ -216,6 +233,175 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
 
 const contentToText = (c: unknown): string =>
   typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (typeof b === "string" ? b : b?.type === "text" ? b.text : b?.text || "")).join("\n") : c == null ? "" : JSON.stringify(c, null, 2);
+
+// #region conversation stores — ONE owner of items + SSE socket + cache, per conversation
+// Every conversation the app touches this session is a ConvStore, held by the ConvManager in a Map
+// keyed by id. A store is the single source of truth for that conversation's messages, its live/busy
+// flag, its cache writer, and its ONE EventSource. Because connect() is guarded and there is one
+// store per id, there is never more than one socket per conversation. Switching conversations just
+// re-points the view at another store (no copy, no reconnect); background streaming is simply "a
+// busy non-view store stays connected". React renders the active store via useSyncExternalStore.
+
+const EMPTY_ITEMS: Item[] = []; // stable identity for the no-conversation view
+
+export interface StoreHooks {
+  onInit: (store: ConvStore, sessionId: string) => void; // a new-chat temp id learned its real session id
+  onResult: (store: ConvStore) => void;                  // a turn finished (reorder the sidebar)
+  onEvent: (store: ConvStore, e: AppEvent) => void;      // raw event tap (voice mode + stall clock)
+  onContext: (store: ConvStore) => void;                 // refresh the context gauge
+}
+
+class ConvStore {
+  id: string;
+  items: Item[] = [];
+  version = 0;           // bumped on any change — the useSyncExternalStore snapshot
+  seq = -1;             // last _seq seen (dedupe across auto-reconnects)
+  busy = false;
+  cwd: string | null = null;
+  compacting = false;
+  compactStart = 0;
+  hydrated = false;     // items loaded from cache or network at least once
+  touched = Date.now(); // LRU key for evicting idle in-memory stores
+  es: EventSource | null = null;
+  private pendingEcho: string[] = []; // optimistic user turns awaiting their SSE echo
+  private cacheTimer: ReturnType<typeof setTimeout> | null = null;
+  private cachedItems: Item[] = [];   // tail-diff baseline for the cache writer
+  private lastWrite = 0;
+  private subs = new Set<() => void>();
+  private mgr: ConvManager;
+  constructor(id: string, mgr: ConvManager) { this.id = id; this.mgr = mgr; }
+
+  subscribe = (l: () => void) => { this.subs.add(l); return () => { this.subs.delete(l); }; };
+  signal() { this.version++; for (const l of this.subs) l(); }            // notify view only
+  private touch() { this.version++; this.touched = Date.now(); for (const l of this.subs) l(); this.scheduleCache(); } // notify + cache
+
+  // ---- the one and only EventSource ----
+  connect(tail = false) {
+    if (this.es) return; // already the single socket for this conversation
+    let es: EventSource;
+    try { es = new EventSource(`/app/stream/${encodeURIComponent(this.id)}${tail ? "?tail=1" : ""}`); } catch { return; }
+    this.es = es;
+    es.onmessage = (ev) => { let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; } this.ingest(e); };
+    es.onerror = () => { if (es.readyState === EventSource.CLOSED) this.disconnect(); }; // 404/fatal -> drop; transient -> browser retries the same socket
+  }
+  disconnect() {
+    if (!this.es) return;
+    try { this.es.onmessage = null; this.es.onerror = null; this.es.close(); } catch { /* */ }
+    this.es = null;
+  }
+  get connected() { return !!this.es; }
+
+  // ---- event reduction (the single applyEvent per conversation) ----
+  ingest(e: AppEvent) {
+    if (typeof e._seq === "number") { if (e._seq <= this.seq) return; this.seq = e._seq; }
+    this.mgr.hooks?.onEvent(this, e);
+    switch (e.t) {
+      case "init":
+        if (e.sessionId && e.sessionId !== this.id) this.mgr.rebind(this, e.sessionId);
+        this.mgr.hooks?.onInit(this, e.sessionId);
+        return;
+      case "busy": this.busy = e.busy; this.signal(); return;
+      case "compacting":
+        this.compacting = e.active; this.compactStart = e.active ? (this.compactStart || Date.now()) : 0; this.signal(); return;
+      case "compact":
+        this.compacting = false; this.compactStart = 0;
+        this.items = applyEvent(this.items, e); this.touch(); this.mgr.hooks?.onContext(this); return;
+      case "user": {
+        const clean = sanitizeUserText(e.text);
+        const i = this.pendingEcho.indexOf(clean);
+        if (i !== -1) { this.pendingEcho.splice(i, 1); return; }             // our own optimistic turn echoed back
+        const last = this.items[this.items.length - 1];
+        if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) return;
+        this.items = applyEvent(this.items, e); this.touch(); return;
+      }
+      case "result":
+        this.busy = false; this.items = applyEvent(this.items, e); this.touch();
+        this.mgr.hooks?.onResult(this); this.mgr.hooks?.onContext(this); return;
+      case "error":
+        this.busy = false; this.items = [...this.items, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]; this.touch(); return;
+      case "closed": this.disconnect(); return;
+      default: this.items = applyEvent(this.items, e); this.touch(); return;
+    }
+  }
+
+  // ---- mutations from the UI ----
+  addOptimisticUser(text: string) { this.pendingEcho.push(text); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.touch(); }
+  answerAsk(askId: string, answer: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)); this.touch(); }
+  setBusy(b: boolean) { if (this.busy === b) return; this.busy = b; this.signal(); }
+  beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
+  endCompactFallback() { if (this.compacting) { this.compacting = false; this.compactStart = 0; this.signal(); } }
+  showItems(items: Item[]) { this.items = items; this.signal(); } // transient placeholder view (offline note / queued)
+
+  // ---- hydration + reconcile (the cache-vs-network policy) ----
+  hydrate(items: Item[], meta: { busy?: boolean; cwd?: string | null }) {
+    this.items = items; this.cachedItems = items; this.hydrated = true;
+    if (meta.busy != null) this.busy = meta.busy;
+    if (meta.cwd != null) this.cwd = meta.cwd;
+    this.signal();
+  }
+  // Server transcript is truth for committed history. We keep our own tail when it's AHEAD of the
+  // server (live tokens, or a just-sent turn not yet in the transcript) so nothing flickers away.
+  reconcile(items: Item[], meta: { busy: boolean; cwd: string | null }) {
+    this.cwd = meta.cwd; this.hydrated = true;
+    const localAhead = this.pendingEcho.length > 0 || (this.busy && this.items.length >= items.length);
+    if (!localAhead) { this.items = items; this.cachedItems = items; }
+    this.busy = meta.busy || this.busy;
+    this.signal();
+  }
+
+  // ---- cache (tail-diff, ≤1/s, event-driven) ----
+  private cacheable() { return !!this.id && !this.id.startsWith("pending-") && !this.id.startsWith("new-"); }
+  private scheduleCache() {
+    if (!this.cacheable() || this.cacheTimer) return;
+    const since = Date.now() - this.lastWrite;
+    const run = () => { this.cacheTimer = null; this.lastWrite = Date.now(); this.writeCache(); };
+    if (since >= 1000) run(); else this.cacheTimer = setTimeout(run, 1000 - since);
+  }
+  flushCache() { if (this.cacheTimer) { clearTimeout(this.cacheTimer); this.cacheTimer = null; } if (this.cacheable()) { this.lastWrite = Date.now(); this.writeCache(); } }
+  private writeCache() {
+    const its = this.items; if (!its.length) return;
+    const prev = this.cachedItems, n = Math.min(prev.length, its.length);
+    let i = 0; while (i < n && its[i] === prev[i]) i++;
+    this.cachedItems = its;
+    void offline.saveConvItems(this.id, its, i, { busy: this.busy, cwd: this.cwd, live: this.busy });
+  }
+
+  teardown() { this.disconnect(); this.flushCache(); this.subs.clear(); }
+}
+
+class ConvManager {
+  stores = new Map<string, ConvStore>();
+  hooks: StoreHooks | null = null;
+  private CAP = 20; // in-memory stores kept for instant switching; idle ones past this are evicted
+  ensure(id: string): ConvStore { let s = this.stores.get(id); if (!s) { s = new ConvStore(id, this); this.stores.set(id, s); } s.touched = Date.now(); return s; }
+  get(id: string) { return this.stores.get(id); }
+  rebind(store: ConvStore, newId: string) {
+    if (store.id === newId) return;
+    this.stores.delete(store.id);
+    this.stores.set(newId, store); store.id = newId; store.hydrated = true; store.signal();
+  }
+  // Background pool: keep busy, non-active conversations streaming into cache, capped by bandwidth.
+  reconcileBackground(statuses: Record<string, { busy: boolean }>, activeId: string | null, budget: number) {
+    const busyIds = Object.keys(statuses).filter((id) => statuses[id]?.busy && id !== activeId && !id.startsWith("pending-"));
+    const want = new Set(budget > 0 ? busyIds.slice(0, budget) : []);
+    for (const id of want) { const s = this.ensure(id); if (!s.connected) { s.connect(true); void this.seed(s); } }
+    for (const [id, s] of this.stores) { if (id !== activeId && s.connected && !want.has(id)) s.disconnect(); }
+    this.evict(activeId);
+  }
+  private async seed(s: ConvStore) {
+    if (s.hydrated || s.items.length) return;
+    try { const d = await api.conversation(s.id); if (!s.hydrated && !s.items.length) s.hydrate((d.events || []).reduce((a: Item[], e: AppEvent) => applyEvent(a, e), [] as Item[]), { busy: d.busy, cwd: d.cwd }); } catch { /* live events still build it */ }
+  }
+  private evict(activeId: string | null) {
+    if (this.stores.size <= this.CAP) return;
+    const drop = [...this.stores.values()].filter((s) => s.id !== activeId && !s.connected && !s.busy).sort((a, b) => a.touched - b.touched);
+    let over = this.stores.size - this.CAP;
+    for (const s of drop) { if (over-- <= 0) break; s.teardown(); this.stores.delete(s.id); }
+  }
+  closeAll() { for (const s of this.stores.values()) s.teardown(); }
+}
+const manager = new ConvManager();
+// #endregion
 
 // #region small components
 // Rough token estimate for a tool (its call args + returned result). The SDK doesn't attribute
@@ -306,6 +492,43 @@ function ContextRing({ pct, total, max, onCompact, busy, estimated }: { pct: num
       <span className="ctx-pct">{p}%</span>
     </button>
   );
+}
+
+// Human "resets in 3h 12m" from an ISO reset timestamp.
+function fmtResetIn(iso?: string | null): string {
+  if (!iso) return "";
+  const t = Date.parse(iso); if (!t) return "";
+  const ms = t - Date.now(); if (ms <= 0) return "now";
+  const m = Math.round(ms / 60000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60), r = m % 60;
+  if (h < 24) return r ? `${h}h ${r}m` : `${h}h`;
+  const d = Math.floor(h / 24), hr = h % 24;
+  return hr ? `${d}d ${hr}h` : `${d}d`;
+}
+
+// Plan session-limit chip: how much of the claude.ai 5-hour rate-limit window is used, plus when it
+// resets. Colour is status-only feedback (amber ≥80%, red ≥95%). Weekly window sits in the tooltip.
+function PlanChip({ plan, url }: { plan: Plan; url?: string }) {
+  if (!plan?.available || !plan.fiveHour || plan.fiveHour.utilization == null) return null;
+  const u = Math.round(plan.fiveHour.utilization);
+  const cls = u >= 95 ? " crit" : u >= 80 ? " warn" : "";
+  const resetIn = fmtResetIn(plan.fiveHour.resetsAt);
+  const weekU = plan.sevenDay?.utilization != null ? Math.round(plan.sevenDay.utilization) : null;
+  const weekReset = fmtResetIn(plan.sevenDay?.resetsAt);
+  const title = `Plan session limit (5-hour window): ${u}% used${resetIn ? `, resets in ${resetIn}` : ""}`
+    + (weekU != null ? `\nWeekly limit: ${weekU}% used${weekReset ? `, resets in ${weekReset}` : ""}` : "")
+    + "\nOpen the usage dashboard";
+  const body = (
+    <>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></svg>
+      <span>{u}%</span>
+      {resetIn && <i className="plan-reset">{resetIn}</i>}
+    </>
+  );
+  return url
+    ? <a className={"plan-chip" + cls} href={url} target="_blank" rel="noreferrer" title={title}>{body}</a>
+    : <span className={"plan-chip" + cls} title={title}>{body}</span>;
 }
 
 // Shown while a compaction runs (manual click or the /compact turn). The SDK doesn't expose an
@@ -506,9 +729,17 @@ function App() {
   const [titleDraft, setTitleDraft] = useState("");
   const [defaultCwd, setDefaultCwd] = useState<string>("");
   const [convs, setConvs] = useState<Conv[]>([]);
-  const [items, setItems] = useState<Item[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  // The visible conversation is a ConvStore (the single owner of its items/SSE/cache); React renders
+  // it via useSyncExternalStore and everything below derives from it. Switching = point at another store.
+  const [activeStore, setActiveStore] = useState<ConvStore | null>(null);
+  const activeStoreRef = useRef<ConvStore | null>(null);
+  useEffect(() => { activeStoreRef.current = activeStore; }, [activeStore]);
+  const subscribe = useCallback((cb: () => void) => (activeStore ? activeStore.subscribe(cb) : () => {}), [activeStore]);
+  useSyncExternalStore(subscribe, () => activeStore?.version ?? 0);
+  const items = activeStore ? activeStore.items : EMPTY_ITEMS;
+  const activeId = activeStore?.id ?? null;
+  const busy = activeStore?.busy ?? false;
+  const compacting = activeStore?.compacting ?? false;
   const [model, setModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
@@ -522,9 +753,9 @@ function App() {
   const contextRef = useRef<typeof context>(null); // mirror, so the compact handler can read the pre-compaction context
   useEffect(() => { contextRef.current = context; }, [context]);
   const itemsRef = useRef<Item[]>([]);
-  const [compacting, setCompacting] = useState(false);
   const [loadingConv, setLoadingConv] = useState(false);
   const [usage5h, setUsage5h] = useState<{ output5h: number; url: string } | null>(null);
+  const [plan, setPlan] = useState<Plan>(null);
   const [statuses, setStatuses] = useState<Record<string, { busy: boolean; waiting: boolean }>>({});
   const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
@@ -547,18 +778,12 @@ function App() {
   const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [queued, setQueued] = useState(0);
 
-  const esRef = useRef<EventSource | null>(null);
-  const esOpen = useRef(false);
-  const esIdRef = useRef<string | null>(null); // which conversation the foreground stream is for (handoff tracking)
-  const lastSeq = useRef(-1);
-  const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the live stream last say anything
-  const compactingRef = useRef(false); // mirror of `compacting` for stable callbacks
+  const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the active stream last speak
   const compactQueue = useRef<string[]>([]); // messages typed DURING compaction, sent once it finishes
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const newChatRef = useRef<(() => void) | null>(null); // lets earlier callbacks reset to a blank chat
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const cwdRef = useRef<string>("");
-  const pendingUser = useRef<string[]>([]); // optimistic user turns awaiting their SSE echo
   const forceBottom = useRef(false); // scroll to the end after opening a conversation
   const stickBottom = useRef(true); // follow new content only while the user is parked at the bottom
   const [atBottom, setAtBottom] = useState(true); // drives the "jump to latest" button while streaming
@@ -646,15 +871,14 @@ function App() {
       setContext(est > 0 ? { percentage: Math.min(100, (est / max) * 100), total: est, max, estimated: true } : null);
     }).catch(() => { /* keep the last value on a transient error */ });
   }, []);
-  const compactStartRef = useRef(0);
   const doCompact = useCallback(async () => {
-    if (!activeIdRef.current || compacting) return;
-    compactStartRef.current = Date.now();
-    setCompacting(true);
-    try { await api.compact(activeIdRef.current); } catch { /* */ }
-    // Cleared for real by the compact event (handleEvent); this is just a safety net.
-    setTimeout(() => { setCompacting(false); compactingRef.current = false; refreshContext(activeIdRef.current); flushCompactRef.current(); }, 45000);
-  }, [compacting, refreshContext]);
+    const s = activeStoreRef.current;
+    if (!s || s.compacting) return;
+    s.beginCompact(); // optimistic banner; the backend "compacting"/"compact" events keep it honest
+    try { await api.compact(s.id); } catch { /* */ }
+    // Safety net: if the compact events never arrive (e.g. dropped stream), clear the banner anyway.
+    setTimeout(() => { s.endCompactFallback(); refreshContext(s.id); flushCompactRef.current(); }, 45000);
+  }, [refreshContext]);
   // Which conversations have an offline message queued (resume target) — drives the queued indicator
   // on EXISTING conversations, not just brand-new offline chats.
   const refreshQueue = useCallback(async () => {
@@ -697,10 +921,16 @@ function App() {
   // Context-window gauge: refresh for the open conversation on open, when a turn ends (busy flips),
   // and on a slow poll while it's live.
   useEffect(() => { refreshContext(activeId); const t = setInterval(() => refreshContext(activeId), 15000); return () => clearInterval(t); }, [activeId, busy, refreshContext]);
-  // Owner's rolling 5h usage for the sidebar chip (slow poll).
+  // Owner's rolling 5h usage + the claude.ai plan session limit for the composer footer (slow poll).
+  // The plan figure is null on the first response (the server fetches it in the background), so a quick
+  // second pull picks it up without waiting a whole interval.
   useEffect(() => {
-    const pull = () => api.usage().then((d) => setUsage5h(d?.available ? { output5h: d.output5h, url: d.url } : null)).catch(() => {});
-    pull(); const t = setInterval(pull, 120000); return () => clearInterval(t);
+    const pull = () => api.usage().then((d) => {
+      setUsage5h(d?.available ? { output5h: d.output5h, url: d.url } : null);
+      setPlan(d?.plan?.available ? d.plan : null);
+    }).catch(() => {});
+    pull(); const t = setInterval(pull, 60000); const t2 = setTimeout(pull, 5000);
+    return () => { clearInterval(t); clearTimeout(t2); };
   }, []);
   // Live conversation statuses (thinking / waiting) for the list indicators + queued-message set.
   useEffect(() => {
@@ -716,52 +946,16 @@ function App() {
   useEffect(() => { convsRef.current = convs; }, [convs]); // latest list for read-marking / lookups
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
-  // Snapshot the on-screen conversation into the per-message cache. We diff against what we last
-  // wrote and store ONLY the changed tail (a streaming token that grows the last bubble writes one
-  // record, not the whole conversation). `immediate` writes now (page hide / switch); otherwise the
-  // write is handed to requestIdleCallback so it lands in the background, off the render path.
-  const lastCache = useRef<{ cid: string; items: Item[] }>({ cid: "", items: [] });
-  const cacheActive = useCallback((id?: string | null, immediate = false) => {
-    const cid = id ?? activeIdRef.current;
-    if (!cid || cid.startsWith("pending-")) return;
-    const its = itemsRef.current;
-    if (!its.length) return;
-    const prev = lastCache.current;
-    let fromIdx = 0;
-    if (prev.cid === cid) { // same conversation as last write -> only the changed tail
-      const n = Math.min(prev.items.length, its.length);
-      let i = 0; while (i < n && its[i] === prev.items[i]) i++;
-      fromIdx = i;
-    }
-    lastCache.current = { cid, items: its };
-    const write = () => { void offline.saveConvItems(cid, its, fromIdx, { busy: busyRef.current, cwd: cwdRef.current, live: busyRef.current }); };
-    if (!immediate && typeof requestIdleCallback === "function") requestIdleCallback(write, { timeout: 1500 });
-    else write();
-  }, []);
-  // Persist to the offline cache AS the conversation changes (not on a timer). Streaming updates
-  // `items` on every token, and each write stores the whole conversation, so we coalesce a burst of
-  // tokens into at most one write per second (a leading write, then a trailing write for whatever
-  // arrived during the gap) — event-driven, nothing runs while idle. A reload mid-stream or a
-  // return-from-lock then restores the in-progress conversation instead of the last completed snapshot.
-  const cacheThrottle = useRef<{ timer: ReturnType<typeof setTimeout> | null; last: number }>({ timer: null, last: 0 });
+  // Each store caches itself (tail-diff, ≤1/s) as its items change — no app-level cache writer. We
+  // only force a flush the instant the page is hidden (phone lock / app switch), before JS freezes.
   useEffect(() => {
-    const tc = cacheThrottle.current;
-    if (tc.timer) return; // a trailing write is already scheduled; it'll pick up the latest items
-    const since = Date.now() - tc.last;
-    if (since >= 1000) { tc.last = Date.now(); cacheActive(); }
-    else { tc.timer = setTimeout(() => { tc.timer = null; tc.last = Date.now(); cacheActive(); }, 1000 - since); }
-  }, [items, cacheActive]);
-  // Guarantee the newest state is saved the instant the page is hidden (phone lock / app switch),
-  // even if a coalesced write was still pending.
-  useEffect(() => {
-    const flush = () => { if (document.visibilityState === "hidden") cacheActive(undefined, true); }; // write NOW, before the page freezes
-    const flushNow = () => cacheActive(undefined, true);
+    const flush = () => { if (document.visibilityState === "hidden") activeStoreRef.current?.flushCache(); };
+    const flushNow = () => activeStoreRef.current?.flushCache();
     document.addEventListener("visibilitychange", flush);
     window.addEventListener("pagehide", flushNow);
     return () => { document.removeEventListener("visibilitychange", flush); window.removeEventListener("pagehide", flushNow); };
-  }, [cacheActive]);
-  useEffect(() => { compactingRef.current = compacting; }, [compacting]);
-  const flushCompactRef = useRef<() => void>(() => {}); // assigned after openStream is defined
+  }, []);
+  const flushCompactRef = useRef<() => void>(() => {}); // assigned once the stores/hooks are wired
 
   // PWA update check: poll the server build id; if it changed since load, offer a reload.
   // Content-hashed assets + no-store index mean the reload gets everything fresh.
@@ -857,191 +1051,52 @@ function App() {
     stickBottom.current = true; setAtBottom(true); el.scrollTop = el.scrollHeight;
   }, []);
 
-  const closeStream = () => { esRef.current?.close(); esRef.current = null; esOpen.current = false; esIdRef.current = null; };
-
-  const handleEvent = useCallback((e: AppEvent) => {
-    lastEventAt.current = Date.now(); // stream is alive
-    for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode (streaming text, result, error)
-    if (e.t === "init") { setActiveId(e.sessionId); activeIdRef.current = e.sessionId; history.replaceState(null, "", `/app?c=${e.sessionId}`); setTimeout(refreshConvs, 400); return; }
-    // user echo: drop it if we already rendered this turn optimistically (match by value, any
-    // position), and guard against a stream reopen replaying a turn already at the tail.
-    if (e.t === "user") {
-      // Compare the CLEANED text (directive/image-note removed) so an echoed decorated turn dedupes
-      // against the optimistic clean one, instead of rendering a second bubble with the directive in it.
-      const clean = sanitizeUserText(e.text);
-      const idx = pendingUser.current.indexOf(clean);
-      if (idx !== -1) { pendingUser.current.splice(idx, 1); return; }
-      setItems((it) => { const last = it[it.length - 1]; return last && last.kind === "user" && sanitizeUserText(last.text) === clean ? it : applyEvent(it, e); });
-      return;
-    }
-    if (e.t === "busy") { setBusy(e.busy); return; }
-    if (e.t === "compact") {
-      // Compaction finished. Capture the before-context (state hasn't refreshed yet) + elapsed, add the
-      // compact divider, release any queued messages, then fetch the after-context and stamp the divider
-      // with a persistent "freed Nk tokens" record.
-      setCompacting(false); compactingRef.current = false;
-      const before = contextRef.current;
-      const durMs = compactStartRef.current ? Date.now() - compactStartRef.current : 0;
-      compactStartRef.current = 0;
-      setItems((it) => applyEvent(it, e));
-      flushCompactRef.current();
-      const id = activeIdRef.current;
-      if (id && !id.startsWith("pending-")) {
-        api.context(id).then((d) => {
-          if (!d?.available) return;
-          try { localStorage.setItem("ct-app-ctxmax", String(d.max)); } catch { /* */ }
-          setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false });
-          const saved = before && before.total > d.total ? before.total - d.total : 0;
-          if (!saved && !durMs) return;
-          setItems((it) => {
-            const c = it.slice();
-            for (let k = c.length - 1; k >= 0; k--) if (c[k].kind === "compact") { c[k] = { kind: "compact", savedTokens: saved, durationMs: durMs, pctBefore: before?.percentage, pctAfter: d.percentage }; break; }
-            return c;
-          });
-        }).catch(() => { refreshContext(id); });
-      } else refreshContext(id);
-      return;
-    } // compaction finished -> send anything held
-    if (e.t === "result") { setBusy(false); setItems((it) => applyEvent(it, e)); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage (the items-change writer caches it)
-    if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
-    if (e.t === "closed") { return; }
-    setItems((it) => applyEvent(it, e));
+  // App-level hooks the stores call: URL + list refresh when a new chat gets its real id, sidebar
+  // reorder when a turn finishes, the voice tap + stall clock on every ACTIVE-store event, and the
+  // context-gauge refresh. Only the active store drives the view side effects.
+  useEffect(() => {
+    manager.hooks = {
+      onInit: (store, sid) => {
+        if (store === activeStoreRef.current) { activeIdRef.current = sid; history.replaceState(null, "", `/app?c=${sid}`); }
+        setTimeout(refreshConvs, 400);
+      },
+      onResult: () => setTimeout(refreshConvs, 500),
+      onEvent: (store, e) => {
+        if (store !== activeStoreRef.current) return;
+        lastEventAt.current = Date.now(); // stall watchdog: the active stream is alive
+        for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode
+        if (e.t === "compact") flushCompactRef.current(); // release messages typed during compaction
+      },
+      onContext: (store) => { if (store === activeStoreRef.current) refreshContext(store.id); },
+    };
+    return () => { manager.hooks = null; };
   }, [refreshConvs, refreshContext]);
 
-  // The foreground stream's message handler (drives the visible conversation). Extracted so a
-  // background stream can be PROMOTED to foreground by re-pointing its onmessage here — no reconnect.
-  const fgOnMessage = useCallback((ev: MessageEvent) => {
-    let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
-    if (typeof e._seq === "number") { if (e._seq <= lastSeq.current) return; lastSeq.current = e._seq; }
-    handleEvent(e);
-  }, [handleEvent]);
-
-  const openStream = useCallback((id: string, tail = false) => {
-    // Already streaming this conversation in the foreground (e.g. a background stream was just
-    // promoted on switch) -> don't tear it down and reconnect.
-    if (esOpen.current && esIdRef.current === id) return;
-    closeStream();
-    lastSeq.current = -1;
-    const es = new EventSource(`/app/stream/${encodeURIComponent(id)}${tail ? "?tail=1" : ""}`);
-    esRef.current = es; esOpen.current = true; esIdRef.current = id;
-    es.onmessage = fgOnMessage;
-    es.onerror = () => { /* EventSource auto-reconnects; buffer + _seq dedupe keeps us consistent */ };
-  }, [fgOnMessage]);
-
-  // #region background streaming: keep still-working conversations caching while you're elsewhere
-  // A conversation you switch away from keeps running on the server; normally its stream closes, so
-  // you only see its new output after a network fetch on return. Here we hold an extra stream (or two)
-  // open for conversations that are actively WORKING, reducing their events into a buffer and writing
-  // it to the per-message cache, so returning to them is instant-complete. Gated by bandwidth.
-  type BgStream = { es: EventSource | null; buf: Item[]; lastSeq: number; lastCache: Item[]; timer: ReturnType<typeof setTimeout> | null; lastWrite: number; closed: boolean };
-  const bgStreams = useRef<Map<string, BgStream>>(new Map());
-  const bgDoneRef = useRef<Set<string>>(new Set()); // finished this session; don't reopen until they go busy again
   const [netTick, setNetTick] = useState(0); // bumped on connection change to re-evaluate the budget
-
-  // How many conversations we'll stream in the BACKGROUND, from connection quality + a live stall
-  // signal: 0 on save-data / 2g / a foreground stream that's currently stalling; up to 2 on good 4g.
+  // How many conversations to stream in the BACKGROUND, from connection quality alone (stable, so the
+  // pool doesn't churn): 0 on save-data / 2g; 1 on 3g / slow links; up to 2 on good 4g.
   const bgBudget = useCallback((): number => {
     void netTick;
-    if (busyRef.current && Date.now() - lastEventAt.current > 8000) return 0; // foreground struggling -> link is bad
     const c: any = (navigator as any).connection;
     if (c) {
-      if (c.saveData) return 0; // user asked the OS to save data
+      if (c.saveData) return 0;
       const et = c.effectiveType;
       if (et === "slow-2g" || et === "2g") return 0;
       if (et === "3g") return 1;
-      if (typeof c.downlink === "number" && c.downlink > 0 && c.downlink < 1) return 1; // <1 Mbps
-      if (typeof c.rtt === "number" && c.rtt > 600) return 1; // laggy
+      if (typeof c.downlink === "number" && c.downlink > 0 && c.downlink < 1) return 1;
+      if (typeof c.rtt === "number" && c.rtt > 600) return 1;
       return 2;
     }
-    return 1; // no Network Information API (e.g. iOS Safari) -> stay conservative
+    return 1; // no Network Information API (e.g. iOS Safari) -> conservative
   }, [netTick]);
 
-  const bgWrite = useCallback((id: string, st: BgStream, meta: { busy: boolean; live: boolean }) => {
-    const its = st.buf, prev = st.lastCache;
-    const n = Math.min(prev.length, its.length);
-    let i = 0; while (i < n && its[i] === prev[i]) i++; // tail-diff, same as the foreground writer
-    st.lastCache = its;
-    void offline.saveConvItems(id, its, i, { busy: meta.busy, cwd: cwdRef.current, live: meta.live });
-  }, []);
-  const bgSchedule = useCallback((id: string, st: BgStream, meta: { busy: boolean; live: boolean }, immediate = false) => {
-    if (immediate) { if (st.timer) { clearTimeout(st.timer); st.timer = null; } st.lastWrite = Date.now(); bgWrite(id, st, meta); return; }
-    if (st.timer) return; // a coalesced write is already scheduled
-    const since = Date.now() - st.lastWrite;
-    if (since >= 1000) { st.lastWrite = Date.now(); bgWrite(id, st, meta); }
-    else st.timer = setTimeout(() => { st.timer = null; st.lastWrite = Date.now(); bgWrite(id, st, meta); }, 1000 - since);
-  }, [bgWrite]);
-  const stopBgStream = useCallback((id: string) => {
-    const st = bgStreams.current.get(id); if (!st) return;
-    st.closed = true; if (st.timer) { clearTimeout(st.timer); st.timer = null; }
-    try { st.es?.close(); } catch { /* */ }
-    bgStreams.current.delete(id);
-  }, []);
-  // A background stream's message handler (reduce into buffer + cache, no view). Extracted so a
-  // demoted foreground stream can adopt it without reconnecting.
-  const bgOnMessage = useCallback((id: string, st: BgStream) => (ev: MessageEvent) => {
-    let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
-    if (typeof e._seq === "number") { if (e._seq <= st.lastSeq) return; st.lastSeq = e._seq; }
-    if (e.t === "init" || e.t === "busy") return;
-    if (e.t === "closed") { stopBgStream(id); return; }
-    if (e.t === "user") e = { ...e, text: sanitizeUserText(e.text) } as AppEvent;
-    st.buf = applyEvent(st.buf, e);
-    if (e.t === "result" || e.t === "error") { bgDoneRef.current.add(id); bgSchedule(id, st, { busy: false, live: false }, true); stopBgStream(id); return; }
-    bgSchedule(id, st, { busy: true, live: true });
-  }, [bgSchedule, stopBgStream]);
-  const startBgStream = useCallback((id: string) => {
-    if (bgStreams.current.has(id)) return;
-    const st: BgStream = { es: null, buf: [], lastSeq: -1, lastCache: [], timer: null, lastWrite: 0, closed: false };
-    bgStreams.current.set(id, st);
-    void (async () => {
-      try { const d = await api.conversation(id); if (st.closed) return; st.buf = (d.events || []).reduce((a: Item[], e: AppEvent) => applyEvent(a, e), [] as Item[]); bgSchedule(id, st, { busy: true, live: true }, true); }
-      catch { /* seed failed; live events still build the buffer */ }
-      if (st.closed) return;
-      const es = new EventSource(`/app/stream/${encodeURIComponent(id)}?tail=1`);
-      st.es = es;
-      es.onmessage = bgOnMessage(id, st);
-      es.onerror = () => { /* EventSource auto-reconnects; _seq dedupe keeps the buffer consistent */ };
-    })();
-  }, [bgSchedule, bgOnMessage]);
-
-  // HANDOFF (no reconnect on switch):
-  // demote = the conversation you're leaving keeps its live stream, moved to the background pool.
-  const demoteOrClose = useCallback((id: string | null) => {
-    const es = esRef.current;
-    if (!id || !es) { closeStream(); return; }
-    const keep = !!statuses[id]?.busy && bgBudget() > 0 && !bgStreams.current.has(id) && !bgDoneRef.current.has(id);
-    if (!keep) { closeStream(); return; }
-    const its = itemsRef.current;
-    const st: BgStream = { es, buf: its.slice(), lastSeq: lastSeq.current, lastCache: its, timer: null, lastWrite: Date.now(), closed: false };
-    es.onmessage = bgOnMessage(id, st); // re-point the SAME connection at the background handler
-    bgStreams.current.set(id, st);
-    esRef.current = null; esOpen.current = false; esIdRef.current = null; // foreground lets go without closing
-  }, [statuses, bgBudget, bgOnMessage]);
-  // promote = the conversation you're opening was streaming in the background -> adopt that connection
-  // as the foreground one and paint its live buffer, instead of opening a fresh stream.
-  const promoteFromBg = useCallback((id: string): boolean => {
-    const st = bgStreams.current.get(id);
-    if (!st || !st.es) return false;
-    bgStreams.current.delete(id);
-    if (st.timer) { clearTimeout(st.timer); st.timer = null; }
-    esRef.current = st.es; esOpen.current = true; esIdRef.current = id; lastSeq.current = st.lastSeq;
-    st.es.onmessage = fgOnMessage;
-    forceBottom.current = true;
-    setItems(st.buf);
-    return true;
-  }, [fgOnMessage]);
-
-  // Reconcile the pool: stream the working conversations (minus the active one, capped by the budget),
-  // stop the rest. Re-runs whenever statuses (5s poll), the active chat, connectivity, or the measured
-  // bandwidth changes — so a link going bad tears the background streams down within a few seconds.
+  // Background pool: the manager keeps busy, non-active conversations streaming into cache (capped by
+  // bandwidth). One owned socket per conversation, so this only opens missing streams / closes
+  // unwanted ones — no churn. Re-runs on the 5s status poll, switch, connectivity, or bandwidth change.
   useEffect(() => {
-    if (!online) { for (const id of Array.from(bgStreams.current.keys())) stopBgStream(id); return; }
-    for (const id of Object.keys(statuses)) if (!statuses[id]?.busy) bgDoneRef.current.delete(id); // idle again -> eligible next turn
-    const budget = bgBudget();
-    const busyIds = Object.keys(statuses).filter((id) => statuses[id]?.busy && id !== activeId && !id.startsWith("pending-") && !bgDoneRef.current.has(id));
-    const want = busyIds.slice(0, budget);
-    for (const id of Array.from(bgStreams.current.keys())) if (!want.includes(id)) stopBgStream(id);
-    for (const id of want) startBgStream(id);
-  }, [statuses, activeId, online, netTick, bgBudget, startBgStream, stopBgStream]);
+    if (!online) { for (const s of manager.stores.values()) if (s.id !== activeId) s.disconnect(); return; }
+    manager.reconcileBackground(statuses, activeId, bgBudget());
+  }, [statuses, activeId, online, netTick, bgBudget]);
   useEffect(() => {
     const c: any = (navigator as any).connection;
     if (!c?.addEventListener) return;
@@ -1049,90 +1104,68 @@ function App() {
     c.addEventListener("change", onChange);
     return () => c.removeEventListener("change", onChange);
   }, []);
-  useEffect(() => () => { for (const id of Array.from(bgStreams.current.keys())) stopBgStream(id); }, [stopBgStream]);
-  // #endregion
+  useEffect(() => () => manager.closeAll(), []); // close every socket on unmount
 
-  // Flush messages held during compaction (assigned here so it can use openStream). Called via a ref
-  // from doCompact/handleEvent to sidestep declaration order.
+  // Messages typed DURING a compaction are held (submitText renders them optimistically, then queues
+  // the text), and sent once compaction finishes — the compact event fires onEvent -> here.
   flushCompactRef.current = () => {
     const q = compactQueue.current; compactQueue.current = [];
-    if (!q.length) return;
+    const s = activeStoreRef.current; if (!q.length || !s) return;
     void (async () => {
       for (const text of q) {
-        const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
-        try {
-          if (esOpen.current && activeIdRef.current) await api.send({ id: activeIdRef.current, text });
-          else { const r = await api.start(body); if (r?.id) { setActiveId(r.id); activeIdRef.current = r.id; openStream(r.id); } }
-        } catch { await offline.enqueueSend(body); void refreshQueue(); }
+        const body = { text, resume: s.id.startsWith("new-") ? undefined : s.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
+        try { if (s.connected) await api.send({ id: s.id, text }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
+        catch { await offline.enqueueSend(body); void refreshQueue(); }
       }
     })();
   };
 
-  // Render one conversation payload (from network or cache) into the view. `reconcile` = we're
-  // updating a conversation that's ALREADY on screen (e.g. the network copy after a cached paint),
-  // so don't yank the scroll to the bottom — leave it where the user is (the autoscroll effect still
-  // follows if they were parked at the end).
-  const applyConv = useCallback((id: string, d: any, highlight?: string, reconcile = false) => {
-    // A stream-cached payload stores the already-built items directly (partial turns and all), so a
-    // reload mid-turn restores exactly what was on screen instead of the last completed snapshot.
-    let built: Item[] = Array.isArray(d.items) ? (d.items as Item[]) : (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
-    // Reopening a LIVE conversation (e.g. one blocked on an ask_user while you were away):
-    // drop any unanswered ask rebuilt from the transcript (its id can't unblock the tool) and
-    // re-add the server's real pending asks, then stream FUTURE events so the reply flows once
-    // you answer. tail=1 avoids re-rendering the current turn already built from the transcript.
-    if (d.live) {
-      const pending: any[] = Array.isArray(d.pendingAsks) ? d.pendingAsks : [];
-      if (pending.length) {
-        built = built.filter((it: Item) => !(it.kind === "ask" && it.answered === undefined));
-        for (const a of pending) built.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
-      }
-    }
-    if (highlight) highlightRef.current = highlight; else if (!reconcile) forceBottom.current = true;
-    setItems(built); setBusy(!!d.busy); cwdRef.current = d.cwd || defaultCwd;
-    if (d.live) openStream(id, true); // reconnect to a live conversation (streams follow-up + ask answers)
-  }, [defaultCwd, openStream]);
-
+  // Open a conversation: point the view at its store, paint instantly from what we already have (memory
+  // -> cache), then reconcile from the network once and connect if it's live. The store holds its items
+  // continuously, so a switch is a pointer change — no reconnect, no re-fetch when it's already in memory.
   const loadConv = useCallback(async (id: string, highlight?: string) => {
-    cacheActive(undefined, true); // snapshot the conversation we're leaving NOW so returning to it is instant
-    // Handoff instead of reconnect: keep the conversation we're leaving streaming in the background if
-    // it's working, and adopt an existing background stream for the one we're opening.
-    demoteOrClose(activeIdRef.current);
-    const promoted = promoteFromBg(id);
+    activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
+    const s = manager.ensure(id);
+    setActiveStore(s); activeStoreRef.current = s;
+    activeIdRef.current = id;
     setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
     stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
-    setDrawer(false); setBusy(false);
-    // Switch INSTANTLY: set active + paint the cached copy right away, then refresh from the network
-    // in the background and show a loader until it lands. On a weak link this avoids the long block
-    // that made switching feel frozen.
-    setActiveId(id); activeIdRef.current = id;
+    setDrawer(false);
     history.replaceState(null, "", `/app?c=${id}`);
-    // Reset the tail-diff baseline so the first cache write for this conversation is a full snapshot.
-    lastCache.current = { cid: "", items: [] };
-    const cached = promoted ? null : await offline.getConv(id).catch(() => null); // promoted already painted the live buffer
-    if (cached) applyConv(id, cached, highlight);
-    else if (!promoted) setItems([]);
-    if (!navigator.onLine) { if (!cached && !promoted) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
+    if (highlight) highlightRef.current = highlight; else forceBottom.current = true;
+    // Instant paint: if the store isn't already hydrated in memory, fill it from the offline cache.
+    if (!s.hydrated && !s.items.length) {
+      const cached = await offline.getConv(id).catch(() => null);
+      if (cached && activeStoreRef.current === s) s.hydrate(cached.items, { busy: cached.busy, cwd: cached.cwd });
+    }
+    if (!navigator.onLine) { if (!s.items.length) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
     setLoadingConv(true);
     try {
       const d = await api.conversation(id);
-      // reconcile (not first paint) when we already showed a cached/promoted copy, so the network
-      // refresh doesn't yank the scroll to the bottom while you're reading. applyConv -> items change
-      // -> the cache writer persists the reconciled copy (tool uses and all).
-      if (activeIdRef.current === id) applyConv(id, d, highlight, !!cached || promoted); // ignore if the user already switched away
+      if (activeStoreRef.current !== s) return; // user switched away while we fetched
+      const serverItems: Item[] = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+      // A live conversation blocked on an ask_user: the transcript's ask id can't unblock the tool, so
+      // swap any unanswered asks for the server's real pending asks.
+      if (d.live && Array.isArray(d.pendingAsks) && d.pendingAsks.length) {
+        for (let i = serverItems.length - 1; i >= 0; i--) if (serverItems[i].kind === "ask" && (serverItems[i] as any).answered === undefined) serverItems.splice(i, 1);
+        for (const a of d.pendingAsks) serverItems.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
+      }
+      s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd });
+      if (d.live) s.connect(true); // stream follow-up events; connect() is a no-op if already connected
     } catch {
-      if (!cached && !promoted && activeIdRef.current === id) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
-    } finally { if (activeIdRef.current === id) setLoadingConv(false); }
-  }, [applyConv, cacheActive, demoteOrClose, promoteFromBg]);
+      if (!s.items.length && activeStoreRef.current === s) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
+    } finally { if (activeStoreRef.current === s) setLoadingConv(false); }
+  }, [defaultCwd]);
 
-  const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
+  const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
   // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
-  // to drain into a real conversation.
+  // to drain into a real conversation. A pending- store never caches or connects.
   const viewPending = useCallback((c: Conv) => {
-    closeStream();
-    setActiveId(c.sessionId); activeIdRef.current = c.sessionId;
-    setItems([{ kind: "user", text: c.queuedText || c.title }, { kind: "notice", noticeKind: "info", text: "Queued — this sends and starts the conversation as soon as you're back online." }]);
-    setBusy(false); setDrawer(false); history.replaceState(null, "", "/app");
+    const s = manager.ensure(c.sessionId);
+    setActiveStore(s); activeStoreRef.current = s; activeIdRef.current = c.sessionId;
+    s.showItems([{ kind: "user", text: c.queuedText || c.title }, { kind: "notice", noticeKind: "info", text: "Queued — this sends and starts the conversation as soon as you're back online." }]);
+    setDrawer(false); history.replaceState(null, "", "/app");
   }, []);
 
   // #region offline: online/offline detection + queued-message drain
@@ -1150,8 +1183,8 @@ function App() {
     await refreshQueue();
     refreshConvs();
     // reconnect the active conversation's stream so a drained message's reply streams in live
-    if (lastId && (lastId === activeIdRef.current || activeIdRef.current === null)) { setActiveId(lastId); activeIdRef.current = lastId; openStream(lastId); }
-  }, [openStream, refreshConvs, refreshQueue]);
+    if (lastId && (lastId === activeIdRef.current || activeIdRef.current === null)) { const s = manager.ensure(lastId); setActiveStore(s); activeStoreRef.current = s; activeIdRef.current = lastId; s.connect(false); }
+  }, [refreshConvs, refreshQueue]);
 
   const drainingRef = useRef(false);
   useEffect(() => {
@@ -1192,9 +1225,9 @@ function App() {
       const st = statuses[id];
       const serverDone = st ? !st.busy : false; // server knows this conv and says the turn ended
       // Missed the ending (server done but we still show busy) -> resync fast. Otherwise resync after a
-      // shorter silence so a weak-signal stall recovers on its own instead of looking hung. A genuinely
-      // long, quiet tool run just re-attaches the stream (loadConv reopens it if still live).
-      if ((serverDone && quietFor > 6000) || quietFor > 15000) { lastEventAt.current = Date.now(); void loadConv(id); }
+      // shorter silence so a weak-signal stall recovers on its own. Drop the (possibly silently-dead)
+      // socket first so loadConv's connect() actually reopens it instead of no-opping on a stale one.
+      if ((serverDone && quietFor > 6000) || quietFor > 15000) { lastEventAt.current = Date.now(); activeStoreRef.current?.disconnect(); void loadConv(id); }
     }, 4000);
     return () => clearInterval(t);
   }, [busy, statuses, loadConv]);
@@ -1217,35 +1250,36 @@ function App() {
   // voice bridge identity never churns.
   const submitText = useCallback(async (text: string, opts?: { voice?: boolean }): Promise<string | null> => {
     if (!text.trim()) return null;
-    setBusy(true);
     stickBottom.current = true; setAtBottom(true); // sending re-anchors to the bottom so you see your turn + the reply
-    pendingUser.current.push(text);
-    setItems((it) => applyEvent(it, { t: "user", text }));
-    const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
-    const isNewChat = !activeIdRef.current;
+    // Ensure there's a store to send into (a brand-new chat gets a temp store, promoted to its real id
+    // when the server assigns one). addOptimisticUser renders the turn + flips busy immediately.
+    let s = activeStoreRef.current;
+    const isNewChat = !s || s.id.startsWith("pending-");
+    if (isNewChat) { s = manager.ensure("new-" + Date.now().toString(36) + Math.floor(performance.now())); setActiveStore(s); activeStoreRef.current = s; }
+    s!.addOptimisticUser(text);
+    const body = { text, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
     const queue = async () => {
       await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued);
       // A chat STARTED offline has no server id yet, so it wouldn't show anywhere. Drop a local
       // placeholder into the sidebar, flagged pending, so it's visible + clearly "waiting to send".
-      // refreshConvs() on reconnect (after the queue drains) replaces it with the real conversation.
       if (isNewChat) {
         const firstLine = text.replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
         const pid = "pending-" + Date.now();
         setConvs((cs) => [{ sessionId: pid, title: firstLine, cwd: cwdRef.current || null, mtime: Date.now(), pending: true, queuedText: text }, ...cs]);
       }
-      setBusy(false);
+      s!.setBusy(false);
     };
     if (typeof navigator !== "undefined" && !navigator.onLine) { await queue(); return null; } // offline: hold it, send on reconnect
     // During compaction, hold the message (already rendered optimistically) and send it once the
     // compaction finishes, so it isn't lost or racing the /compact turn.
-    if (compactingRef.current && activeIdRef.current) { compactQueue.current.push(text); return activeIdRef.current; }
+    if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push(text); return s!.id; }
     try {
-      if (esOpen.current && activeIdRef.current) { await api.send({ id: activeIdRef.current, text }); return activeIdRef.current; }
+      if (s!.connected && !s!.id.startsWith("new-")) { await api.send({ id: s!.id, text }); return s!.id; }
       const r = await api.start(body);
-      if (r?.id) { setActiveId(r.id); activeIdRef.current = r.id; openStream(r.id); return r.id; }
-      setBusy(false); return null;
+      if (r?.id) { manager.rebind(s!, r.id); activeIdRef.current = r.id; s!.connect(false); return r.id; }
+      s!.setBusy(false); return null;
     } catch { await queue(); return null; } // network died mid-send -> queue for reconnect
-  }, [openStream]);
+  }, []);
 
   const doSend = async () => {
     const raw = input.trim();
@@ -1263,7 +1297,7 @@ function App() {
     subscribe: (fn) => { voiceSinks.current.add(fn as (e: AppEvent) => void); return () => { voiceSinks.current.delete(fn as (e: AppEvent) => void); }; },
   }), [submitText]);
 
-  const stop = async () => { if (activeId) await api.interrupt(activeId); setBusy(false); };
+  const stop = async () => { const s = activeStoreRef.current; if (!s) return; s.setBusy(false); await api.interrupt(s.id); };
 
   // #region context menus (long-press / right-click): message copy+edit, conversation rename+delete
   const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant") => setMsgMenu({ x, y, text, kind }), []);
@@ -1288,8 +1322,9 @@ function App() {
 
   // User tapped an ask_user option: mark it chosen locally + tell the server (unblocks Claude).
   const answerAsk = useCallback((askId: string, answer: string) => {
-    setItems((its) => its.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)));
-    if (activeIdRef.current) api.answerAsk(activeIdRef.current, askId, answer).catch(() => {});
+    const s = activeStoreRef.current; if (!s) return;
+    s.answerAsk(askId, answer);
+    api.answerAsk(s.id, askId, answer).catch(() => {});
   }, []);
 
   // Tapping a PWA push (e.g. "Claude has a question") posts this from the service worker;
@@ -1310,7 +1345,7 @@ function App() {
 
   const onPickModel = async (m: string) => {
     setModel(m); localStorage.setItem("ct-app-model", m); setMenuOpen(false); setOtherOpen(false);
-    if (esOpen.current && activeId) { try { await api.setModel({ id: activeId, model: m }); } catch { /* */ } }
+    if (activeStoreRef.current?.connected && activeId) { try { await api.setModel({ id: activeId, model: m }); } catch { /* */ } }
   };
 
   const startRename = () => { if (!activeId) return; setTitleDraft(convs.find((c) => c.sessionId === activeId)?.title || ""); setEditingTitle(true); };
@@ -1569,7 +1604,7 @@ function App() {
                 }
                 return nodes;
               })()}
-              {compacting && <CompactionBanner start={compactStartRef.current} />}
+              {compacting && <CompactionBanner start={activeStore?.compactStart ?? 0} />}
               {busy && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}

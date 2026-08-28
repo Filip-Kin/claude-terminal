@@ -8,6 +8,7 @@
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
 import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { mkdirSync } from "node:fs";
 import { z } from "zod";
 
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
@@ -20,7 +21,8 @@ export type AppEvent =
   | { t: "thinking_progress"; tokens: number } // thinking is happening but text is redacted (subscription auth): show progress
   | { t: "tool_use"; id: string; name: string; input: unknown }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
-  | { t: "compact"; trigger: "manual" | "auto" }
+  | { t: "compact"; trigger: "manual" | "auto"; preTokens?: number; postTokens?: number; durationMs?: number } // a compaction finished; metadata drives the "freed Nk" card
+  | { t: "compacting"; active: boolean } // compaction started/stopped (drives the progress banner, incl. auto-compaction)
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
   | { t: "user"; text: string } // an echoed user turn (used by history replay)
@@ -292,7 +294,18 @@ export class Conversation {
     switch (m.type) {
       case "system":
         if (anyM.subtype === "init") this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
-        else if (anyM.subtype === "compact_boundary") this.emit({ t: "compact", trigger: anyM.compact_metadata?.trigger || "auto" });
+        else if (anyM.subtype === "compact_boundary") {
+          const md = anyM.compact_metadata || {};
+          this.emit({ t: "compacting", active: false });
+          this.emit({ t: "compact", trigger: md.trigger || "auto", preTokens: md.pre_tokens, postTokens: md.post_tokens, durationMs: md.duration_ms });
+        }
+        // This SDK build reports compaction progress via a status message (compacting -> null with a
+        // compact_result), THEN the compact_boundary above. Drive the banner from it so auto-compaction
+        // shows progress too, and surface a failed compaction instead of a silently stuck banner.
+        else if (anyM.subtype === "status" && (anyM.status === "compacting" || anyM.compact_result)) {
+          if (anyM.status === "compacting") this.emit({ t: "compacting", active: true });
+          else if (anyM.compact_result === "failed") { this.emit({ t: "compacting", active: false }); this.emit({ t: "notice", kind: "info", text: "Compaction failed: " + (anyM.compact_error || "unknown") }); }
+        }
         // Background subagent activity + cross-session messages, surfaced inline so the thread
         // shows work spun off to other agents (Claude Code's task/notification stream).
         else if (anyM.subtype === "task_started") this.emit({ t: "notice", kind: "task", text: String(anyM.description || "background task"), status: "started" });
@@ -482,9 +495,63 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       }
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       turnOut = 0; turnThink = 0; turnStartTs = 0; // compaction is a fresh turn boundary
-      out.push({ t: "compact", trigger: o.compact_metadata?.trigger || "auto" });
+      const md = o.compact_metadata || {};
+      out.push({ t: "compact", trigger: md.trigger || "auto", preTokens: md.pre_tokens, postTokens: md.post_tokens, durationMs: md.duration_ms });
     }
   }
   return out;
+}
+// #endregion
+
+// #region plan usage (claude.ai subscription rate-limit windows — the data behind `/usage`)
+// A single long-lived control query, opened lazily, purely to call the SDK usage API. It never
+// sends a turn (no tokens spent) and runs in a /tmp cwd whose `-tmp-*` project the conversation
+// list already excludes, so it never pollutes the sidebar. getPlanUsage() is non-blocking: it
+// returns the cached snapshot immediately and refreshes it in the background when stale.
+export interface PlanWindow { utilization: number | null; resetsAt: string | null }
+export interface PlanUsage { available: boolean; subscription: string | null; fiveHour: PlanWindow | null; sevenDay: PlanWindow | null; fetchedAt: number }
+
+const PLAN_CWD = "/tmp/ct-usage"; // -tmp-ct-usage project -> excluded from the conversation list
+const PLAN_TTL = 90_000; // a rate-limit window moves slowly; 90s is plenty fresh
+let ctrlQuery: any = null;
+let ctrlReady: Promise<void> | null = null;
+let planCache: PlanUsage | null = null;
+let planRefreshing = false;
+
+function startControlQuery() {
+  try { mkdirSync(PLAN_CWD, { recursive: true }); } catch { /* */ }
+  let release = () => {};
+  const gen = (async function* (): AsyncGenerator<SDKUserMessage> { await new Promise<void>((r) => { release = r; }); })();
+  const q: any = query({ prompt: gen, options: { cwd: PLAN_CWD, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
+  ctrlQuery = q;
+  ctrlReady = new Promise<void>((resolve) => {
+    (async () => {
+      try { for await (const m of q) { if ((m as any)?.type === "system" && (m as any)?.subtype === "init") resolve(); } }
+      catch { /* control query died */ }
+      finally { if (ctrlQuery === q) { ctrlQuery = null; ctrlReady = null; } release(); resolve(); }
+    })();
+  });
+}
+
+async function refreshPlanUsage(): Promise<void> {
+  if (planRefreshing) return;
+  planRefreshing = true;
+  try {
+    if (!ctrlQuery) startControlQuery();
+    await Promise.race([ctrlReady, new Promise((r) => setTimeout(r, 8000))]);
+    if (!ctrlQuery) return;
+    const u: any = await ctrlQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+    const rl = u?.rate_limits || {};
+    const win = (w: any): PlanWindow | null => (w ? { utilization: typeof w.utilization === "number" ? w.utilization : null, resetsAt: w.resets_at || null } : null);
+    planCache = { available: !!u?.rate_limits_available, subscription: u?.subscription_type || null, fiveHour: win(rl.five_hour), sevenDay: win(rl.seven_day), fetchedAt: Date.now() };
+  } catch { /* keep the last snapshot */ }
+  finally { planRefreshing = false; }
+}
+
+// Non-blocking: returns whatever we have now and kicks a background refresh when the snapshot is
+// missing or stale. The first-ever call returns null; the value lands on a subsequent poll.
+export function getPlanUsage(): PlanUsage | null {
+  if (!planCache || Date.now() - planCache.fetchedAt > PLAN_TTL) void refreshPlanUsage();
+  return planCache;
 }
 // #endregion
