@@ -326,7 +326,7 @@ function build(d){
       <div class="who">
         <span class="swatch" style="background:${c}"></span>
         <span class="name">${u.name}</span>
-        ${u.external ? `<span class="badge external">external${u.peer?` · ${u.peer}`:''}</span>`
+        ${u.external ? `<span class="badge external">external</span>`
           : u.host ? '<span class="badge host">host</span>' : '<span class="badge">sandbox</span>'}
         ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>
