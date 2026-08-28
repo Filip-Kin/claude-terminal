@@ -161,9 +161,30 @@ function skillLoadName(txt: string): string | null {
   return p.split(/[/\\]/).pop() || p;
 }
 
-// Last-known context window size (persisted on every context fetch), for turning the compaction
-// metadata's pre/post token counts into a percentage. Falls back to the default window.
-function ctxMax(): number { try { return Number(localStorage.getItem("ct-app-ctxmax")) || DEFAULT_CTX; } catch { return DEFAULT_CTX; } }
+// Context window size (tokens) cached PER CONVERSATION. The window is a property of the model, so a
+// single global value was wrong: reopening a 200k chat after a 1M one divided the real tokens by the
+// stale 1M window and badly under-read the ring (e.g. 17% for a chat that was ~88% full). We cache
+// the real window (from getContextUsage) per session id, and fall back to the default window — never
+// to another conversation's max. A legacy bare-number value parses to a non-object and is ignored.
+const CTXMAX_KEY = "ct-app-ctxmax";
+function ctxMaxMap(): Record<string, number> {
+  try { const p = JSON.parse(localStorage.getItem(CTXMAX_KEY) || "{}"); return p && typeof p === "object" ? p : {}; } catch { return {}; }
+}
+function ctxMaxGet(id?: string | null): number {
+  if (id) { const v = ctxMaxMap()[id]; if (v) return Number(v) || DEFAULT_CTX; }
+  return DEFAULT_CTX;
+}
+function ctxMaxSet(id: string, max: number): void {
+  if (!id || !max) return;
+  try {
+    const m = ctxMaxMap(); m[id] = max;
+    const keys = Object.keys(m); if (keys.length > 200) delete m[keys[0]]; // bound the map
+    localStorage.setItem(CTXMAX_KEY, JSON.stringify(m));
+  } catch { /* */ }
+}
+// The active conversation's real window, so a compaction card (reduced in applyEvent, which has no
+// conversation id in scope) shows a sensible percentage. Updated whenever the active gauge refreshes.
+let activeCtxMax = DEFAULT_CTX;
 
 function applyEvent(items: Item[], e: AppEvent): Item[] {
   // Freeze a live "thinking" block's duration the instant the first non-thinking event lands, so
@@ -230,7 +251,7 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       // Build the persistent "freed Nk tokens" card straight from the SDK's compact_metadata (works
       // for manual AND auto compaction, live or replayed — no fragile post-hoc context diffing).
       const saved = e.preTokens != null && e.postTokens != null ? Math.max(0, e.preTokens - e.postTokens) : 0;
-      const max = ctxMax();
+      const max = activeCtxMax;
       const pctBefore = max && e.preTokens != null ? (e.preTokens / max) * 100 : undefined;
       const pctAfter = max && e.postTokens != null ? (e.postTokens / max) * 100 : undefined;
       return [...items, { kind: "compact", savedTokens: saved || undefined, durationMs: e.durationMs, pctBefore, pctAfter }];
@@ -672,8 +693,17 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
   );
 }
 
-function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant") => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"] }) {
+function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
+  // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
+  // audio actually plays (Kokoro TTS can take a moment), then a subtle "playing" state until it ends.
+  const raPill = reading ? (
+    <div className={"ra-status ra-" + reading}>
+      {reading === "generating"
+        ? <><span className="ra-spin" /> Generating voice…</>
+        : <><span className="ra-eq"><i /><i /><i /></span> Playing…</>}
+    </div>
+  ) : null;
   // Messages stay natively selectable (so you can highlight part of one to copy). The copy/edit
   // menu is therefore RIGHT-CLICK only (desktop); a mobile long-press does OS text selection, not
   // our menu. Conversation rows use the full long-press menu instead (they're not selectable).
@@ -682,8 +712,8 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, send
   // triggers our menu instead of the OS text-selection popup.
   const menuBind = (text: string, kind: "user" | "assistant"): Record<string, unknown> => {
     if (!onMenu) return {};
-    if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y) => onMenu(x, y, text, kind)) };
-    return { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind); } };
+    if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y) => onMenu(x, y, text, kind, i)) };
+    return { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
   };
   if (it.kind === "user") {
     const { images, files, body } = parseUserText(it.text);
@@ -694,6 +724,7 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, send
           {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
           {body && <div className="bubble-user-text">{body}</div>}
         </div>
+        {raPill}
         {sendStatus && <div className="send-ticks-row"><SendTicks state={sendStatus} /></div>}
       </div>
     );
@@ -754,6 +785,7 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, send
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
       {showRole && <div className="role">Claude</div>}
       <AssistantContent text={it.text} convId={convId} onOpenArtifact={onOpenArtifact} />
+      {raPill}
       {summary && <div className="turn-think" title={tip}>{summary}</div>}
     </div>
   );
@@ -814,7 +846,7 @@ function App() {
   const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
   const [readTick, setReadTick] = useState(0); // bump to re-render unread dots after marking read
-  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant" } | null>(null);
+  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant"; i: number } | null>(null);
   const [convMenu, setConvMenu] = useState<{ x: number; y: number; id: string; title: string; fav: boolean } | null>(null);
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
   const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
@@ -924,8 +956,9 @@ function App() {
   const refreshContext = useCallback((id: string | null) => {
     if (!id || id.startsWith("pending-")) { setContext(null); return; }
     api.context(id).then((d) => {
-      if (d?.available) { try { localStorage.setItem("ct-app-ctxmax", String(d.max)); } catch { /* */ } setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false }); return; }
-      const max = Number(localStorage.getItem("ct-app-ctxmax")) || DEFAULT_CTX;
+      if (d?.available) { ctxMaxSet(id, d.max); activeCtxMax = d.max; setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false }); return; }
+      const max = ctxMaxGet(id); // THIS conversation's window (from when it was last live), not a global
+      activeCtxMax = max;
       // Not live in memory: use the REAL context from the last committed turn's usage (stamped on
       // assistant items during replay), so a reopened conversation shows its true last-message context.
       let realCtx = 0;
