@@ -675,6 +675,32 @@ function App() {
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
   useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, markRead]);
   useEffect(() => { itemsRef.current = items; }, [items]); // for the context estimate
+  const busyRef = useRef(false);
+  useEffect(() => { busyRef.current = busy; }, [busy]);
+  // Snapshot the on-screen conversation (partial turns and all) into the offline cache, so a reload
+  // mid-stream or a switch-and-return restores exactly what was there instead of the last completed
+  // snapshot. Cheap and best-effort; skips brand-new/empty views.
+  const cacheActive = useCallback((id?: string | null) => {
+    const cid = id ?? activeIdRef.current;
+    if (!cid || cid.startsWith("pending-")) return;
+    const its = itemsRef.current;
+    if (!its.length) return;
+    void offline.cacheConversation(cid, { items: its, busy: busyRef.current, cwd: cwdRef.current, live: busyRef.current, at: Date.now() });
+  }, []);
+  // Keep the offline cache warm DURING a turn (not just when it finishes): snapshot every ~2s while
+  // busy, and immediately when the page is hidden (phone lock / app switch). So a reload mid-stream or
+  // a return-from-lock restores the in-progress conversation instead of jumping back to before you spoke.
+  useEffect(() => {
+    if (!busy) return;
+    const t = setInterval(() => cacheActive(), 2000);
+    return () => clearInterval(t);
+  }, [busy, cacheActive]);
+  useEffect(() => {
+    const flush = () => { if (document.visibilityState === "hidden") cacheActive(); };
+    document.addEventListener("visibilitychange", flush);
+    window.addEventListener("pagehide", cacheActive as any);
+    return () => { document.removeEventListener("visibilitychange", flush); window.removeEventListener("pagehide", cacheActive as any); };
+  }, [cacheActive]);
   useEffect(() => { compactingRef.current = compacting; }, [compacting]);
   const flushCompactRef = useRef<() => void>(() => {}); // assigned after openStream is defined
 
@@ -817,7 +843,7 @@ function App() {
       } else refreshContext(id);
       return;
     } // compaction finished -> send anything held
-    if (e.t === "result") { setBusy(false); setItems((it) => applyEvent(it, e)); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage
+    if (e.t === "result") { setBusy(false); setItems((it) => { const n = applyEvent(it, e); setTimeout(() => cacheActive(), 0); return n; }); setTimeout(refreshConvs, 500); return; } // applyEvent stamps the turn's real token usage; snapshot the finished turn to cache
     if (e.t === "error") { setBusy(false); setItems((it) => [...it, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]); return; }
     if (e.t === "closed") { return; }
     setItems((it) => applyEvent(it, e));
@@ -852,9 +878,14 @@ function App() {
     })();
   };
 
-  // Render one conversation payload (from network or cache) into the view.
-  const applyConv = useCallback((id: string, d: any, highlight?: string) => {
-    let built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+  // Render one conversation payload (from network or cache) into the view. `reconcile` = we're
+  // updating a conversation that's ALREADY on screen (e.g. the network copy after a cached paint),
+  // so don't yank the scroll to the bottom — leave it where the user is (the autoscroll effect still
+  // follows if they were parked at the end).
+  const applyConv = useCallback((id: string, d: any, highlight?: string, reconcile = false) => {
+    // A stream-cached payload stores the already-built items directly (partial turns and all), so a
+    // reload mid-turn restores exactly what was on screen instead of the last completed snapshot.
+    let built: Item[] = Array.isArray(d.items) ? (d.items as Item[]) : (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
     // Reopening a LIVE conversation (e.g. one blocked on an ask_user while you were away):
     // drop any unanswered ask rebuilt from the transcript (its id can't unblock the tool) and
     // re-add the server's real pending asks, then stream FUTURE events so the reply flows once
@@ -866,12 +897,13 @@ function App() {
         for (const a of pending) built.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
       }
     }
-    if (highlight) highlightRef.current = highlight; else forceBottom.current = true;
+    if (highlight) highlightRef.current = highlight; else if (!reconcile) forceBottom.current = true;
     setItems(built); setBusy(!!d.busy); cwdRef.current = d.cwd || defaultCwd;
     if (d.live) openStream(id, true); // reconnect to a live conversation (streams follow-up + ask answers)
   }, [defaultCwd, openStream]);
 
   const loadConv = useCallback(async (id: string, highlight?: string) => {
+    cacheActive(); // snapshot the conversation we're leaving so returning to it is instant
     closeStream();
     setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
     stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
@@ -889,11 +921,13 @@ function App() {
     try {
       const d = await api.conversation(id);
       offline.cacheConversation(id, d);
-      if (activeIdRef.current === id) applyConv(id, d, highlight); // ignore if the user already switched away
+      // reconcile (not first paint) when we already showed a cached copy, so the network refresh
+      // doesn't yank the scroll to the bottom while you're reading.
+      if (activeIdRef.current === id) applyConv(id, d, highlight, !!cached); // ignore if the user already switched away
     } catch {
       if (!cached && activeIdRef.current === id) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
     } finally { if (activeIdRef.current === id) setLoadingConv(false); }
-  }, [applyConv]);
+  }, [applyConv, cacheActive]);
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;

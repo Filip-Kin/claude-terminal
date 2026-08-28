@@ -91,7 +91,8 @@ a { color: var(--accent-2); }
 /* Conversation status dot (occupies the icon slot): thinking pulses, waiting/unread solid, queued a ring. */
 .conv-status { flex: 0 0 15px; width: 15px; height: 15px; display: inline-flex; align-items: center; justify-content: center; align-self: center; }
 .conv-status::after { content: ""; width: 8px; height: 8px; border-radius: 50%; }
-.conv-status.thinking::after { background: var(--accent); animation: ctpulse 1.2s ease-in-out infinite; }
+.conv-status.thinking::after { background: var(--accent); animation: ctdot 1.4s ease-in-out infinite; }
+@keyframes ctdot { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 .conv-status.waiting::after { background: var(--warning, #F59E0B); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning, #F59E0B) 25%, transparent); }
 .conv-status.unread::after { background: var(--accent); }
 .conv-status.queued::after { background: transparent; width: 9px; height: 9px; border: 2px solid var(--warning, #F59E0B); }
@@ -219,7 +220,7 @@ a { color: var(--accent-2); }
 .tool-body pre { background: #120f0c; border: 1px solid var(--line-2); border-radius: 9px; padding: 10px 12px; overflow-x: auto; font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; }
 .tool-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-top: 10px; }
 
-.thinking { color: var(--text-3); font-style: italic; font-size: 13.5px; border-left: 2px solid var(--line); padding-left: 12px; margin: 0 0 12px; white-space: pre-wrap; }
+.thinking { color: var(--text-3); font-style: italic; font-size: 13.5px; margin: 0 0 12px; white-space: pre-wrap; }
 .think-label { font-style: normal; font-size: 12px; letter-spacing: 0; color: var(--text-3); font-weight: 600; margin-bottom: 3px; opacity: .9; }
 .think-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-style: normal; }
 .think-text { flex-basis: 100%; font-style: italic; font-size: 13px; margin-top: 4px; white-space: pre-wrap; color: var(--text-3); }
