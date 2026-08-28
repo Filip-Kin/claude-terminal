@@ -335,7 +335,15 @@ function estimateContextTokens(items: Item[]): number {
 }
 
 const fmtDur = (secs: number) => (secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`);
-const fmtTokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
+// The single token-count formatter, matching the terminal's usage button (overlay.js fmtCompact):
+// millions past ~1M ("1.2M"), thousands below ("42k"), exact under 1k. Used everywhere (5h usage,
+// tool-use estimates, thinking, turn footer) so every count reads the same.
+const fmtTokens = (n: number) => {
+  if (n == null || isNaN(n)) return "";
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return Math.round(n / 1e3) + "k";
+  return String(n);
+};
 
 // Sum the thinking time + tokens for the turn that ends at assistant block `i` (walk back to the
 // previous user/compact = turn start). Powers the Claude-Code-style summary under the final reply.
@@ -541,6 +549,7 @@ function App() {
 
   const esRef = useRef<EventSource | null>(null);
   const esOpen = useRef(false);
+  const esIdRef = useRef<string | null>(null); // which conversation the foreground stream is for (handoff tracking)
   const lastSeq = useRef(-1);
   const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the live stream last say anything
   const compactingRef = useRef(false); // mirror of `compacting` for stable callbacks
@@ -848,7 +857,7 @@ function App() {
     stickBottom.current = true; setAtBottom(true); el.scrollTop = el.scrollHeight;
   }, []);
 
-  const closeStream = () => { esRef.current?.close(); esRef.current = null; esOpen.current = false; };
+  const closeStream = () => { esRef.current?.close(); esRef.current = null; esOpen.current = false; esIdRef.current = null; };
 
   const handleEvent = useCallback((e: AppEvent) => {
     lastEventAt.current = Date.now(); // stream is alive
@@ -899,18 +908,25 @@ function App() {
     setItems((it) => applyEvent(it, e));
   }, [refreshConvs, refreshContext]);
 
+  // The foreground stream's message handler (drives the visible conversation). Extracted so a
+  // background stream can be PROMOTED to foreground by re-pointing its onmessage here — no reconnect.
+  const fgOnMessage = useCallback((ev: MessageEvent) => {
+    let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
+    if (typeof e._seq === "number") { if (e._seq <= lastSeq.current) return; lastSeq.current = e._seq; }
+    handleEvent(e);
+  }, [handleEvent]);
+
   const openStream = useCallback((id: string, tail = false) => {
+    // Already streaming this conversation in the foreground (e.g. a background stream was just
+    // promoted on switch) -> don't tear it down and reconnect.
+    if (esOpen.current && esIdRef.current === id) return;
     closeStream();
     lastSeq.current = -1;
     const es = new EventSource(`/app/stream/${encodeURIComponent(id)}${tail ? "?tail=1" : ""}`);
-    esRef.current = es; esOpen.current = true;
-    es.onmessage = (ev) => {
-      let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
-      if (typeof e._seq === "number") { if (e._seq <= lastSeq.current) return; lastSeq.current = e._seq; }
-      handleEvent(e);
-    };
+    esRef.current = es; esOpen.current = true; esIdRef.current = id;
+    es.onmessage = fgOnMessage;
     es.onerror = () => { /* EventSource auto-reconnects; buffer + _seq dedupe keeps us consistent */ };
-  }, [handleEvent]);
+  }, [fgOnMessage]);
 
   // #region background streaming: keep still-working conversations caching while you're elsewhere
   // A conversation you switch away from keeps running on the server; normally its stream closes, so
@@ -960,6 +976,18 @@ function App() {
     try { st.es?.close(); } catch { /* */ }
     bgStreams.current.delete(id);
   }, []);
+  // A background stream's message handler (reduce into buffer + cache, no view). Extracted so a
+  // demoted foreground stream can adopt it without reconnecting.
+  const bgOnMessage = useCallback((id: string, st: BgStream) => (ev: MessageEvent) => {
+    let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
+    if (typeof e._seq === "number") { if (e._seq <= st.lastSeq) return; st.lastSeq = e._seq; }
+    if (e.t === "init" || e.t === "busy") return;
+    if (e.t === "closed") { stopBgStream(id); return; }
+    if (e.t === "user") e = { ...e, text: sanitizeUserText(e.text) } as AppEvent;
+    st.buf = applyEvent(st.buf, e);
+    if (e.t === "result" || e.t === "error") { bgDoneRef.current.add(id); bgSchedule(id, st, { busy: false, live: false }, true); stopBgStream(id); return; }
+    bgSchedule(id, st, { busy: true, live: true });
+  }, [bgSchedule, stopBgStream]);
   const startBgStream = useCallback((id: string) => {
     if (bgStreams.current.has(id)) return;
     const st: BgStream = { es: null, buf: [], lastSeq: -1, lastCache: [], timer: null, lastWrite: 0, closed: false };
@@ -970,19 +998,37 @@ function App() {
       if (st.closed) return;
       const es = new EventSource(`/app/stream/${encodeURIComponent(id)}?tail=1`);
       st.es = es;
-      es.onmessage = (ev) => {
-        let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
-        if (typeof e._seq === "number") { if (e._seq <= st.lastSeq) return; st.lastSeq = e._seq; }
-        if (e.t === "init" || e.t === "busy") return;
-        if (e.t === "closed") { stopBgStream(id); return; }
-        if (e.t === "user") e = { ...e, text: sanitizeUserText(e.text) } as AppEvent;
-        st.buf = applyEvent(st.buf, e);
-        if (e.t === "result" || e.t === "error") { bgDoneRef.current.add(id); bgSchedule(id, st, { busy: false, live: false }, true); stopBgStream(id); return; }
-        bgSchedule(id, st, { busy: true, live: true });
-      };
+      es.onmessage = bgOnMessage(id, st);
       es.onerror = () => { /* EventSource auto-reconnects; _seq dedupe keeps the buffer consistent */ };
     })();
-  }, [bgSchedule, stopBgStream]);
+  }, [bgSchedule, bgOnMessage]);
+
+  // HANDOFF (no reconnect on switch):
+  // demote = the conversation you're leaving keeps its live stream, moved to the background pool.
+  const demoteOrClose = useCallback((id: string | null) => {
+    const es = esRef.current;
+    if (!id || !es) { closeStream(); return; }
+    const keep = !!statuses[id]?.busy && bgBudget() > 0 && !bgStreams.current.has(id) && !bgDoneRef.current.has(id);
+    if (!keep) { closeStream(); return; }
+    const its = itemsRef.current;
+    const st: BgStream = { es, buf: its.slice(), lastSeq: lastSeq.current, lastCache: its, timer: null, lastWrite: Date.now(), closed: false };
+    es.onmessage = bgOnMessage(id, st); // re-point the SAME connection at the background handler
+    bgStreams.current.set(id, st);
+    esRef.current = null; esOpen.current = false; esIdRef.current = null; // foreground lets go without closing
+  }, [statuses, bgBudget, bgOnMessage]);
+  // promote = the conversation you're opening was streaming in the background -> adopt that connection
+  // as the foreground one and paint its live buffer, instead of opening a fresh stream.
+  const promoteFromBg = useCallback((id: string): boolean => {
+    const st = bgStreams.current.get(id);
+    if (!st || !st.es) return false;
+    bgStreams.current.delete(id);
+    if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+    esRef.current = st.es; esOpen.current = true; esIdRef.current = id; lastSeq.current = st.lastSeq;
+    st.es.onmessage = fgOnMessage;
+    forceBottom.current = true;
+    setItems(st.buf);
+    return true;
+  }, [fgOnMessage]);
 
   // Reconcile the pool: stream the working conversations (minus the active one, capped by the budget),
   // stop the rest. Re-runs whenever statuses (5s poll), the active chat, connectivity, or the measured
@@ -1048,7 +1094,10 @@ function App() {
 
   const loadConv = useCallback(async (id: string, highlight?: string) => {
     cacheActive(undefined, true); // snapshot the conversation we're leaving NOW so returning to it is instant
-    closeStream();
+    // Handoff instead of reconnect: keep the conversation we're leaving streaming in the background if
+    // it's working, and adopt an existing background stream for the one we're opening.
+    demoteOrClose(activeIdRef.current);
+    const promoted = promoteFromBg(id);
     setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
     stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
     setDrawer(false); setBusy(false);
@@ -1059,21 +1108,21 @@ function App() {
     history.replaceState(null, "", `/app?c=${id}`);
     // Reset the tail-diff baseline so the first cache write for this conversation is a full snapshot.
     lastCache.current = { cid: "", items: [] };
-    const cached = await offline.getConv(id).catch(() => null);
+    const cached = promoted ? null : await offline.getConv(id).catch(() => null); // promoted already painted the live buffer
     if (cached) applyConv(id, cached, highlight);
-    else setItems([]);
-    if (!navigator.onLine) { if (!cached) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
+    else if (!promoted) setItems([]);
+    if (!navigator.onLine) { if (!cached && !promoted) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
     setLoadingConv(true);
     try {
       const d = await api.conversation(id);
-      // reconcile (not first paint) when we already showed a cached copy, so the network refresh
-      // doesn't yank the scroll to the bottom while you're reading. applyConv -> items change ->
-      // the cache writer persists the reconciled copy (tool uses and all).
-      if (activeIdRef.current === id) applyConv(id, d, highlight, !!cached); // ignore if the user already switched away
+      // reconcile (not first paint) when we already showed a cached/promoted copy, so the network
+      // refresh doesn't yank the scroll to the bottom while you're reading. applyConv -> items change
+      // -> the cache writer persists the reconciled copy (tool uses and all).
+      if (activeIdRef.current === id) applyConv(id, d, highlight, !!cached || promoted); // ignore if the user already switched away
     } catch {
-      if (!cached && activeIdRef.current === id) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
+      if (!cached && !promoted && activeIdRef.current === id) setItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
     } finally { if (activeIdRef.current === id) setLoadingConv(false); }
-  }, [applyConv, cacheActive]);
+  }, [applyConv, cacheActive, demoteOrClose, promoteFromBg]);
 
   const newChat = () => { closeStream(); setItems([]); setActiveId(null); setBusy(false); setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
@@ -1460,12 +1509,6 @@ function App() {
           )}
         </div>
         <div className="sb-foot">
-          {usage5h && (
-            <a className="usage-chip" href={usage5h.url} target="_blank" rel="noreferrer" title="Output tokens in the last 5 hours — open the usage dashboard">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><path d="M7 14l4-4 3 3 5-6" /></svg>
-              <span>{fmtTokens(usage5h.output5h)} · 5h</span>
-            </a>
-          )}
           <a className="term-link" href="/">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.6" /><path d="M8 10l2.5 2L8 14M12.5 14H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
             Terminal
@@ -1486,7 +1529,6 @@ function App() {
           ) : (
             <div className="topbar-title">
               <span className="tt-text">{activeId ? convs.find((c) => c.sessionId === activeId)?.title || "Conversation" : "New chat"}</span>
-              {busy && <span className="working-pill" title="Claude is working"><span className="wp-dot" />Working</span>}
               {activeId && (
                 <button className="rename-btn" onClick={startRename} title="Rename conversation" aria-label="Rename">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
@@ -1598,6 +1640,13 @@ function App() {
               )}
             </div>
             <div className="cf-spacer" />
+            {activeId && context && <span className="cf-convtok" title="Total tokens in this conversation right now">{fmtTokens(context.total)}</span>}
+            {usage5h && (
+              <a className="usage-chip" href={usage5h.url} target="_blank" rel="noreferrer" title="Output tokens in the last 5 hours — open the usage dashboard">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><path d="M7 14l4-4 3 3 5-6" /></svg>
+                <span>{fmtTokens(usage5h.output5h)}</span>
+              </a>
+            )}
             {activeId && context && <ContextRing pct={context.percentage} total={context.total} max={context.max} onCompact={doCompact} busy={compacting} estimated={context.estimated} />}
           </div>
         </div>
