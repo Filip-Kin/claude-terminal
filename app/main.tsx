@@ -1,7 +1,7 @@
 // Chat-app front-end. A Claude-app-style UI that drives Claude Code through the
 // headless Agent SDK via the /app* routes in app-server.ts. The terminal stays one
 // click away (the "Terminal" link -> "/").
-import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
 import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
@@ -9,6 +9,7 @@ import { AskCard } from "./askcard";
 import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard } from "./agents";
+import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -30,6 +31,11 @@ const saveFavPending = (m: Record<string, boolean>) => { try { localStorage.setI
 const LASTREAD_LS = "ct-app-lastread";
 const loadLastRead = (): Record<string, number> => { try { const o = JSON.parse(localStorage.getItem(LASTREAD_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };
 const saveLastRead = (m: Record<string, number>) => { try { localStorage.setItem(LASTREAD_LS, JSON.stringify(m)); } catch { /* */ } };
+// Per-conversation composer drafts: an unsent message is kept under its conversation id (null = the new
+// chat) so switching conversations swaps the draft in the box, and a reload keeps it.
+const draftKey = (id: string | null) => "ct-draft:" + (id || "__new__");
+const loadDraft = (id: string | null): string => { try { return localStorage.getItem(draftKey(id)) || ""; } catch { return ""; } };
+const saveDraft = (id: string | null, v: string) => { try { if (v.trim()) localStorage.setItem(draftKey(id), v); else localStorage.removeItem(draftKey(id)); } catch { /* */ } };
 
 // Long-press (touch, ~500ms, cancelled on scroll) or right-click (desktop) → open a context menu at
 // (x, y). Returns handlers to spread onto the target element.
@@ -61,6 +67,7 @@ type AppEvent =
   | { t: "thinking_progress"; tokens: number; _seq?: number }
   | { t: "tool_use"; id: string; name: string; input: unknown; _seq?: number }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean; _seq?: number }
+  | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string; _seq?: number }
   | { t: "compact"; trigger: string; preTokens?: number; postTokens?: number; durationMs?: number; _seq?: number }
   | { t: "compacting"; active: boolean; _seq?: number }
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
@@ -82,7 +89,7 @@ type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; usage?: TurnUsage }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number }
-  | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
+  | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string } }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "notice"; noticeKind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
   | { kind: "compact"; savedTokens?: number; durationMs?: number; pctBefore?: number; pctAfter?: number };
@@ -202,6 +209,14 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
     }
     case "thinking": return [...items, { kind: "thinking", text: e.text }];
     case "tool_use": return [...items, { kind: "tool", id: e.id, name: e.name, input: e.input }];
+    case "agent_progress": {
+      // Attach live subagent progress to its Task tool card (matched by tool_use id).
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (it.kind === "tool" && it.id === e.id) { const c = items.slice(); c[i] = { ...it, progress: { tokens: e.tokens, toolUses: e.toolUses, durationMs: e.durationMs, lastTool: e.lastTool } }; return c; }
+      }
+      return items; // the Task tool_use card hasn't arrived yet -> ignore
+    }
     case "tool_result": {
       for (let i = items.length - 1; i >= 0; i--) {
         const it = items[i];
@@ -274,8 +289,7 @@ class ConvStore {
   touched = Date.now(); // LRU key for evicting idle in-memory stores
   es: EventSource | null = null;
   private pendingEcho: string[] = []; // optimistic user turns awaiting their SSE echo
-  sendState: "sending" | "sent" | "queued" | "failed" | null = null; // status of the latest sent turn (iMessage-style)
-  private sendClear: ReturnType<typeof setTimeout> | null = null;
+  sendState: "sending" | "delivered" | "read" | "queued" | "failed" | null = null; // delivery of the latest sent turn (Google-Messages-style ticks)
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
   private cachedItems: Item[] = [];   // tail-diff baseline for the cache writer
   private lastWrite = 0;
@@ -307,6 +321,8 @@ class ConvStore {
   ingest(e: AppEvent) {
     if (typeof e._seq === "number") { if (e._seq <= this.seq) return; this.seq = e._seq; }
     this.mgr.hooks?.onEvent(this, e);
+    // The agent has "read" our turn the moment it starts producing (fills the delivery ticks).
+    if ((this.sendState === "sending" || this.sendState === "delivered") && (e.t === "text" || e.t === "text_delta" || e.t === "thinking" || e.t === "thinking_delta" || e.t === "thinking_progress" || e.t === "tool_use")) this.setSendState("read");
     switch (e.t) {
       case "init":
         if (e.sessionId && e.sessionId !== this.id) this.mgr.rebind(this, e.sessionId);
@@ -321,7 +337,7 @@ class ConvStore {
       case "user": {
         const clean = sanitizeUserText(e.text);
         const i = this.pendingEcho.indexOf(clean);
-        if (i !== -1) { this.pendingEcho.splice(i, 1); this.setSendState("sent"); return; } // our own optimistic turn echoed back = confirmed delivered
+        if (i !== -1) { this.pendingEcho.splice(i, 1); if (this.sendState === "sending") this.setSendState("delivered"); return; } // our own optimistic turn echoed back = server has it
         const last = this.items[this.items.length - 1];
         if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) return;
         this.items = applyEvent(this.items, e); this.touch(); return;
@@ -338,14 +354,9 @@ class ConvStore {
 
   // ---- mutations from the UI ----
   addOptimisticUser(text: string) { this.pendingEcho.push(text); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
-  // Delivery status for the most-recent turn. "sent" auto-clears after a moment (like a fading
-  // "Delivered"); "queued"/"failed" persist so you can see the message is waiting, not lost.
-  setSendState(s: ConvStore["sendState"]) {
-    this.sendState = s;
-    if (this.sendClear) { clearTimeout(this.sendClear); this.sendClear = null; }
-    if (s === "sent") this.sendClear = setTimeout(() => { this.sendState = null; this.sendClear = null; this.signal(); }, 2500);
-    this.signal();
-  }
+  // Delivery ticks for the most-recent sent turn (Google Messages: 1 tick sending -> 2 ticks delivered
+  // -> 2 filled ticks when the agent reads/starts). Persists on the turn (no fade); a new send resets it.
+  setSendState(s: ConvStore["sendState"]) { this.sendState = s; this.signal(); }
   answerAsk(askId: string, answer: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)); this.touch(); }
   setBusy(b: boolean) { if (this.busy === b) return; this.busy = b; this.signal(); }
   beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
@@ -643,7 +654,25 @@ function parseUserText(text: string): { images: string[]; files: string[]; body:
   return { images: paths.filter((p) => IMG_RE.test(p)), files: paths.filter((p) => !IMG_RE.test(p)), body };
 }
 
-function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant") => void; onOpenArtifact?: (a: Artifact) => void }) {
+// Google-Messages-style delivery ticks, shown only under the bottom-most turn you sent: one tick while
+// sending, two ticks once the server has it, two FILLED (accent) ticks once the agent reads it + starts.
+function SendTicks({ state }: { state: ConvStore["sendState"] }) {
+  if (!state) return null;
+  if (state === "queued") return <span className="ticks queued" title="Waiting to send" aria-label="Waiting to send">🕘</span>;
+  if (state === "failed") return <span className="ticks failed" title="Not sent — will retry" aria-label="Not sent">!</span>;
+  const dbl = state === "delivered" || state === "read";
+  const title = state === "sending" ? "Sending" : state === "delivered" ? "Delivered" : "Read";
+  return (
+    <span className={"ticks" + (state === "read" ? " read" : "")} title={title} aria-label={title}>
+      <svg width={dbl ? 19 : 13} height="12" viewBox={dbl ? "0 0 19 12" : "0 0 13 12"} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M1 6.5L4.3 10L11 2.5" />
+        {dbl && <path d="M7 6.5L10.3 10L17 2.5" />}
+      </svg>
+    </span>
+  );
+}
+
+function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant") => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"] }) {
   const it = items[i];
   // Messages stay natively selectable (so you can highlight part of one to copy). The copy/edit
   // menu is therefore RIGHT-CLICK only (desktop); a mobile long-press does OS text selection, not
@@ -665,6 +694,7 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact }: { 
           {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
           {body && <div className="bubble-user-text">{body}</div>}
         </div>
+        {sendStatus && <div className="send-ticks-row"><SendTicks state={sendStatus} /></div>}
       </div>
     );
   }
@@ -759,9 +789,10 @@ function App() {
   const items = activeStore ? activeStore.items : EMPTY_ITEMS;
   const activeId = activeStore?.id ?? null;
   const busy = activeStore?.busy ?? false;
+  const todos = useMemo(() => latestTodos(items), [items]); // current task checklist (latest TodoWrite), pinned above the composer
   const compacting = activeStore?.compacting ?? false;
   const [model, setModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -802,6 +833,11 @@ function App() {
   const [reachable, setReachable] = useState(true);
   const [queued, setQueued] = useState(0);
   const [artifact, setArtifact] = useState<Artifact | null>(null); // the artifact open in the split-screen / sheet viewer
+  const [artifactW, setArtifactW] = useState<number>(() => { const v = Number(localStorage.getItem("ct-artifact-w")); return v >= 360 && v <= 1400 ? v : 560; }); // desktop split panel width (px), draggable + persisted
+  const artifactDrag = useRef<{ startX: number; startW: number } | null>(null);
+  const onArtifactResizeDown = (e: React.PointerEvent) => { e.preventDefault(); try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { /* */ } artifactDrag.current = { startX: e.clientX, startW: artifactW }; };
+  const onArtifactResizeMove = (e: React.PointerEvent) => { if (!artifactDrag.current) return; const dx = artifactDrag.current.startX - e.clientX; setArtifactW(Math.max(360, Math.min(window.innerWidth - 320, artifactDrag.current.startW + dx))); }; // drag left = wider right panel
+  const onArtifactResizeUp = () => { if (artifactDrag.current) { artifactDrag.current = null; try { localStorage.setItem("ct-artifact-w", String(Math.round(artifactW))); } catch { /* */ } } };
 
   const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the active stream last speak
   const compactQueue = useRef<string[]>([]); // messages typed DURING compaction, sent once it finishes
@@ -976,6 +1012,9 @@ function App() {
   // mtime a beat later — without this, switching away right then would show it falsely unread.
   useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, convs, markRead]);
   useEffect(() => { itemsRef.current = items; }, [items]); // for the context estimate
+  // Persist the composer draft under the current conversation as it changes (so a switch or reload keeps
+  // it). activeIdRef holds the live conversation id; a new chat saves under the "__new__" key.
+  useEffect(() => { saveDraft(activeIdRef.current, input); }, [input]);
   const convsRef = useRef<Conv[]>([]);
   useEffect(() => { convsRef.current = convs; }, [convs]); // latest list for read-marking / lookups
   const busyRef = useRef(false);
@@ -1063,8 +1102,11 @@ function App() {
   };
   const onAppTouchEnd = () => { swipe.current = null; };
 
-  // autoscroll: jump to the end when a conversation is opened, else follow only if near bottom
-  useEffect(() => {
+  // autoscroll: jump to the end when a conversation is opened, else follow only if near bottom.
+  // useLayoutEffect (pre-paint) so a cache->network reconcile re-pins to the bottom BEFORE the browser
+  // paints — otherwise the reconcile paints near the top and this yanks it down a second time (the
+  // visible "scrolls from the top again" jump when opening a cached conversation).
+  useLayoutEffect(() => {
     const el = scrollRef.current; if (!el) return;
     if (highlightRef.current) {
       const q = highlightRef.current.toLowerCase(); highlightRef.current = "";
@@ -1167,9 +1209,11 @@ function App() {
   // continuously, so a switch is a pointer change — no reconnect, no re-fetch when it's already in memory.
   const loadConv = useCallback(async (id: string, highlight?: string) => {
     activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
+    const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
     const s = manager.ensure(id);
     setActiveStore(s); activeStoreRef.current = s;
     activeIdRef.current = id;
+    if (switching) setInput(loadDraft(id)); // swap the composer to this conversation's saved draft
     setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
     stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
     setDrawer(false);
@@ -1199,7 +1243,7 @@ function App() {
     } finally { if (activeStoreRef.current === s) setLoadingConv(false); }
   }, [defaultCwd]);
 
-  const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
+  const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
   // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
   // to drain into a real conversation. A pending- store never caches or connects.
@@ -1321,9 +1365,9 @@ function App() {
     try {
       // withTimeout so a hung request on a weak link fails fast into the queue instead of sitting
       // "sending" forever. A redelivery is deduped by cid, so the timeout can't double-send.
-      if (s!.connected && !s!.id.startsWith("new-")) { await withTimeout(api.send({ id: s!.id, text, cid })); s!.setSendState("sent"); return s!.id; }
+      if (s!.connected && !s!.id.startsWith("new-")) { await withTimeout(api.send({ id: s!.id, text, cid })); if (s!.sendState === "sending") s!.setSendState("delivered"); return s!.id; }
       const r = await withTimeout(api.start(body));
-      if (r?.id) { manager.rebind(s!, r.id); activeIdRef.current = r.id; s!.connect(false); s!.setSendState("sent"); return r.id; }
+      if (r?.id) { manager.rebind(s!, r.id); activeIdRef.current = r.id; s!.connect(false); if (s!.sendState === "sending") s!.setSendState("delivered"); return r.id; }
       s!.setBusy(false); return null;
     } catch { await queue(); return null; } // network died / timed out mid-send -> queue for reconnect
   }, []);
@@ -1641,9 +1685,12 @@ function App() {
               {(() => {
                 const nodes: React.ReactNode[] = [];
                 // Plain tools collapse into an accordion; subagent/workflow (Task) tools stay standalone
-                // so they render as their own rich activity card.
-                const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input);
+                // (rich activity card); TodoWrite is hidden here (the pinned checklist replaces it).
+                const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name);
+                let lastUserIdx = -1; for (let k = items.length - 1; k >= 0; k--) if (items[k].kind === "user") { lastUserIdx = k; break; }
                 for (let i = 0; i < items.length; i++) {
+                  const cur = items[i];
+                  if (cur.kind === "tool" && isTodoTool((cur as Extract<Item, { kind: "tool" }>).name)) continue; // pinned checklist replaces the inline card
                   if (isPlainTool(items[i])) {
                     let j = i; const run: Extract<Item, { kind: "tool" }>[] = [];
                     while (j < items.length && isPlainTool(items[j])) { run.push(items[j] as Extract<Item, { kind: "tool" }>); j++; }
@@ -1652,20 +1699,12 @@ function App() {
                       i = j - 1; continue;
                     }
                   }
-                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} />);
+                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? (activeStore?.sendState ?? null) : null} />);
                 }
                 return nodes;
               })()}
               {compacting && <CompactionBanner start={activeStore?.compactStart ?? 0} />}
               {busy && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
-              {activeStore?.sendState && items[items.length - 1]?.kind === "user" && (
-                <div className={"send-status " + activeStore.sendState}>
-                  {activeStore.sendState === "sending" ? "Sending…"
-                    : activeStore.sendState === "sent" ? "Sent"
-                    : activeStore.sendState === "queued" ? "Queued — sends when you reconnect"
-                    : "Not sent — will retry"}
-                </div>
-              )}
             </div>
           )}
         </div>
@@ -1676,6 +1715,7 @@ function App() {
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M6 13l6 6 6-6" /></svg>
             </button>
           )}
+          {todos && <TodoChecklist todos={todos} />}
           <div className="composer">
             {attachments.length > 0 && (
               <div className="attach-row">
@@ -1749,7 +1789,10 @@ function App() {
       {artifact && (
         window.matchMedia("(max-width: 820px)").matches
           ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={() => setArtifact(null)} />
-          : <div className="artifact-panel"><ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} /></div>
+          : <div className="artifact-panel" style={{ flex: `0 0 ${artifactW}px` }}>
+              <div className="artifact-resizer" onPointerDown={onArtifactResizeDown} onPointerMove={onArtifactResizeMove} onPointerUp={onArtifactResizeUp} onPointerCancel={onArtifactResizeUp} title="Drag to resize" aria-label="Resize artifact panel" />
+              <ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} />
+            </div>
       )}
       {msgMenu && (
         <>

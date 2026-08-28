@@ -21,6 +21,7 @@ export type AppEvent =
   | { t: "thinking_progress"; tokens: number } // thinking is happening but text is redacted (subscription auth): show progress
   | { t: "tool_use"; id: string; name: string; input: unknown }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
+  | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string } // live subagent progress, keyed by the Task tool_use id
   | { t: "compact"; trigger: "manual" | "auto"; preTokens?: number; postTokens?: number; durationMs?: number } // a compaction finished; metadata drives the "freed Nk" card
   | { t: "compacting"; active: boolean } // compaction started/stopped (drives the progress banner, incl. auto-compaction)
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
@@ -325,6 +326,10 @@ export class Conversation {
         }
         // Background subagent activity + cross-session messages, surfaced inline so the thread
         // shows work spun off to other agents (Claude Code's task/notification stream).
+        else if (anyM.subtype === "task_progress" && anyM.tool_use_id) {
+          const u = anyM.usage || {};
+          this.emit({ t: "agent_progress", id: String(anyM.tool_use_id), tokens: u.total_tokens, toolUses: u.tool_uses, durationMs: u.duration_ms, lastTool: anyM.last_tool_name, subagentType: anyM.subagent_type, description: anyM.description });
+        }
         else if (anyM.subtype === "task_started") this.emit({ t: "notice", kind: "task", text: String(anyM.description || "background task"), status: "started" });
         else if (anyM.subtype === "task_notification") {
           const extra = anyM.usage ? ` (${anyM.usage.total_tokens || 0} tokens, ${anyM.usage.tool_uses || 0} tools)` : "";

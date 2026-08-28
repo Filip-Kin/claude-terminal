@@ -144,18 +144,20 @@ function AgentIcon({ workflow }: { workflow: boolean }) {
 // #endregion
 
 // #region card
+export interface AgentProgress { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }
 export interface AgentActivityCardProps {
   toolUse: AgentToolUse;
   toolResult?: AgentToolResult;
   running?: boolean; // explicit override; defaults to "no result yet"
   defaultOpen?: boolean;
+  progress?: AgentProgress; // live subagent progress (real tokens/tools/duration) when available
 }
 
 // The rich activity card. Header: agent/workflow icon, type + description (or workflow name), a
 // status pill (Running… / Done / Failed) and an estimated token count. Body (collapsible): the task
 // prompt, an optional phase list, and the final result output (markdown-rendered when it looks like
 // markdown, else preformatted).
-export function AgentActivityCard({ toolUse, toolResult, running, defaultOpen }: AgentActivityCardProps) {
+export function AgentActivityCard({ toolUse, toolResult, running, defaultOpen, progress }: AgentActivityCardProps) {
   injectAgentCss();
   const fields = useMemo(() => parseAgentTool(toolUse.name, toolUse.input), [toolUse.name, toolUse.input]);
   const [open, setOpen] = useState(!!defaultOpen);
@@ -194,7 +196,9 @@ export function AgentActivityCard({ toolUse, toolResult, running, defaultOpen }:
           {isRunning && <span className="agent-spin" />}
           {statusLabel}
         </span>
-        {est > 0 && <span className="agent-tok" title="Estimated tokens (brief + result)">~{fmtTokens(est)}</span>}
+        {progress && (progress.tokens || progress.toolUses)
+          ? <span className="agent-tok" title="Live: tokens · tools · elapsed">{fmtTokens(progress.tokens || 0)}{progress.toolUses ? ` · ${progress.toolUses} tools` : ""}{progress.durationMs ? ` · ${Math.round(progress.durationMs / 1000)}s` : ""}</span>
+          : est > 0 ? <span className="agent-tok" title="Estimated tokens (brief + result)">~{fmtTokens(est)}</span> : null}
       </button>
       {open && (
         <div className="agent-body">
@@ -244,13 +248,14 @@ export interface MergedToolItem {
   input: unknown;
   result?: unknown;
   isError?: boolean;
+  progress?: AgentProgress; // live subagent progress merged on by main.tsx (agent_progress event)
 }
 
 // Drop-in replacement for <ToolCard> when the tool is a subagent/workflow. main.tsx can, in its
 // item-render switch, check isAgentTool(it.name, it.input) and render this instead of <ToolCard>.
 export function AgentToolCard({ it }: { it: MergedToolItem }) {
   const toolResult = it.result === undefined ? undefined : { content: it.result, isError: it.isError };
-  return <AgentActivityCard toolUse={{ id: it.id, name: it.name, input: it.input }} toolResult={toolResult} running={it.result === undefined} />;
+  return <AgentActivityCard toolUse={{ id: it.id, name: it.name, input: it.input }} toolResult={toolResult} running={it.result === undefined} progress={it.progress} />;
 }
 // #endregion
 

@@ -367,13 +367,16 @@ a { color: var(--accent-2); }
 .net-banner { flex: 0 0 auto; text-align: center; font-size: 12.5px; padding: 7px 14px; background: #3a2c17; color: #f0cf9c; border-bottom: 1px solid var(--line-2); }
 .net-banner.sending { background: #24201b; color: var(--text-2); }
 .net-banner.warn { background: #3a2c17; color: #f0cf9c; }
-.send-status { align-self: flex-end; max-width: 88%; margin: -2px 2px 2px 0; font-size: 11px; color: var(--text-3); text-align: right; }
-.send-status.queued { color: #f0cf9c; }
-.send-status.failed { color: var(--error, #EF4444); }
-.send-status.sent { color: #10B981; }
+.send-ticks-row { display: flex; justify-content: flex-end; margin: 1px 3px 2px 0; }
+.ticks { display: inline-flex; align-items: center; height: 12px; color: var(--text-3); transition: color .2s; }
+.ticks.read { color: var(--accent); }
+.ticks.queued { color: #F59E0B; font-size: 11px; line-height: 1; }
+.ticks.failed { color: var(--error, #EF4444); font-weight: 700; font-size: 12px; line-height: 1; }
 /* Desktop split-screen: the artifact viewer sits as a resizable-ish right column beside the chat. On
    mobile the viewer renders as a full-screen sheet (position:fixed) so this panel is never used there. */
-.artifact-panel { flex: 0 0 clamp(340px, 44%, 660px); min-width: 0; display: flex; border-left: 1px solid var(--line); overflow: hidden; }
+.artifact-panel { position: relative; flex: 0 0 560px; min-width: 0; display: flex; border-left: 1px solid var(--line); overflow: hidden; }
+.artifact-resizer { position: absolute; left: 0; top: 0; bottom: 0; width: 9px; margin-left: -5px; cursor: col-resize; z-index: 6; touch-action: none; }
+.artifact-resizer:hover, .artifact-resizer:active { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 
 /* ask_user card (Claude asks with tappable options) */
 .ask-card { align-self: stretch; background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin: 0 0 14px; }
