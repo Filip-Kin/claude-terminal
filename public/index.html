@@ -126,6 +126,14 @@
     <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="updated">loading</span></span></div>
   </header>
 
+  <!-- Shared claude.ai subscription limit (session 5h + weekly 7d). Hidden until data exists. -->
+  <div class="panel" id="subPanel" style="display:none">
+    <h2>Session limit</h2>
+    <p id="subNote">The rolling 5-hour session limit and the 7-day weekly limit, shared across everyone on this box.</p>
+    <div class="util" id="subUtil"></div>
+    <div class="billfoot" id="subFoot"></div>
+  </div>
+
   <div class="cards" id="cards"></div>
 
   <div class="panel bill" id="billPanel">
@@ -381,11 +389,51 @@ function refresh(d){
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
 }
 
+// #region Shared subscription limit (session 5h + weekly 7d)
+function subColor(u){ if(u==null) return "var(--muted)"; if(u>=85) return "#ef4444"; if(u>=60) return "#f59e0b"; return "#22c55e"; }
+function untilStr(iso){
+  if(!iso) return "";
+  const t = Date.parse(iso); if(isNaN(t)) return "";
+  let s = Math.round((t - Date.now())/1000);
+  if(s<=0) return "resetting now";
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
+  if(h>=1) return "resets in "+h+"h "+m+"m";
+  if(m>=1) return "resets in "+m+"m";
+  return "resets in <1m";
+}
+function subCell(label, win){
+  const u = win && typeof win.utilization==="number" ? win.utilization : null;
+  const pct = u==null ? 0 : Math.max(0,Math.min(100,u));
+  const col = subColor(u);
+  const left = u==null ? "" : Math.max(0,100-Math.round(u))+"% left";
+  return '<div class="u">'
+    + '<div class="ul"><span>'+label+'</span><b>'+(u==null?"–":Math.round(u)+"%")+'</b></div>'
+    + '<div class="track"><span style="width:'+pct+'%;background:'+col+'"></span></div>'
+    + '<div class="ul" style="margin:8px 0 0"><span>'+left+'</span><span>'+untilStr(win&&win.resets_at)+'</span></div>'
+    + '</div>';
+}
+function renderSubscription(d){
+  const p = d && d.subscription;
+  const panel = document.getElementById("subPanel");
+  if(!panel) return;
+  if(!p || (!p.five_hour && !p.seven_day)){ panel.style.display="none"; return; }
+  panel.style.display="";
+  document.getElementById("subUtil").innerHTML =
+    subCell("Session (5h)", p.five_hour) + subCell("Weekly (7d)", p.seven_day);
+  const n = p.active_users, foot = document.getElementById("subFoot");
+  if(typeof n==="number" && n>0){
+    foot.style.display="";
+    foot.textContent = n===1 ? "1 person active on this box right now." : n+" people sharing this limit right now.";
+  } else { foot.style.display="none"; }
+}
+// #endregion
+
 async function load(first){
   try {
     const r = await fetch("api?t="+Date.now(), {cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const d = await r.json(); DATA = d;
+    renderSubscription(d);
     const s = sig(d);
     if(first || s !== lastSig){ lastSig = s; build(d); }
     else refresh(d);

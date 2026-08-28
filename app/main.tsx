@@ -81,9 +81,9 @@ type AppEvent =
 
 type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
 
-// claude.ai plan rate-limit windows (the real "session limit"), from the SDK /usage API.
-type PlanWin = { utilization: number | null; resetsAt: string | null };
-type Plan = { available: boolean; subscription: string | null; fiveHour: PlanWin | null; sevenDay: PlanWin | null } | null;
+// claude.ai subscription rate-limit windows (the real "session limit"), from the SDK /usage API.
+type SubscriptionWin = { utilization: number | null; resetsAt: string | null };
+type Subscription = { available: boolean; subscription: string | null; fiveHour: SubscriptionWin | null; sevenDay: SubscriptionWin | null } | null;
 
 type Item =
   | { kind: "user"; text: string }
@@ -538,28 +538,28 @@ function fmtResetIn(iso?: string | null): string {
   return hr ? `${d}d ${hr}h` : `${d}d`;
 }
 
-// Plan session-limit chip: how much of the claude.ai 5-hour rate-limit window is used, plus when it
-// resets. Colour is status-only feedback (amber ≥80%, red ≥95%). Weekly window sits in the tooltip.
-function PlanChip({ plan, url }: { plan: Plan; url?: string }) {
-  if (!plan?.available || !plan.fiveHour || plan.fiveHour.utilization == null) return null;
-  const u = Math.round(plan.fiveHour.utilization);
+// Subscription session-limit chip: how much of the claude.ai 5-hour rate-limit window is used, plus
+// when it resets. Colour is status-only feedback (amber ≥80%, red ≥95%). Weekly window in the tooltip.
+function SubscriptionChip({ sub, url }: { sub: Subscription; url?: string }) {
+  if (!sub?.available || !sub.fiveHour || sub.fiveHour.utilization == null) return null;
+  const u = Math.round(sub.fiveHour.utilization);
   const cls = u >= 95 ? " crit" : u >= 80 ? " warn" : "";
-  const resetIn = fmtResetIn(plan.fiveHour.resetsAt);
-  const weekU = plan.sevenDay?.utilization != null ? Math.round(plan.sevenDay.utilization) : null;
-  const weekReset = fmtResetIn(plan.sevenDay?.resetsAt);
-  const title = `Plan session limit (5-hour window): ${u}% used${resetIn ? `, resets in ${resetIn}` : ""}`
+  const resetIn = fmtResetIn(sub.fiveHour.resetsAt);
+  const weekU = sub.sevenDay?.utilization != null ? Math.round(sub.sevenDay.utilization) : null;
+  const weekReset = fmtResetIn(sub.sevenDay?.resetsAt);
+  const title = `Subscription session limit (5-hour window): ${u}% used${resetIn ? `, resets in ${resetIn}` : ""}`
     + (weekU != null ? `\nWeekly limit: ${weekU}% used${weekReset ? `, resets in ${weekReset}` : ""}` : "")
     + "\nOpen the usage dashboard";
   const body = (
     <>
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></svg>
       <span>{u}%</span>
-      {resetIn && <i className="plan-reset">{resetIn}</i>}
+      {resetIn && <i className="sub-reset">{resetIn}</i>}
     </>
   );
   return url
-    ? <a className={"plan-chip" + cls} href={url} target="_blank" rel="noreferrer" title={title}>{body}</a>
-    : <span className={"plan-chip" + cls} title={title}>{body}</span>;
+    ? <a className={"sub-chip" + cls} href={url} target="_blank" rel="noreferrer" title={title}>{body}</a>
+    : <span className={"sub-chip" + cls} title={title}>{body}</span>;
 }
 
 // Shown while a compaction runs (manual click or the /compact turn). The SDK doesn't expose an
@@ -806,7 +806,10 @@ function App() {
   const itemsRef = useRef<Item[]>([]);
   const [loadingConv, setLoadingConv] = useState(false);
   const [usage5h, setUsage5h] = useState<{ output5h: number; url: string } | null>(null);
-  const [plan, setPlan] = useState<Plan>(null);
+  const [subscription, setSubscription] = useState<Subscription>(null);
+  // Shared subscription session-limit warning toast (5h limit high AND the box is contended).
+  const [limitToast, setLimitToast] = useState<{ left: number; resetIn: string; n: number } | null>(null);
+  const limitDismissed = useRef(false);
   const [statuses, setStatuses] = useState<Record<string, { busy: boolean; waiting: boolean }>>({});
   const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
@@ -992,7 +995,23 @@ function App() {
   useEffect(() => {
     const pull = () => api.usage().then((d) => {
       setUsage5h(d?.available ? { output5h: d.output5h, url: d.url } : null);
-      setPlan(d?.plan?.available ? d.plan : null);
+      const s = d?.subscription?.available ? d.subscription : null;
+      setSubscription(s);
+      // Warn the person currently using the app when the SHARED 5h session limit is high and the
+      // box is contended. activeUsers is null on a guest sidecar (no DB) -> treat as contended so
+      // guests still see it. Shows once per episode; re-arms when the condition clears.
+      const warnPct = typeof d?.warnPct === "number" ? d.warnPct : 70;
+      const n: number | null = typeof d?.activeUsers === "number" ? d.activeUsers : null;
+      const contended = n == null ? true : n >= 2;
+      const u = s?.fiveHour?.utilization;
+      if (typeof u === "number" && u >= warnPct && contended) {
+        if (!limitDismissed.current) {
+          setLimitToast({ left: Math.max(0, 100 - Math.round(u)), resetIn: fmtResetIn(s!.fiveHour!.resetsAt), n: n ?? 0 });
+        }
+      } else {
+        limitDismissed.current = false;
+        setLimitToast(null);
+      }
     }).catch(() => {});
     pull(); const t = setInterval(pull, 60000); const t2 = setTimeout(pull, 5000);
     return () => { clearInterval(t); clearTimeout(t2); };
@@ -1530,6 +1549,16 @@ function App() {
           <button className="ut-dismiss" onClick={() => setUpdateAvail(false)} aria-label="Dismiss">×</button>
         </div>
       )}
+      {limitToast && (
+        <div className="limit-toast" role="status">
+          <svg className="lt-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /></svg>
+          <span>
+            Close to the session limit — about {limitToast.left}% left{limitToast.resetIn && limitToast.resetIn !== "now" ? `, resets in ${limitToast.resetIn}` : ""}.
+            {limitToast.n >= 2 ? ` ${limitToast.n} people are sharing it right now.` : ""}
+          </span>
+          <button className="ut-dismiss" onClick={() => { limitDismissed.current = true; setLimitToast(null); }} aria-label="Dismiss">×</button>
+        </div>
+      )}
       {otherOpen && (
         <div className="modal-scrim" onClick={() => setOtherOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -1782,6 +1811,7 @@ function App() {
                 <span>{fmtTokens(usage5h.output5h)}</span>
               </a>
             )}
+            <SubscriptionChip sub={subscription} url={usage5h?.url} />
             {activeId && context && <ContextRing pct={context.percentage} total={context.total} max={context.max} onCompact={doCompact} busy={compacting} estimated={context.estimated} />}
           </div>
         </div>

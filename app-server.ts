@@ -7,7 +7,7 @@
 
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getPlanUsage, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getSubscriptionUsage, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -40,6 +40,8 @@ export interface AppCtx {
   ttsUrl?: string; // local Kokoro service base URL (loopback); enables voice out
   notifyAsk?: AskNotifier; // push a PWA notification when Claude asks and no client is watching
   ownerUsage?: () => { output5h: number; url: string } | null; // rolling 5h output + link to the usage page
+  activeUsers?: () => number | null; // local users active on this box in the last ~15 min (null = unknown, e.g. guest sidecar with no DB)
+  subscriptionWarnPct?: number; // 5-hour utilisation at/above which the shared-limit toast fires (config.subscriptionWarnPct)
 }
 
 // #region send idempotency — dedupe a retried/redelivered turn by its client-supplied cid, so a flaky
@@ -324,12 +326,14 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     return jsonRes({ statuses: liveStatuses() }, ctx, req);
   }
   // Owner's rolling 5-hour output tokens + a link to the full usage page (terminal-side dashboard),
-  // plus the claude.ai plan rate-limit windows (the real "session limit" — 5-hour + weekly), sourced
-  // live from the SDK /usage API. `plan` is null until the first background fetch lands.
+  // plus the claude.ai subscription rate-limit windows (the real "session limit" — 5-hour + weekly),
+  // sourced live from the SDK /usage API. `subscription` is null until the first background fetch lands.
   if (req.method === "GET" && path === "/app/api/usage") {
     const u = ctx.ownerUsage?.();
-    const plan = getPlanUsage();
-    return jsonRes({ ...(u ? { available: true, ...u } : { available: false }), plan }, ctx, req);
+    const subscription = getSubscriptionUsage();
+    const activeUsers = ctx.activeUsers?.() ?? null;
+    const warnPct = ctx.subscriptionWarnPct ?? 70;
+    return jsonRes({ ...(u ? { available: true, ...u } : { available: false }), subscription, activeUsers, warnPct }, ctx, req);
   }
 
   if (req.method === "GET" && path === "/app/api/favorites") {

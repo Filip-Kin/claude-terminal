@@ -134,6 +134,35 @@ function ensureExt() {
 }
 const extKey = (peer: string, user: string) => "ext_" + `${peer}_${user}`.replace(/[^A-Za-z0-9_]/g, "_");
 
+// Latest claude.ai subscription rate-limit snapshot (the SHARED session + weekly limit everyone
+// on this box draws down, written by subscription-collector.ts). Prepared lazily because
+// subscription_samples only exists once a collector carrying that schema has run; a vanilla/old
+// DB simply reports nothing. Returns the most recent sample, or null when unavailable.
+let qSub: any = null;
+let qSubChecked = false;
+function latestSubscription() {
+  if (!db) return null;
+  if (!qSubChecked) {
+    qSubChecked = true;
+    try {
+      const t = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='subscription_samples'").get();
+      if (t) qSub = db.query("SELECT * FROM subscription_samples ORDER BY ts DESC LIMIT 1");
+    } catch { qSub = null; }
+  }
+  if (!qSub) return null;
+  try {
+    const r = qSub.get() as any;
+    if (!r) return null;
+    return {
+      subscription: r.subscription ?? null,
+      five_hour: { utilization: r.five_hour_util ?? null, resets_at: r.five_hour_reset ?? null },
+      seven_day: { utilization: r.seven_day_util ?? null, resets_at: r.seven_day_reset ?? null },
+      active_users: r.active_users ?? null,
+      sampled_at: r.ts ?? null,
+    };
+  } catch { return null; }
+}
+
 // A portable snapshot of THIS instance's usage for a trusted peer to pull. Raw hourly
 // buckets (last 45 days) + cumulative + meta per local user, so the puller reconstructs
 // the same gauges against its own clock. Only local users are exported (external users
@@ -273,6 +302,7 @@ function buildLeaderboard() {
     window_hours: ROLLING_HOURS, gauge_max: GAUGE_MAX, subscription_usd: SUBSCRIPTION_USD,
     month_label: monthLabel(monthPrefix), current_month: monthPrefix,
     months, hour_ms, spark_hours: SPARK_HOURS, users,
+    subscription: latestSubscription(),
   };
 }
 
@@ -593,6 +623,22 @@ const appCtx: AppCtx = {
       return { output5h: rolling(hours, "output", new Date(), 5), url: cfg.usageUrl || "/usage/" };
     } catch { return null; }
   },
+  // Count of LOCAL users active in the last ~15 min (same window the board uses). The shared
+  // plan limit is account-wide, so "2+ active" means the session limit is genuinely contended.
+  activeUsers: () => {
+    if (!db) return null; // no usage DB (guest sidecar): count is unknown, not zero
+    try {
+      const now = Date.now();
+      let n = 0;
+      for (const { user } of qUsers.all() as any[]) {
+        const meta = qMeta.get(user) as any;
+        const t = meta?.last_activity ? Date.parse(meta.last_activity) : NaN;
+        if (!isNaN(t) && now - t <= ACTIVE_MS) n++;
+      }
+      return n;
+    } catch { return null; }
+  },
+  subscriptionWarnPct: Number(cfg.subscriptionWarnPct) || 70,
   // Hands-free voice: loopback Whisper (STT) + Kokoro (TTS) sidecars. Present only when
   // configured, so a vanilla install (and guest sidecars) simply never show the mic.
   sttUrl: cfg.sttUrl || (cfg.voice ? "http://127.0.0.1:7801" : undefined),

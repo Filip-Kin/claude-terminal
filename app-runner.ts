@@ -525,26 +525,26 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
 }
 // #endregion
 
-// #region plan usage (claude.ai subscription rate-limit windows — the data behind `/usage`)
+// #region subscription usage (claude.ai subscription rate-limit windows — the data behind `/usage`)
 // A single long-lived control query, opened lazily, purely to call the SDK usage API. It never
 // sends a turn (no tokens spent) and runs in a /tmp cwd whose `-tmp-*` project the conversation
-// list already excludes, so it never pollutes the sidebar. getPlanUsage() is non-blocking: it
-// returns the cached snapshot immediately and refreshes it in the background when stale.
-export interface PlanWindow { utilization: number | null; resetsAt: string | null }
-export interface PlanUsage { available: boolean; subscription: string | null; fiveHour: PlanWindow | null; sevenDay: PlanWindow | null; fetchedAt: number }
+// list already excludes, so it never pollutes the sidebar. getSubscriptionUsage() is non-blocking:
+// it returns the cached snapshot immediately and refreshes it in the background when stale.
+export interface SubscriptionWindow { utilization: number | null; resetsAt: string | null }
+export interface SubscriptionUsage { available: boolean; subscription: string | null; fiveHour: SubscriptionWindow | null; sevenDay: SubscriptionWindow | null; fetchedAt: number }
 
-const PLAN_CWD = "/tmp/ct-usage"; // -tmp-ct-usage project -> excluded from the conversation list
-const PLAN_TTL = 90_000; // a rate-limit window moves slowly; 90s is plenty fresh
+const SUB_CWD = "/tmp/ct-usage"; // -tmp-ct-usage project -> excluded from the conversation list
+const SUB_TTL = 90_000; // a rate-limit window moves slowly; 90s is plenty fresh
 let ctrlQuery: any = null;
 let ctrlReady: Promise<void> | null = null;
-let planCache: PlanUsage | null = null;
-let planRefreshing = false;
+let subCache: SubscriptionUsage | null = null;
+let subRefreshing = false;
 
 function startControlQuery() {
-  try { mkdirSync(PLAN_CWD, { recursive: true }); } catch { /* */ }
+  try { mkdirSync(SUB_CWD, { recursive: true }); } catch { /* */ }
   let release = () => {};
   const gen = (async function* (): AsyncGenerator<SDKUserMessage> { await new Promise<void>((r) => { release = r; }); })();
-  const q: any = query({ prompt: gen, options: { cwd: PLAN_CWD, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
+  const q: any = query({ prompt: gen, options: { cwd: SUB_CWD, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
   ctrlQuery = q;
   ctrlReady = new Promise<void>((resolve) => {
     (async () => {
@@ -555,25 +555,25 @@ function startControlQuery() {
   });
 }
 
-async function refreshPlanUsage(): Promise<void> {
-  if (planRefreshing) return;
-  planRefreshing = true;
+async function refreshSubscriptionUsage(): Promise<void> {
+  if (subRefreshing) return;
+  subRefreshing = true;
   try {
     if (!ctrlQuery) startControlQuery();
     await Promise.race([ctrlReady, new Promise((r) => setTimeout(r, 8000))]);
     if (!ctrlQuery) return;
     const u: any = await ctrlQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
     const rl = u?.rate_limits || {};
-    const win = (w: any): PlanWindow | null => (w ? { utilization: typeof w.utilization === "number" ? w.utilization : null, resetsAt: w.resets_at || null } : null);
-    planCache = { available: !!u?.rate_limits_available, subscription: u?.subscription_type || null, fiveHour: win(rl.five_hour), sevenDay: win(rl.seven_day), fetchedAt: Date.now() };
+    const win = (w: any): SubscriptionWindow | null => (w ? { utilization: typeof w.utilization === "number" ? w.utilization : null, resetsAt: w.resets_at || null } : null);
+    subCache = { available: !!u?.rate_limits_available, subscription: u?.subscription_type || null, fiveHour: win(rl.five_hour), sevenDay: win(rl.seven_day), fetchedAt: Date.now() };
   } catch { /* keep the last snapshot */ }
-  finally { planRefreshing = false; }
+  finally { subRefreshing = false; }
 }
 
 // Non-blocking: returns whatever we have now and kicks a background refresh when the snapshot is
 // missing or stale. The first-ever call returns null; the value lands on a subsequent poll.
-export function getPlanUsage(): PlanUsage | null {
-  if (!planCache || Date.now() - planCache.fetchedAt > PLAN_TTL) void refreshPlanUsage();
-  return planCache;
+export function getSubscriptionUsage(): SubscriptionUsage | null {
+  if (!subCache || Date.now() - subCache.fetchedAt > SUB_TTL) void refreshSubscriptionUsage();
+  return subCache;
 }
 // #endregion

@@ -5,6 +5,8 @@
   "db": "/var/lib/claude-terminal/usage.db",
   "usagePage": true,
   "subscriptionUsd": 0,
+  "subscriptionWarnPct": 70,
+  "subscriptionActiveWindowMin": 10,
   "collectSeconds": 60,
   "historyHide": [
     "/path/to/an/automation/cwd"

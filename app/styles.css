@@ -252,12 +252,23 @@ a { color: var(--accent-2); }
 .usage-chip:hover { background: var(--bg-2); color: var(--text); }
 .cf-convtok { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
 /* Plan session-limit chip (5-hour claude.ai window). Muted by default; status colour only as it fills. */
-.plan-chip { display: inline-flex; align-items: center; gap: 4px; color: var(--text-3); text-decoration: none; font-size: 11.5px; padding: 5px 7px; border-radius: 8px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
-.plan-chip:hover { background: var(--bg-2); color: var(--text); }
-.plan-chip .plan-reset { color: var(--text-3); font-style: normal; font-size: 10.5px; opacity: 0.75; }
-.plan-chip.warn { color: var(--warning); }
-.plan-chip.crit { color: var(--error); }
-.plan-chip.warn .plan-reset, .plan-chip.crit .plan-reset { color: inherit; opacity: 0.8; }
+.sub-chip { display: inline-flex; align-items: center; gap: 4px; color: var(--text-3); text-decoration: none; font-size: 11.5px; padding: 5px 7px; border-radius: 8px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+.sub-chip:hover { background: var(--bg-2); color: var(--text); }
+.sub-chip .sub-reset { color: var(--text-3); font-style: normal; font-size: 10.5px; opacity: 0.75; }
+.sub-chip.warn { color: var(--warning); }
+.sub-chip.crit { color: var(--error); }
+.sub-chip.warn .sub-reset, .sub-chip.crit .sub-reset { color: inherit; opacity: 0.8; }
+
+/* Shared subscription session-limit toast: fires when the 5h limit is high and the box is contended. */
+.limit-toast {
+  position: fixed; z-index: 60; left: 50%; top: 14px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 12px; max-width: calc(100vw - 28px);
+  background: var(--bg-3); border: 1px solid var(--warning); border-radius: 12px;
+  padding: 10px 12px 10px 16px; box-shadow: 0 14px 40px rgba(0,0,0,.55); font-size: 13.5px; color: var(--text);
+}
+.limit-toast .lt-ico { color: var(--warning); flex: 0 0 auto; }
+.limit-toast .ut-dismiss { background: transparent; border: none; color: var(--text-3); font-size: 18px; line-height: 1; padding: 0 2px; }
+.limit-toast .ut-dismiss:hover { color: var(--text); }
 .notice { display: flex; align-items: flex-start; gap: 8px; margin: 6px 0; padding: 7px 10px; border-radius: 8px; font-size: 12.5px; background: var(--bg-2); border: 1px solid var(--line); color: var(--text-2); }
 .notice-ic { flex: 0 0 auto; opacity: .8; }
 .notice-peer { border-color: var(--accent); }

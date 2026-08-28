@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { openDb } from "./db.ts";
 import { sampleCloudCost } from "./cost-collector.ts";
 import { sampleExternalPeers } from "./external-collector.ts";
-import { samplePlanUsage } from "./plan-collector.ts";
+import { sampleSubscriptionUsage } from "./subscription-collector.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -213,13 +213,13 @@ try {
   console.error("cloud cost sample failed:", e);
 }
 
-// Plan-usage sample: record the claude.ai session (5h) + weekly (7d) rate-limit utilization
-// alongside the concurrent account-wide cumulative output, into the plan_samples table. Runs
-// last (needs the fresh cumulative/meta this tick just wrote) and is non-fatal: a stopped
-// service or missing plan data must never disturb token collection.
+// Subscription-usage sample: record the claude.ai session (5h) + weekly (7d) rate-limit
+// utilisation alongside the concurrent account-wide cumulative output, into the
+// subscription_samples table. Runs last (needs the fresh cumulative/meta this tick just wrote)
+// and is non-fatal: a stopped service or missing subscription data must never disturb collection.
 try {
-  await samplePlanUsage(CONFIG_PATH);
+  await sampleSubscriptionUsage(CONFIG_PATH);
 } catch (e) {
-  console.error("plan usage sample failed:", e);
+  console.error("subscription usage sample failed:", e);
 }
 
