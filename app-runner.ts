@@ -29,7 +29,7 @@ export type AppEvent =
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage }
   // A background/peer event surfaced in the thread: a subagent task settling, or a message from
   // another of Filip's running sessions (peer-send-message). kind drives how it renders.
-  | { t: "notice"; kind: "task" | "peer" | "info"; text: string; from?: string; status?: string }
+  | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
   | { t: "busy"; busy: boolean }
   | { t: "error"; message: string }
   | { t: "closed" };
@@ -51,6 +51,18 @@ const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; you
 export function decorateVoiceTurn(text: string): string { return `${text}\n\n<voice-mode>${VOICE_DIRECTIVE}</voice-mode>`; }
 const VOICE_STRIP = /\s*<voice-mode>[\s\S]*?<\/voice-mode>\s*$/;
 // #endregion
+
+// When Claude loads a skill, its whole body is injected as a user message that starts with
+// "Base directory for this skill: <path>/<name>". We render a small "loaded skill" card instead of
+// the full text (which otherwise looks like the user pasted the entire skill file). Returns the
+// skill's name, or null when the text isn't a skill load.
+function skillLoadName(txt: string): string | null {
+  if (!txt.startsWith("Base directory for this skill:")) return null;
+  const m = /^Base directory for this skill:\s*(.+)$/m.exec(txt);
+  if (!m) return null;
+  const p = m[1].trim().replace(/[/\\]+$/, "");
+  return p.split(/[/\\]/).pop() || p;
+}
 
 function textOfContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -323,6 +335,10 @@ export class Conversation {
         // tool_result blocks come back as a user message
         const c = anyM.message?.content;
         if (Array.isArray(c)) for (const b of c) if (b?.type === "tool_result") { if (this.askToolUseIds.has(b.tool_use_id)) continue; this.emit({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error }); }
+        // A loaded skill is injected as a user text message ("Base directory for this skill: ...");
+        // surface it as a compact card instead of dumping the whole skill file into the thread.
+        const sk = skillLoadName(textOfContent(c));
+        if (sk) this.emit({ t: "notice", kind: "skill", text: sk });
         break;
       }
       case "result": {
@@ -430,7 +446,9 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         }
       }
       const txt = textOfContent(c).replace(VOICE_STRIP, ""); // hide the appended voice-mode directive
-      if (txt.trim() && !txt.startsWith("<")) {
+      const sk = skillLoadName(txt);
+      if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
+      else if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
         out.push({ t: "user", text: txt });

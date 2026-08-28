@@ -254,6 +254,9 @@ a { color: var(--accent-2); }
 .notice-peer { border-color: var(--accent); }
 .notice-peer .notice-ic { color: var(--accent); }
 .notice-text { min-width: 0; word-break: break-word; }
+.skill-card { display: inline-flex; align-items: center; gap: 7px; margin: 6px 0; padding: 6px 11px; border-radius: 999px; font-size: 12.5px; background: var(--bg-2); border: 1px solid var(--line); color: var(--text-2); }
+.skill-ic { flex: 0 0 auto; display: inline-flex; color: var(--accent); }
+.skill-text b { color: var(--text); font-weight: 600; }
 .think-progress .think-label { margin-bottom: 0; }
 .think-progress.live .think-label { color: var(--accent); opacity: 1; }
 .think-progress .think-ellipsis { color: var(--accent); animation: blink 1.2s infinite both; }

@@ -61,7 +61,7 @@ type AppEvent =
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
   | { t: "user"; text: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
-  | { t: "notice"; kind: "task" | "peer" | "info"; text: string; from?: string; status?: string; _seq?: number }
+  | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string; _seq?: number }
   | { t: "busy"; busy: boolean; _seq?: number }
   | { t: "error"; message: string; _seq?: number }
   | { t: "closed"; _seq?: number };
@@ -74,7 +74,7 @@ type Item =
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
-  | { kind: "notice"; noticeKind: "task" | "peer" | "info"; text: string; from?: string; status?: string }
+  | { kind: "notice"; noticeKind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
   | { kind: "compact"; savedTokens?: number; durationMs?: number; pctBefore?: number; pctAfter?: number };
 // #endregion
 
@@ -115,6 +115,16 @@ const api = {
 type SearchHit = { sessionId: string; title: string; snippet: string; count: number; mtime: number; cwd: string | null };
 // #endregion
 
+// A loaded skill is injected as a user message starting with "Base directory for this skill:
+// <path>/<name>". Pull the skill name out so we can show a small card instead of the raw file.
+function skillLoadName(txt: string): string | null {
+  if (!txt || !txt.startsWith("Base directory for this skill:")) return null;
+  const m = /^Base directory for this skill:\s*(.+)$/m.exec(txt);
+  if (!m) return null;
+  const p = m[1].trim().replace(/[/\\]+$/, "");
+  return p.split(/[/\\]/).pop() || p;
+}
+
 function applyEvent(items: Item[], e: AppEvent): Item[] {
   // Freeze a live "thinking" block's duration the instant the first non-thinking event lands, so
   // "Thought for Ns" is fixed once the model stops reasoning (and survives reconnects in state).
@@ -126,7 +136,14 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
   }
   const last = items[items.length - 1];
   switch (e.t) {
-    case "user": return [...items, { kind: "user", text: e.text }];
+    case "user": {
+      // A loaded skill arrives as a user message that dumps the whole skill file ("Base directory
+      // for this skill: <path>/<name>"). Render a compact card instead. (Also done server-side; this
+      // covers transcripts replayed before that backend build ships, so no restart is needed.)
+      const sk = skillLoadName(e.text);
+      if (sk) return [...items, { kind: "notice", noticeKind: "skill", text: sk }];
+      return [...items, { kind: "user", text: e.text }];
+    }
     case "text":
     case "text_delta":
       if (last && last.kind === "assistant") { const c = items.slice(); c[c.length - 1] = { kind: "assistant", text: last.text + e.text }; return c; }
@@ -402,6 +419,14 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu }: { items: Item[]; i
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
   if (it.kind === "tool") return <ToolCard it={it} />;
   if (it.kind === "notice") {
+    if (it.noticeKind === "skill") {
+      return (
+        <div className="skill-card" title={`Skill "${it.text}" loaded`}>
+          <span className="skill-ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" /></svg></span>
+          <span className="skill-text">Loaded skill <b>{it.text}</b></span>
+        </div>
+      );
+    }
     const icon = it.noticeKind === "peer" ? "⇄" : it.noticeKind === "task" ? "⛭" : "ⓘ";
     return (
       <div className={"notice notice-" + it.noticeKind} title={it.from ? `from ${it.from}` : undefined}>
@@ -829,6 +854,7 @@ function App() {
 
   const loadConv = useCallback(async (id: string, highlight?: string) => {
     closeStream();
+    setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
     stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
     setDrawer(false); setBusy(false);
     // Switch INSTANTLY: set active + paint the cached copy right away, then refresh from the network
