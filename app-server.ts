@@ -73,8 +73,44 @@ function jsonRes(body: unknown, ctx: AppCtx, req: Request, status = 200) {
 // #region conversation listing (scans the same .jsonl store as the terminal history)
 interface ConvRow { sessionId: string; title: string; cwd: string | null; mtime: number; project: string }
 
-function listConversations(ctx: AppCtx): ConvRow[] {
-  const rows: { path: string; sessionId: string; project: string; mtime: number }[] = [];
+// A conversation's "last activity" is the timestamp of its last user/assistant message — NOT the
+// file's mtime. An idle Claude Code session keeps rewriting trailing bookkeeping entries
+// (stop_hook_summary / turn_duration / away_summary) into its transcript, which bumps the file mtime
+// (and only the mtime — same size, no new message) long after the real conversation ended. Trusting
+// mtime made those idle sessions float to the top, group under "Today", and read as permanently
+// unread. So for recently-touched files we read the tail and recover the real last-message time;
+// older files (never touched again once their session ended) keep their mtime, which already matches.
+const RECENT_MS = 7 * 24 * 60 * 60 * 1000;
+const activityCache = new Map<string, { size: number; ts: number }>();
+
+async function lastActivityMs(path: string, size: number, fallbackMtimeMs: number): Promise<number> {
+  // Cache by (path,size): an idle bump doesn't change the size, so subsequent polls are free.
+  const cached = activityCache.get(path);
+  if (cached && cached.size === size) return cached.ts;
+  let ts = 0;
+  try {
+    // The last real message sits just before the small trailing bookkeeping entries, so a bounded
+    // tail is enough. The slice may begin mid-line; scanning from the end skips that partial line.
+    const start = Math.max(0, size - 262144);
+    const text = await Bun.file(path).slice(start).text();
+    const lines = text.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let o: any; try { o = JSON.parse(line); } catch { continue; }
+      if ((o.type === "user" || o.type === "assistant") && o.timestamp) {
+        const t = Date.parse(o.timestamp);
+        if (t) { ts = t; break; }
+      }
+    }
+  } catch {}
+  if (!ts) ts = fallbackMtimeMs; // no parseable message in the tail — fall back to the file clock
+  activityCache.set(path, { size, ts });
+  return ts;
+}
+
+async function listConversations(ctx: AppCtx): Promise<{ path: string; sessionId: string; project: string; mtime: number }[]> {
+  const rows: { path: string; sessionId: string; project: string; mtime: number; size: number; statMtime: number }[] = [];
   let projects: string[] = [];
   try { projects = readdirSync(ctx.dataDir); } catch { return []; }
   for (const project of projects) {
@@ -88,11 +124,16 @@ function listConversations(ctx: AppCtx): ConvRow[] {
     for (const f of files) {
       if (!f.endsWith(".jsonl")) continue;
       const p = join(pdir, f);
-      let mtime = 0;
-      try { mtime = statSync(p).mtimeMs; } catch { continue; }
-      rows.push({ path: p, sessionId: f.slice(0, -6), project, mtime });
+      let st; try { st = statSync(p); } catch { continue; }
+      rows.push({ path: p, sessionId: f.slice(0, -6), project, mtime: st.mtimeMs, size: st.size, statMtime: st.mtimeMs });
     }
   }
+  // Only recently-touched files can be misdated by an idle bump (bumps move mtime forward, never
+  // back), so only those need a tail read; the rest keep their mtime. Cache-misses read in parallel.
+  const now = Date.now();
+  await Promise.all(rows.map(async (r) => {
+    if (now - r.statMtime < RECENT_MS) r.mtime = await lastActivityMs(r.path, r.size, r.statMtime);
+  }));
   rows.sort((a, b) => b.mtime - a.mtime);
   return rows;
 }
@@ -297,7 +338,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const url = new URL(req.url);
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 40, 1), 100);
     const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
-    const rows = listConversations(ctx);
+    const rows = await listConversations(ctx);
     const titles = await loadTitles(ctx.titlesFile);
     const out: ConvRow[] = [];
     let i = offset;
@@ -323,7 +364,11 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
         const meta = await convMeta(t.path);
         const title = titles[id] || meta.title;
         if (!title) continue;
-        let mtime = 0; try { mtime = statSync(t.path).mtimeMs; } catch {}
+        let mtime = 0;
+        try {
+          const st = statSync(t.path);
+          mtime = Date.now() - st.mtimeMs < RECENT_MS ? await lastActivityMs(t.path, st.size, st.mtimeMs) : st.mtimeMs;
+        } catch {}
         favorites.push({ sessionId: id, title, cwd: meta.cwd, mtime, project: t.project });
       }
     }
@@ -355,7 +400,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const q = (new URL(req.url).searchParams.get("q") || "").trim().toLowerCase();
     if (q.length < 2) return jsonRes({ results: [], q }, ctx, req);
     const titles = await loadTitles(ctx.titlesFile);
-    const rows = listConversations(ctx).slice(0, 200); // recent-first
+    const rows = (await listConversations(ctx)).slice(0, 200); // recent-first
     const results: { sessionId: string; title: string; cwd: string | null; mtime: number; snippet: string; count: number }[] = [];
     for (const r of rows) {
       let text: string;
