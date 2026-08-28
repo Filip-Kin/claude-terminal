@@ -904,6 +904,100 @@ function App() {
     es.onerror = () => { /* EventSource auto-reconnects; buffer + _seq dedupe keeps us consistent */ };
   }, [handleEvent]);
 
+  // #region background streaming: keep still-working conversations caching while you're elsewhere
+  // A conversation you switch away from keeps running on the server; normally its stream closes, so
+  // you only see its new output after a network fetch on return. Here we hold an extra stream (or two)
+  // open for conversations that are actively WORKING, reducing their events into a buffer and writing
+  // it to the per-message cache, so returning to them is instant-complete. Gated by bandwidth.
+  type BgStream = { es: EventSource | null; buf: Item[]; lastSeq: number; lastCache: Item[]; timer: ReturnType<typeof setTimeout> | null; lastWrite: number; closed: boolean };
+  const bgStreams = useRef<Map<string, BgStream>>(new Map());
+  const bgDoneRef = useRef<Set<string>>(new Set()); // finished this session; don't reopen until they go busy again
+  const [netTick, setNetTick] = useState(0); // bumped on connection change to re-evaluate the budget
+
+  // How many conversations we'll stream in the BACKGROUND, from connection quality + a live stall
+  // signal: 0 on save-data / 2g / a foreground stream that's currently stalling; up to 2 on good 4g.
+  const bgBudget = useCallback((): number => {
+    void netTick;
+    if (busyRef.current && Date.now() - lastEventAt.current > 8000) return 0; // foreground struggling -> link is bad
+    const c: any = (navigator as any).connection;
+    if (c) {
+      if (c.saveData) return 0; // user asked the OS to save data
+      const et = c.effectiveType;
+      if (et === "slow-2g" || et === "2g") return 0;
+      if (et === "3g") return 1;
+      if (typeof c.downlink === "number" && c.downlink > 0 && c.downlink < 1) return 1; // <1 Mbps
+      if (typeof c.rtt === "number" && c.rtt > 600) return 1; // laggy
+      return 2;
+    }
+    return 1; // no Network Information API (e.g. iOS Safari) -> stay conservative
+  }, [netTick]);
+
+  const bgWrite = useCallback((id: string, st: BgStream, meta: { busy: boolean; live: boolean }) => {
+    const its = st.buf, prev = st.lastCache;
+    const n = Math.min(prev.length, its.length);
+    let i = 0; while (i < n && its[i] === prev[i]) i++; // tail-diff, same as the foreground writer
+    st.lastCache = its;
+    void offline.saveConvItems(id, its, i, { busy: meta.busy, cwd: cwdRef.current, live: meta.live });
+  }, []);
+  const bgSchedule = useCallback((id: string, st: BgStream, meta: { busy: boolean; live: boolean }, immediate = false) => {
+    if (immediate) { if (st.timer) { clearTimeout(st.timer); st.timer = null; } st.lastWrite = Date.now(); bgWrite(id, st, meta); return; }
+    if (st.timer) return; // a coalesced write is already scheduled
+    const since = Date.now() - st.lastWrite;
+    if (since >= 1000) { st.lastWrite = Date.now(); bgWrite(id, st, meta); }
+    else st.timer = setTimeout(() => { st.timer = null; st.lastWrite = Date.now(); bgWrite(id, st, meta); }, 1000 - since);
+  }, [bgWrite]);
+  const stopBgStream = useCallback((id: string) => {
+    const st = bgStreams.current.get(id); if (!st) return;
+    st.closed = true; if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+    try { st.es?.close(); } catch { /* */ }
+    bgStreams.current.delete(id);
+  }, []);
+  const startBgStream = useCallback((id: string) => {
+    if (bgStreams.current.has(id)) return;
+    const st: BgStream = { es: null, buf: [], lastSeq: -1, lastCache: [], timer: null, lastWrite: 0, closed: false };
+    bgStreams.current.set(id, st);
+    void (async () => {
+      try { const d = await api.conversation(id); if (st.closed) return; st.buf = (d.events || []).reduce((a: Item[], e: AppEvent) => applyEvent(a, e), [] as Item[]); bgSchedule(id, st, { busy: true, live: true }, true); }
+      catch { /* seed failed; live events still build the buffer */ }
+      if (st.closed) return;
+      const es = new EventSource(`/app/stream/${encodeURIComponent(id)}?tail=1`);
+      st.es = es;
+      es.onmessage = (ev) => {
+        let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; }
+        if (typeof e._seq === "number") { if (e._seq <= st.lastSeq) return; st.lastSeq = e._seq; }
+        if (e.t === "init" || e.t === "busy") return;
+        if (e.t === "closed") { stopBgStream(id); return; }
+        if (e.t === "user") e = { ...e, text: sanitizeUserText(e.text) } as AppEvent;
+        st.buf = applyEvent(st.buf, e);
+        if (e.t === "result" || e.t === "error") { bgDoneRef.current.add(id); bgSchedule(id, st, { busy: false, live: false }, true); stopBgStream(id); return; }
+        bgSchedule(id, st, { busy: true, live: true });
+      };
+      es.onerror = () => { /* EventSource auto-reconnects; _seq dedupe keeps the buffer consistent */ };
+    })();
+  }, [bgSchedule, stopBgStream]);
+
+  // Reconcile the pool: stream the working conversations (minus the active one, capped by the budget),
+  // stop the rest. Re-runs whenever statuses (5s poll), the active chat, connectivity, or the measured
+  // bandwidth changes — so a link going bad tears the background streams down within a few seconds.
+  useEffect(() => {
+    if (!online) { for (const id of Array.from(bgStreams.current.keys())) stopBgStream(id); return; }
+    for (const id of Object.keys(statuses)) if (!statuses[id]?.busy) bgDoneRef.current.delete(id); // idle again -> eligible next turn
+    const budget = bgBudget();
+    const busyIds = Object.keys(statuses).filter((id) => statuses[id]?.busy && id !== activeId && !id.startsWith("pending-") && !bgDoneRef.current.has(id));
+    const want = busyIds.slice(0, budget);
+    for (const id of Array.from(bgStreams.current.keys())) if (!want.includes(id)) stopBgStream(id);
+    for (const id of want) startBgStream(id);
+  }, [statuses, activeId, online, netTick, bgBudget, startBgStream, stopBgStream]);
+  useEffect(() => {
+    const c: any = (navigator as any).connection;
+    if (!c?.addEventListener) return;
+    const onChange = () => setNetTick((n) => n + 1);
+    c.addEventListener("change", onChange);
+    return () => c.removeEventListener("change", onChange);
+  }, []);
+  useEffect(() => () => { for (const id of Array.from(bgStreams.current.keys())) stopBgStream(id); }, [stopBgStream]);
+  // #endregion
+
   // Flush messages held during compaction (assigned here so it can use openStream). Called via a ref
   // from doCompact/handleEvent to sidestep declaration order.
   flushCompactRef.current = () => {
