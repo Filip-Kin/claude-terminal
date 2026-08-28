@@ -93,7 +93,7 @@ function takeSentences(buf: string): [string[], string] {
 // #endregion
 
 // #region audio playback queue (Web Audio so barge-in can stop instantly)
-export class SpeechPlayer {
+export class SpeechPlayer implements TtsPlayer {
   private ctx: AudioContext;
   private out: AudioNode;
   private queue: AudioBuffer[] = [];
@@ -142,35 +142,115 @@ export class SpeechPlayer {
 }
 // #endregion
 
-// #region media sink (loud car audio + duck/pause other apps)
-// Routes Web Audio through a MediaStream -> <audio> element with a MediaSession so the OS treats
-// playback as MEDIA, not a phone call: it plays loud on the car speakers and takes audio focus, which
-// pauses/ducks music. acquire() grabs focus (music pauses); release() hands it back (music resumes).
-// prime() establishes the element as user-activated during the opening tap so later acquire() isn't
-// blocked by autoplay policy. Returns null when unsupported (e.g. iOS MediaStream quirks) -> caller
-// falls back to plain speaker output, exactly as before.
-export type MediaSink = { node: AudioNode; prime: () => void; acquire: () => void; release: () => void; destroy: () => void };
-export function makeMediaSink(ctx: AudioContext): MediaSink | null {
-  try {
-    if (typeof MediaStream === "undefined" || typeof ctx.createMediaStreamDestination !== "function") return null;
-    const dest = ctx.createMediaStreamDestination();
-    const el: HTMLAudioElement = new Audio();
-    el.srcObject = dest.stream;
-    (el as unknown as { playsInline: boolean }).playsInline = true;
-    el.autoplay = false;
-    let acquired = false;
-    // iOS 16.4+: declare a media (with-mic) audio session so output is loud on the speakers.
-    try { const as = (navigator as unknown as { audioSession?: { type: string } }).audioSession; if (as) as.type = "play-and-record"; } catch { /* */ }
-    const setState = (s: MediaSessionPlaybackState) => { try { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = s; } catch { /* */ } };
-    const setMeta = () => { try { if ("mediaSession" in navigator && "MediaMetadata" in window) navigator.mediaSession.metadata = new MediaMetadata({ title: "Claude", artist: "skuno voice" }); } catch { /* */ } };
-    return {
-      node: dest,
-      prime: () => { const m = el.muted; el.muted = true; el.play().then(() => { el.pause(); el.muted = m; }).catch(() => { el.muted = m; }); },
-      acquire: () => { if (acquired) return; acquired = true; setMeta(); el.play().then(() => setState("playing")).catch(() => {}); },
-      release: () => { if (!acquired) return; acquired = false; try { el.pause(); } catch { /* */ } setState("none"); },
-      destroy: () => { try { el.pause(); } catch { /* */ } try { (el as unknown as { srcObject: MediaStream | null }).srcObject = null; } catch { /* */ } },
-    };
-  } catch { return null; }
+// #region shared player interface
+// Both playback engines below satisfy this, so the TTS core + read-aloud + voice mode drive either
+// one identically: SpeechPlayer (Web Audio, instant barge-in) or ElementPlayer (a real media element).
+export interface TtsPlayer {
+  enqueue(wav: ArrayBuffer): Promise<void>;
+  stop(): void;
+  readonly isActive: boolean;
+  onStart?: () => void;
+  onDrain?: () => void;
+  prime?: () => void; // unlock element playback within a user gesture (no-op for Web Audio)
+}
+// #endregion
+
+// #region element playback (true media: loud + takes audio focus, ducks/pauses other apps)
+// Plays a queue of TTS clips through ONE HTMLAudioElement fed real blob URLs. Web Audio (SpeechPlayer)
+// is routed by iOS to the quiet, mixable "ambient" category — it plays UNDER the user's music and
+// never takes audio focus, which is exactly the "too quiet, didn't pause my music in the car" report.
+// A media element playing actual file data is treated as MEDIA instead: it plays at media volume on
+// the car speakers, takes audio focus, and pauses/ducks other apps. MediaSession metadata makes the
+// OS show it as now-playing (lock screen / car head unit). prime() MUST be called inside a user
+// gesture (the tap that started read-aloud or voice) so a later play() isn't blocked by autoplay policy.
+// INHERENT iOS PWA LIMIT: Safari can't fully deactivate the audio session, so other apps' audio resumes
+// on its own timing after we stop; and while a mic is live (always-on voice) the session is forced to
+// the call type and a media element can't override it — hence always-on stays on Web Audio.
+
+// A ~0.05s 8-bit silent WAV, used to "unlock" the media element during a user gesture on iOS.
+function silentWavUrl(): string {
+  const rate = 8000, n = 400, size = 44 + n;
+  const b = new ArrayBuffer(size), v = new DataView(b);
+  const w = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + n, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  w(36, "data"); v.setUint32(40, n, true);
+  for (let i = 0; i < n; i++) v.setUint8(44 + i, 128); // 8-bit silence
+  return URL.createObjectURL(new Blob([b], { type: "audio/wav" }));
+}
+
+export class ElementPlayer implements TtsPlayer {
+  private el: HTMLAudioElement;
+  private queue: string[] = []; // pending object URLs
+  private current: string | null = null; // URL now loaded on the element
+  private playing = false;
+  private started = false; // onStart (first real audio) fired yet?
+  onStart?: () => void;
+  onDrain?: () => void;
+
+  constructor() {
+    this.el = new Audio();
+    (this.el as unknown as { playsInline: boolean }).playsInline = true;
+    this.el.preload = "auto";
+    // onStart = the moment audio actually starts (used to clear the "generating voice…" indicator).
+    this.el.onplaying = () => { if (!this.started) { this.started = true; this.onStart?.(); } };
+    try { if ("mediaSession" in navigator && "MediaMetadata" in window) navigator.mediaSession.metadata = new MediaMetadata({ title: "Claude", artist: "skuno voice" }); } catch { /* */ }
+    try { if ("mediaSession" in navigator) navigator.mediaSession.setActionHandler?.("pause", () => this.stop()); } catch { /* */ }
+    try { if ("mediaSession" in navigator) navigator.mediaSession.setActionHandler?.("stop", () => this.stop()); } catch { /* */ }
+  }
+
+  // iOS 16.4+: declare a media (playback) audio session so output is loud on the speakers and takes
+  // audio focus (pauses/ducks other apps), rather than the quiet mixable Web-Audio default.
+  private claimSession() {
+    try { const as = (navigator as unknown as { audioSession?: { type: string } }).audioSession; if (as) as.type = "playback"; } catch { /* */ }
+  }
+
+  // Unlock the element (play a silent clip) during a user gesture so a later play() isn't blocked by
+  // autoplay policy, and claim the media session. Safe to call more than once.
+  prime() {
+    this.claimSession();
+    try { this.el.onended = null; this.el.onerror = null; this.el.src = silentWavUrl(); const p = this.el.play(); if (p) p.catch(() => {}); } catch { /* */ }
+  }
+
+  async enqueue(wav: ArrayBuffer) {
+    const url = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
+    this.queue.push(url);
+    if (!this.playing) this.playNext();
+  }
+
+  private playNext() {
+    const url = this.queue.shift();
+    if (!url) { this.playing = false; if (this.current) { URL.revokeObjectURL(this.current); this.current = null; } this.onDrain?.(); return; }
+    if (!this.playing) this.claimSession(); // starting from idle (a mic turn may have flipped the session to record)
+    this.playing = true;
+    if (this.current) URL.revokeObjectURL(this.current);
+    this.current = url;
+    let advanced = false;
+    const go = () => { if (advanced) return; advanced = true; this.playNext(); }; // advance once per clip, whatever fires first
+    this.el.onended = go;
+    this.el.onerror = go;
+    try {
+      this.el.src = url;
+      try { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing"; } catch { /* */ }
+      const p = this.el.play();
+      if (p) p.catch(() => go()); // autoplay blocked / decode error -> skip so the queue can't stall
+    } catch { go(); }
+  }
+
+  get isActive() { return this.playing || this.queue.length > 0; }
+
+  stop() {
+    for (const u of this.queue) URL.revokeObjectURL(u);
+    this.queue = [];
+    this.el.onended = null; this.el.onerror = null;
+    try { this.el.pause(); } catch { /* */ }
+    if (this.current) { URL.revokeObjectURL(this.current); this.current = null; }
+    try { this.el.removeAttribute("src"); this.el.load(); } catch { /* */ }
+    try { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "none"; } catch { /* */ }
+    this.playing = false;
+    this.started = false; // next playback reports first-audio again (reused player, e.g. tap-to-talk)
+  }
 }
 // #endregion
 
@@ -178,7 +258,7 @@ export function makeMediaSink(ctx: AudioContext): MediaSink | null {
 // The single fetch+enqueue step behind BOTH hands-free voice mode and one-shot read-aloud, so they
 // use the identical server pipeline. Returns false only on a real TTS failure (so read-aloud can
 // fall back to the browser voice); a skipped empty/punctuation sentence counts as success.
-export async function ttsSpeakInto(player: SpeechPlayer, sentence: string, isActive: () => boolean, voice?: string): Promise<boolean> {
+export async function ttsSpeakInto(player: TtsPlayer, sentence: string, isActive: () => boolean, voice?: string): Promise<boolean> {
   const clean = speakable(sentence);
   if (!clean || !/[a-z0-9]/i.test(clean)) return true;
   if (!isActive()) return true;
@@ -202,39 +282,41 @@ let raStop: (() => void) | null = null;
 let raOnEnd: (() => void) | null = null;
 export function stopReadAloud() { const s = raStop; raStop = null; const cb = raOnEnd; raOnEnd = null; if (s) s(); if (cb) cb(); }
 
-function synthSpeak(text: string, onEnd?: () => void) {
+function synthSpeak(text: string, onEnd?: () => void, onStart?: () => void) {
   try {
     const synth = window.speechSynthesis;
     if (!synth) { onEnd?.(); return; }
     synth.cancel();
     const u = new SpeechSynthesisUtterance(text);
+    u.onstart = () => { onStart?.(); };
     u.onend = () => { if (raStop) { raStop = null; raOnEnd = null; onEnd?.(); } };
     u.onerror = u.onend;
-    raStop = () => { try { u.onend = null; u.onerror = null; synth.cancel(); } catch {} };
+    raStop = () => { try { u.onstart = null; u.onend = null; u.onerror = null; synth.cancel(); } catch {} };
     raOnEnd = onEnd || null;
     synth.speak(u);
   } catch { onEnd?.(); }
 }
 
-export function readAloud(raw: string, opts?: { useServerTts?: boolean; voice?: string; onEnd?: () => void }): void {
+export function readAloud(raw: string, opts?: { useServerTts?: boolean; voice?: string; onStart?: () => void; onEnd?: () => void }): void {
   stopReadAloud();
   const clean = speakable(raw).trim();
   if (!clean) { opts?.onEnd?.(); return; }
   const onEnd = opts?.onEnd;
-  if (!opts?.useServerTts) { synthSpeak(clean, onEnd); return; }
-  // server TTS path: chunk by sentence, fetch each, play through the same queue voice mode uses,
-  // so playback starts on the first sentence instead of waiting for the whole message.
+  if (!opts?.useServerTts) { synthSpeak(clean, onEnd, opts?.onStart); return; }
+  // Server TTS path: chunk by sentence, fetch each, and play through a real media element so the OS
+  // treats it as MEDIA (loud on the car speakers, ducks/pauses the user's music) instead of quiet Web
+  // Audio. Playback starts on the first sentence rather than waiting for the whole message.
   let cancelled = false;
-  let started = false;
-  const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-  const ctx = new AC();
-  try { void ctx.resume(); } catch { /* */ }
-  const sink = makeMediaSink(ctx); // loud media + pause the user's music while reading
-  const player = new SpeechPlayer(ctx, sink?.node);
-  sink?.acquire(); // this call is inside the tap that opened the menu -> autoplay allowed
-  const finish = () => { sink?.release(); sink?.destroy(); try { ctx.close(); } catch { /* */ } };
-  player.onDrain = () => { if (started && !cancelled) { cancelled = true; finish(); if (raStop) { raStop = null; raOnEnd = null; onEnd?.(); } } };
-  raStop = () => { cancelled = true; player.stop(); finish(); };
+  let started = false;    // at least one sentence produced audio
+  let enqueuedAll = false; // every sentence has been fetched + enqueued (guards against a premature drain)
+  const player = new ElementPlayer();
+  player.prime(); // this runs inside the tap that opened the menu -> unlock playback + claim media focus
+  const done = () => { if (cancelled) return; cancelled = true; player.stop(); if (raStop) { raStop = null; raOnEnd = null; onEnd?.(); } };
+  player.onStart = () => { if (!cancelled) opts?.onStart?.(); }; // first audio actually playing
+  // Finish only once the whole message has been enqueued AND the queue has fully drained, so a short
+  // sentence finishing before the next fetch returns can't cut the read-aloud short.
+  player.onDrain = () => { if (enqueuedAll && started) done(); };
+  raStop = () => { cancelled = true; player.stop(); };
   raOnEnd = onEnd || null;
   const sentences = clean.match(/\s*[^.!?…]+[.!?…]*/g) || [clean];
   void (async () => {
@@ -246,11 +328,13 @@ export function readAloud(raw: string, opts?: { useServerTts?: boolean; voice?: 
       if (cancelled) return;
       if (!ok) {
         // TTS sidecar unreachable (offline / not configured) -> finish with the browser voice
-        if (!started) { finish(); synthSpeak(clean, onEnd); }
+        if (!started) { player.stop(); synthSpeak(clean, onEnd, opts?.onStart); }
         return;
       }
       started = true;
     }
+    enqueuedAll = true;
+    if (started && !cancelled && !player.isActive) done(); // already drained before the last enqueue landed
   })();
 }
 // #endregion
@@ -279,14 +363,13 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   // car stays on media (A2DP) — playback is loud and the music can duck/resume, unlike always-on mode.
   const pttRef = useRef(!!tapToTalk);
   useEffect(() => { pttRef.current = !!tapToTalk; }, [tapToTalk]);
-  const sinkRef = useRef<MediaSink | null>(null); // media sink used in tap-to-talk (no persistent mic)
 
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const srcNodeRef = useRef<MediaStreamAudioSourceNode | null>(null); // mic source, so tap-to-talk can disconnect it between turns
   const onstopSendRef = useRef(false); // whether the current recording should be transcribed (vs a silence-only segment)
-  const playerRef = useRef<SpeechPlayer | null>(null);
+  const playerRef = useRef<TtsPlayer | null>(null);
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const rafRef = useRef<number | null>(null);
@@ -309,8 +392,6 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     try { recRef.current?.state !== "inactive" && recRef.current?.stop(); } catch {}
     recRef.current = null;
     playerRef.current?.stop();
-    try { sinkRef.current?.release(); sinkRef.current?.destroy(); } catch {}
-    sinkRef.current = null;
     try { srcNodeRef.current?.disconnect(); } catch {}
     srcNodeRef.current = null;
     try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
@@ -319,14 +400,6 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     ctxRef.current = null; analyserRef.current = null; playerRef.current = null;
     setPhaseR("idle"); setLevel(0);
   }, []);
-
-  // Tap-to-talk only: duck the user's music while Claude speaks (grab audio focus), release it when he
-  // stops so music resumes. Safe here because there's no live mic fighting for the audio session.
-  useEffect(() => {
-    if (!pttRef.current) return;
-    const sink = sinkRef.current; if (!sink) return;
-    if (phase === "speaking") sink.acquire(); else sink.release();
-  }, [phase]);
 
   // #region listening + VAD
   const startListening = useCallback(() => {
@@ -395,8 +468,11 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   // tap force-sends what's captured. Acquires the mic on demand instead of holding it open.
   const pttTap = useCallback(async () => {
     if (!activeRef.current) return;
+    // This tap is a real user gesture -> unlock the media element now so a later TTS play() (which
+    // happens after STT + thinking, outside any gesture) isn't blocked by iOS autoplay policy.
+    playerRef.current?.prime?.();
     if (phaseRef.current === "listening") { clearRaf(); onstopSendRef.current = true; setPhaseR("transcribing"); try { recRef.current?.stop(); } catch {} return; }
-    if (phaseRef.current === "speaking" || phaseRef.current === "thinking") { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; sinkRef.current?.release(); }
+    if (phaseRef.current === "speaking" || phaseRef.current === "thinking") { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; }
     const ctx = ctxRef.current; if (!ctx) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
@@ -508,7 +584,7 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
       if (phaseRef.current === "thinking" && player.isActive) setPhaseR("speaking");
       // turn done + audio drained: hands-free listens again; tap-to-talk goes idle (music resumes) to wait for a tap
       if (phaseRef.current === "speaking" && turnDoneRef.current && !player.isActive) {
-        if (pttRef.current) { sinkRef.current?.release(); setPhaseR("idle"); }
+        if (pttRef.current) setPhaseR("idle");
         else startListening();
         return;
       }
@@ -547,10 +623,10 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
         ctxRef.current = ctx;
         activeRef.current = true;
         if (pttRef.current) {
-          // Tap-to-talk: no persistent mic. Route TTS through a media sink so playback is loud media
-          // that ducks the user's music; the mic only opens on a tap (pttTap). Wait in idle for the tap.
-          const sink = makeMediaSink(ctx); sinkRef.current = sink; sink?.prime();
-          playerRef.current = new SpeechPlayer(ctx, sink?.node);
+          // Tap-to-talk: no persistent mic. Play TTS through a real media element (ElementPlayer) so the
+          // OS treats it as MEDIA — loud on the car speakers, ducks/pauses the user's music — instead of
+          // quiet Web Audio. The mic only opens on a tap (pttTap, which also primes/unlocks the element).
+          playerRef.current = new ElementPlayer();
           setPhaseR("idle");
         } else {
           // Always-on: the open mic makes the phone hold a CALL-type audio session (over car Bluetooth
@@ -585,7 +661,7 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   const label = ptt && phase === "idle" ? "Tap to talk"
     : phase === "listening" ? (ptt ? "Listening… tap to send" : "Listening…")
     : phase === "transcribing" ? "…" : phase === "thinking" ? "Thinking…" : phase === "speaking" ? "Speaking…" : phase === "error" ? "Problem" : "";
-  const interrupt = () => { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; if (ptt) { sinkRef.current?.release(); setPhaseR("idle"); } else startListening(); };
+  const interrupt = () => { playerRef.current?.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; if (ptt) { setPhaseR("idle"); } else startListening(); };
   return (
     <div className="voice-overlay" role="dialog" aria-label="Voice mode">
       <div className="voice-top">

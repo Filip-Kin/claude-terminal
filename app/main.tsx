@@ -857,7 +857,10 @@ function App() {
   const [ttsVoice, setTtsVoiceState] = useState<string>(() => { try { return localStorage.getItem("ct-voice-name") || ""; } catch { return ""; } });
   const setTtsVoice = (v: string) => { setTtsVoiceState(v); try { localStorage.setItem("ct-voice-name", v); } catch { /* */ } };
   const [voiceOpen, setVoiceOpen] = useState(false);
-  const [speaking, setSpeaking] = useState(false); // a message is being read aloud (long-press -> Read aloud)
+  // Which message (item index) is being read aloud + whether we're still generating the voice (Kokoro
+  // TTS latency) or actually playing it. Drives the per-message "generating voice…" / "playing" pill.
+  const [reading, setReading] = useState<{ i: number; phase: "generating" | "playing" } | null>(null);
+  const speaking = reading !== null; // a message is being read aloud (long-press -> Read aloud)
   const [search, setSearch] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
@@ -1267,7 +1270,7 @@ function App() {
     activeIdRef.current = id;
     if (switching) setInput(loadDraft(id)); // swap the composer to this conversation's saved draft
     setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
-    stopReadAloud(); setSpeaking(false); // don't keep reading a message from the conversation you just left
+    stopReadAloud(); setReading(null); // don't keep reading a message from the conversation you just left
     setDrawer(false);
     history.replaceState(null, "", `/app?c=${id}`);
     if (highlight) highlightRef.current = highlight; else forceBottom.current = true;
@@ -1443,7 +1446,7 @@ function App() {
   const stop = async () => { const s = activeStoreRef.current; if (!s) return; s.setBusy(false); await api.interrupt(s.id); };
 
   // #region context menus (long-press / right-click): message copy+edit, conversation rename+delete
-  const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant") => setMsgMenu({ x, y, text, kind }), []);
+  const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant", i: number) => setMsgMenu({ x, y, text, kind, i }), []);
   const copyText = (t: string) => { try { void navigator.clipboard?.writeText(t); } catch { /* */ } };
   const editIntoComposer = (t: string) => { setInput(t); setMsgMenu(null); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
   const deleteConv = useCallback(async (id: string) => {
@@ -1761,7 +1764,7 @@ function App() {
                       i = j - 1; continue;
                     }
                   }
-                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? (activeStore?.sendState ?? null) : null} />);
+                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? (activeStore?.sendState ?? null) : null} reading={reading?.i === i ? reading.phase : undefined} />);
                 }
                 return nodes;
               })()}
@@ -1862,9 +1865,18 @@ function App() {
           <div className="ctx-scrim" onClick={() => setMsgMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMsgMenu(null); }} />
           <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 160), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
             {speaking ? (
-              <button onClick={() => { stopReadAloud(); setMsgMenu(null); }}>Stop reading</button>
+              <button onClick={() => { stopReadAloud(); setReading(null); setMsgMenu(null); }}>Stop reading</button>
             ) : (
-              <button onClick={() => { const t = msgMenu.text; setMsgMenu(null); setSpeaking(true); readAloud(t, { useServerTts: voiceAvail && online, voice: ttsVoice || undefined, onEnd: () => setSpeaking(false) }); }}>Read aloud</button>
+              <button onClick={() => {
+                const t = msgMenu.text, mi = msgMenu.i; setMsgMenu(null);
+                setReading({ i: mi, phase: "generating" }); // show the spinner on this message from the tap
+                readAloud(t, {
+                  useServerTts: voiceAvail && online,
+                  voice: ttsVoice || undefined,
+                  onStart: () => setReading((r) => (r && r.i === mi ? { i: mi, phase: "playing" } : r)), // first audio -> clear the spinner
+                  onEnd: () => setReading((r) => (r && r.i === mi ? null : r)),
+                });
+              }}>Read aloud</button>
             )}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
             {msgMenu.kind === "user" && <button onClick={() => editIntoComposer(msgMenu.text)}>Edit</button>}

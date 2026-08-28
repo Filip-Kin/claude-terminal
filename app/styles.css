@@ -233,6 +233,15 @@ a { color: var(--accent-2); }
 .think-dots span:nth-child(2) { animation-delay: .18s; }
 .think-dots span:nth-child(3) { animation-delay: .36s; }
 .turn-think { margin-top: 8px; font-size: 11.5px; color: var(--text-3); opacity: .8; font-variant-numeric: tabular-nums; }
+/* read-aloud status pill (per message): "generating voice…" spinner until the first audio plays, then "playing" */
+.ra-status { display: inline-flex; align-items: center; gap: 7px; margin-top: 8px; font-size: 12px; font-weight: 500; color: var(--accent); }
+.ra-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent); border-top-color: var(--accent); animation: spin .7s linear infinite; }
+.ra-eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 12px; }
+.ra-eq i { width: 3px; height: 100%; border-radius: 2px; background: var(--accent); transform-origin: bottom; animation: raeq 1s ease-in-out infinite; }
+.ra-eq i:nth-child(2) { animation-delay: .18s; }
+.ra-eq i:nth-child(3) { animation-delay: .36s; }
+@keyframes raeq { 0%, 100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) { .ra-spin, .ra-eq i { animation: none; } }
 .tool-group { border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; background: var(--bg-2); overflow: hidden; }
 .tool-group-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 12px; background: none; border: 0; color: var(--text-2); cursor: pointer; font-size: 13px; text-align: left; }
 .tool-group-head:hover { background: var(--bg-3); }
