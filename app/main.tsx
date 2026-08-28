@@ -396,7 +396,14 @@ class ConvStore {
   reconcile(items: Item[], meta: { busy: boolean; cwd: string | null }) {
     this.cwd = meta.cwd; this.hydrated = true;
     const localAhead = this.pendingEcho.length > 0 || (this.busy && this.items.length >= items.length);
-    if (!localAhead) { this.items = items; this.cachedItems = items; }
+    if (!localAhead) {
+      // Only swap in the server items when they actually differ from what we already show (typically
+      // the cache paint). Replacing them with an equal array would give the view a fresh `items`
+      // reference and fire a second scroll-to-bottom right after the cache one — the "scrolls twice on
+      // open". Keeping the same reference lets the scroll effect (keyed on items) skip the redundant run.
+      const changed = this.items.length !== items.length || JSON.stringify(this.items) !== JSON.stringify(items);
+      if (changed) { this.items = items; this.cachedItems = items; }
+    }
     this.busy = meta.busy || this.busy;
     this.signal();
   }
@@ -1460,6 +1467,10 @@ function App() {
     if (!raw && !attachments.length) return; // busy is allowed: the turn queues (processed after the current one)
     let text = raw;
     if (attachments.length) text = "Attached files:\n" + attachments.map((a) => a.path).join("\n") + (raw ? "\n\n" + raw : "");
+    // Clear THIS conversation's saved draft now, keyed by the id we're sending FROM (null = new chat).
+    // Doing it here (not only via the input-change effect) avoids a race where a new chat gets its real
+    // id before the effect runs, leaving the "__new__" draft set so the next new chat reloads it.
+    saveDraft(activeIdRef.current, "");
     setInput(""); setAttachments([]);
     if (taRef.current) taRef.current.style.height = "auto";
     await submitText(text);
