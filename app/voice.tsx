@@ -35,8 +35,31 @@ export interface VoiceBridge {
 type Phase = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "error";
 
 // #region speakable text (strip markdown so we don't read syntax or code aloud)
+// Numbers 0-59 as words, for reading clock times naturally (Kokoro mangles "5:30 PM" into
+// "five ... thirty"). "5:30 PM" -> "five thirty P M", "5:00" -> "five o'clock", "5:05" -> "five oh five".
+const ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"];
+const TENS = ["", "", "twenty", "thirty", "forty", "fifty"];
+function numWords(n: number): string {
+  if (n < 20) return ONES[n];
+  const t = TENS[Math.floor(n / 10)] || "";
+  const o = n % 10;
+  return o ? `${t} ${ONES[o]}` : t;
+}
+function normalizeTimes(s: string): string {
+  return s.replace(/\b(\d{1,2}):(\d{2})\s*([ap])\.?\s?m\.?/gi, (_m, h, mm, ap) => {
+    const H = parseInt(h, 10), M = parseInt(mm, 10);
+    const minute = M === 0 ? "" : M < 10 ? ` oh ${ONES[M]}` : ` ${numWords(M)}`;
+    return `${numWords(H)}${minute} ${ap.toLowerCase() === "a" ? "A M" : "P M"}`;
+  }).replace(/\b(\d{1,2}):(\d{2})\b/g, (_m, h, mm) => {
+    const H = parseInt(h, 10), M = parseInt(mm, 10);
+    if (H > 23 || M > 59) return `${h}:${mm}`; // not a clock time, leave it
+    if (M === 0) return `${numWords(H)} o'clock`;
+    return `${numWords(H)}${M < 10 ? ` oh ${ONES[M]}` : ` ${numWords(M)}`}`;
+  });
+}
+
 function speakable(md: string): string {
-  let s = md;
+  let s = normalizeTimes(md);
   s = s.replace(/```[\s\S]*?```/g, " . "); // drop fenced code blocks
   s = s.replace(/`[^`]*`/g, (m) => m.replace(/`/g, "")); // inline code -> its text
   s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, " "); // images
@@ -72,6 +95,7 @@ function takeSentences(buf: string): [string[], string] {
 // #region audio playback queue (Web Audio so barge-in can stop instantly)
 export class SpeechPlayer {
   private ctx: AudioContext;
+  private out: AudioNode;
   private queue: AudioBuffer[] = [];
   private src: AudioBufferSourceNode | null = null;
   private playing = false;
@@ -79,7 +103,9 @@ export class SpeechPlayer {
   onStart?: () => void;
   onDrain?: () => void;
 
-  constructor(ctx: AudioContext) { this.ctx = ctx; }
+  // `out` lets voice mode route playback through a MediaStream destination + <audio> element so the
+  // OS treats it as media (louder in the car, ducks/pauses other apps). Defaults to the speakers.
+  constructor(ctx: AudioContext, out?: AudioNode) { this.ctx = ctx; this.out = out || ctx.destination; }
 
   async enqueue(wav: ArrayBuffer) {
     let buf: AudioBuffer;
@@ -96,7 +122,7 @@ export class SpeechPlayer {
     if (first) this.onStart?.();
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(this.ctx.destination);
+    src.connect(this.out);
     const advance = () => { if (this.src === src) { this.src = null; if (this.timer) { clearTimeout(this.timer); this.timer = null; } this.playNext(); } };
     src.onended = advance;
     this.src = src;
@@ -116,16 +142,48 @@ export class SpeechPlayer {
 }
 // #endregion
 
+// #region media sink (loud car audio + duck/pause other apps)
+// Routes Web Audio through a MediaStream -> <audio> element with a MediaSession so the OS treats
+// playback as MEDIA, not a phone call: it plays loud on the car speakers and takes audio focus, which
+// pauses/ducks music. acquire() grabs focus (music pauses); release() hands it back (music resumes).
+// prime() establishes the element as user-activated during the opening tap so later acquire() isn't
+// blocked by autoplay policy. Returns null when unsupported (e.g. iOS MediaStream quirks) -> caller
+// falls back to plain speaker output, exactly as before.
+export type MediaSink = { node: AudioNode; prime: () => void; acquire: () => void; release: () => void; destroy: () => void };
+export function makeMediaSink(ctx: AudioContext): MediaSink | null {
+  try {
+    if (typeof MediaStream === "undefined" || typeof ctx.createMediaStreamDestination !== "function") return null;
+    const dest = ctx.createMediaStreamDestination();
+    const el: HTMLAudioElement = new Audio();
+    el.srcObject = dest.stream;
+    (el as unknown as { playsInline: boolean }).playsInline = true;
+    el.autoplay = false;
+    let acquired = false;
+    // iOS 16.4+: declare a media (with-mic) audio session so output is loud on the speakers.
+    try { const as = (navigator as unknown as { audioSession?: { type: string } }).audioSession; if (as) as.type = "play-and-record"; } catch { /* */ }
+    const setState = (s: MediaSessionPlaybackState) => { try { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = s; } catch { /* */ } };
+    const setMeta = () => { try { if ("mediaSession" in navigator && "MediaMetadata" in window) navigator.mediaSession.metadata = new MediaMetadata({ title: "Claude", artist: "skuno voice" }); } catch { /* */ } };
+    return {
+      node: dest,
+      prime: () => { const m = el.muted; el.muted = true; el.play().then(() => { el.pause(); el.muted = m; }).catch(() => { el.muted = m; }); },
+      acquire: () => { if (acquired) return; acquired = true; setMeta(); el.play().then(() => setState("playing")).catch(() => {}); },
+      release: () => { if (!acquired) return; acquired = false; try { el.pause(); } catch { /* */ } setState("none"); },
+      destroy: () => { try { el.pause(); } catch { /* */ } try { (el as unknown as { srcObject: MediaStream | null }).srcObject = null; } catch { /* */ } },
+    };
+  } catch { return null; }
+}
+// #endregion
+
 // #region shared TTS core (one sentence -> Kokoro -> SpeechPlayer)
 // The single fetch+enqueue step behind BOTH hands-free voice mode and one-shot read-aloud, so they
 // use the identical server pipeline. Returns false only on a real TTS failure (so read-aloud can
 // fall back to the browser voice); a skipped empty/punctuation sentence counts as success.
-export async function ttsSpeakInto(player: SpeechPlayer, sentence: string, isActive: () => boolean): Promise<boolean> {
+export async function ttsSpeakInto(player: SpeechPlayer, sentence: string, isActive: () => boolean, voice?: string): Promise<boolean> {
   const clean = speakable(sentence);
   if (!clean || !/[a-z0-9]/i.test(clean)) return true;
   if (!isActive()) return true;
   try {
-    const r = await fetch("/app/api/tts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: clean }) });
+    const r = await fetch("/app/api/tts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(voice ? { text: clean, voice } : { text: clean }) });
     if (!r.ok) return false;
     const buf = await r.arrayBuffer();
     if (!isActive()) return true;
@@ -158,7 +216,7 @@ function synthSpeak(text: string, onEnd?: () => void) {
   } catch { onEnd?.(); }
 }
 
-export function readAloud(raw: string, opts?: { useServerTts?: boolean; onEnd?: () => void }): void {
+export function readAloud(raw: string, opts?: { useServerTts?: boolean; voice?: string; onEnd?: () => void }): void {
   stopReadAloud();
   const clean = speakable(raw).trim();
   if (!clean) { opts?.onEnd?.(); return; }
@@ -171,9 +229,12 @@ export function readAloud(raw: string, opts?: { useServerTts?: boolean; onEnd?: 
   const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   const ctx = new AC();
   try { void ctx.resume(); } catch { /* */ }
-  const player = new SpeechPlayer(ctx);
-  player.onDrain = () => { if (started && !cancelled) { cancelled = true; try { ctx.close(); } catch { /* */ } if (raStop) { raStop = null; raOnEnd = null; onEnd?.(); } } };
-  raStop = () => { cancelled = true; player.stop(); try { ctx.close(); } catch { /* */ } };
+  const sink = makeMediaSink(ctx); // loud media + pause the user's music while reading
+  const player = new SpeechPlayer(ctx, sink?.node);
+  sink?.acquire(); // this call is inside the tap that opened the menu -> autoplay allowed
+  const finish = () => { sink?.release(); sink?.destroy(); try { ctx.close(); } catch { /* */ } };
+  player.onDrain = () => { if (started && !cancelled) { cancelled = true; finish(); if (raStop) { raStop = null; raOnEnd = null; onEnd?.(); } } };
+  raStop = () => { cancelled = true; player.stop(); finish(); };
   raOnEnd = onEnd || null;
   const sentences = clean.match(/\s*[^.!?…]+[.!?…]*/g) || [clean];
   void (async () => {
@@ -181,11 +242,11 @@ export function readAloud(raw: string, opts?: { useServerTts?: boolean; onEnd?: 
       if (cancelled) return;
       const t = s.trim();
       if (!t) continue;
-      const ok = await ttsSpeakInto(player, t, () => !cancelled); // same pipeline as voice mode
+      const ok = await ttsSpeakInto(player, t, () => !cancelled, opts?.voice); // same pipeline as voice mode
       if (cancelled) return;
       if (!ok) {
         // TTS sidecar unreachable (offline / not configured) -> finish with the browser voice
-        if (!started) { try { ctx.close(); } catch { /* */ } synthSpeak(clean, onEnd); }
+        if (!started) { finish(); synthSpeak(clean, onEnd); }
         return;
       }
       started = true;
@@ -200,7 +261,7 @@ async function pickMime(): Promise<string> {
   return ""; // let the browser choose (iOS often returns "" -> audio/mp4)
 }
 
-export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFinalOnly }: { bridge: VoiceBridge; open: boolean; onClose: () => void; pendingAsk?: AskItem; onAnswer?: (askId: string, answer: string) => void; speakFinalOnly?: boolean }) {
+export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFinalOnly, ttsVoice }: { bridge: VoiceBridge; open: boolean; onClose: () => void; pendingAsk?: AskItem; onAnswer?: (askId: string, answer: string) => void; speakFinalOnly?: boolean; ttsVoice?: string }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [heard, setHeard] = useState(""); // last user transcript
   const [caption, setCaption] = useState(""); // live assistant caption (what's being said)
@@ -211,11 +272,14 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   const setPhaseR = (p: Phase) => { phaseRef.current = p; setPhase(p); };
   const speakFinalRef = useRef(!!speakFinalOnly); // read latest inside the stable subscribe closure
   useEffect(() => { speakFinalRef.current = !!speakFinalOnly; }, [speakFinalOnly]);
+  const ttsVoiceRef = useRef(ttsVoice); // latest chosen Kokoro voice for the stable speakSentence closure
+  useEffect(() => { ttsVoiceRef.current = ttsVoice; }, [ttsVoice]);
 
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const playerRef = useRef<SpeechPlayer | null>(null);
+  const sinkRef = useRef<MediaSink | null>(null); // media element that ducks music + plays loud in the car
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const rafRef = useRef<number | null>(null);
@@ -238,12 +302,21 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     try { recRef.current?.state !== "inactive" && recRef.current?.stop(); } catch {}
     recRef.current = null;
     playerRef.current?.stop();
+    try { sinkRef.current?.release(); sinkRef.current?.destroy(); } catch {}
+    sinkRef.current = null;
     try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
     streamRef.current = null;
     try { ctxRef.current?.close(); } catch {}
     ctxRef.current = null; analyserRef.current = null; playerRef.current = null;
     setPhaseR("idle"); setLevel(0);
   }, []);
+
+  // Duck the user's music: grab audio focus while Claude is speaking, hand it back the moment he
+  // stops (thinking/listening/idle) so music resumes between replies. Driven by the phase machine.
+  useEffect(() => {
+    const sink = sinkRef.current; if (!sink) return;
+    if (phase === "speaking") sink.acquire(); else sink.release();
+  }, [phase]);
 
   // #region listening + VAD
   const startListening = useCallback(() => {
@@ -325,7 +398,7 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     const player = playerRef.current;
     if (!player) return;
     // serialise TTS fetches so audio enqueues in sentence order — same core as one-shot read-aloud
-    ttsChainRef.current = ttsChainRef.current.then(() => ttsSpeakInto(player, sentence, () => activeRef.current)).then(() => {});
+    ttsChainRef.current = ttsChainRef.current.then(() => ttsSpeakInto(player, sentence, () => activeRef.current, ttsVoiceRef.current)).then(() => {});
   }, []);
   // #endregion
 
@@ -427,7 +500,12 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
         analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.3;
         src.connect(analyser);
         analyserRef.current = analyser;
-        const player = new SpeechPlayer(ctx);
+        // Route TTS through a media sink (loud car audio + pause the user's music while Claude talks).
+        // prime() runs inside this open-gesture so a later acquire() isn't blocked by autoplay policy.
+        const sink = makeMediaSink(ctx);
+        sinkRef.current = sink;
+        sink?.prime();
+        const player = new SpeechPlayer(ctx, sink?.node);
         playerRef.current = player;
         activeRef.current = true;
         startListening();

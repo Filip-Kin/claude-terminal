@@ -43,6 +43,15 @@ export type TurnUsage = { input: number; output: number; thinking: number; cache
 type Sub = (e: AppEvent) => void;
 // #endregion
 
+// #region voice-mode turn directive
+// When a turn comes from hands-free voice mode, we append a hidden instruction so Claude keeps the
+// reply short and TTS-friendly (it's read aloud to someone driving). It's wrapped in a sentinel tag
+// so replay strips it from the visible transcript; the live UI already renders the user's own words.
+const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; your reply will be read aloud by text-to-speech. Keep it brief and conversational: lead with the answer in one or two spoken sentences. Do not use markdown, bullet or numbered lists, tables, code blocks, headings, or URLs unless explicitly asked. Write times and numbers as words a voice would say (for example 'five thirty PM', not '5:30 PM'). Only expand if the user asks for detail.";
+export function decorateVoiceTurn(text: string): string { return `${text}\n\n<voice-mode>${VOICE_DIRECTIVE}</voice-mode>`; }
+const VOICE_STRIP = /\s*<voice-mode>[\s\S]*?<\/voice-mode>\s*$/;
+// #endregion
+
 function textOfContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -420,7 +429,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
           continue;
         }
       }
-      const txt = textOfContent(c);
+      const txt = textOfContent(c).replace(VOICE_STRIP, ""); // hide the appended voice-mode directive
       if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;

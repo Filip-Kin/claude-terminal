@@ -487,6 +487,9 @@ function App() {
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
   const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
   const [voiceAvail, setVoiceAvail] = useState(false);
+  const [voices, setVoices] = useState<{ id: string; label: string }[]>([]); // available Kokoro voices
+  const [ttsVoice, setTtsVoiceState] = useState<string>(() => { try { return localStorage.getItem("ct-voice-name") || ""; } catch { return ""; } });
+  const setTtsVoice = (v: string) => { setTtsVoiceState(v); try { localStorage.setItem("ct-voice-name", v); } catch { /* */ } };
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [speaking, setSpeaking] = useState(false); // a message is being read aloud (long-press -> Read aloud)
   const [search, setSearch] = useState("");
@@ -607,7 +610,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
     refreshConvs();
     refreshFavs();
     const c = new URLSearchParams(location.search).get("c");
@@ -936,13 +939,13 @@ function App() {
   // Core send used by both the composer and voice mode. Renders the user turn optimistically,
   // starts/resumes the conversation, and returns its session id. Stable (reads refs) so the
   // voice bridge identity never churns.
-  const submitText = useCallback(async (text: string): Promise<string | null> => {
+  const submitText = useCallback(async (text: string, opts?: { voice?: boolean }): Promise<string | null> => {
     if (!text.trim()) return null;
     setBusy(true);
     stickBottom.current = true; setAtBottom(true); // sending re-anchors to the bottom so you see your turn + the reply
     pendingUser.current.push(text);
     setItems((it) => applyEvent(it, { t: "user", text }));
-    const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
+    const body = { text, resume: activeIdRef.current || undefined, model: modelRef.current || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
     const isNewChat = !activeIdRef.current;
     const queue = async () => {
       await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued);
@@ -980,7 +983,7 @@ function App() {
 
   // Stable bridge handed to voice mode: submit a turn + subscribe to the live event stream.
   const voiceBridge = useMemo<VoiceBridge>(() => ({
-    submit: submitText,
+    submit: (text: string) => submitText(text, { voice: true }), // flag the turn so the backend adds the brief/TTS directive
     subscribe: (fn) => { voiceSinks.current.add(fn as (e: AppEvent) => void); return () => { voiceSinks.current.delete(fn as (e: AppEvent) => void); }; },
   }), [submitText]);
 
@@ -1153,6 +1156,17 @@ function App() {
                 </span>
                 <button role="switch" aria-checked={speakFinalOnly} className={"toggle" + (speakFinalOnly ? " on" : "")} onClick={() => setSpeakFinal(!speakFinalOnly)}><span className="knob" /></button>
               </label>
+              {voices.length > 0 && (
+                <label className="settings-row">
+                  <span className="settings-row-main">
+                    <span className="settings-row-title">Voice</span>
+                    <span className="settings-row-desc">Which text-to-speech voice reads replies aloud (voice mode and read-aloud).</span>
+                  </span>
+                  <select className="settings-select" value={ttsVoice} onChange={(e) => setTtsVoice(e.target.value)}>
+                    {voices.map((v) => <option key={v.id} value={v.id}>{v.label}</option>)}
+                  </select>
+                </label>
+              )}
             </div>
           </div>
         </div>
@@ -1360,7 +1374,7 @@ function App() {
             {speaking ? (
               <button onClick={() => { stopReadAloud(); setMsgMenu(null); }}>Stop reading</button>
             ) : (
-              <button onClick={() => { const t = msgMenu.text; setMsgMenu(null); setSpeaking(true); readAloud(t, { useServerTts: voiceAvail && online, onEnd: () => setSpeaking(false) }); }}>Read aloud</button>
+              <button onClick={() => { const t = msgMenu.text; setMsgMenu(null); setSpeaking(true); readAloud(t, { useServerTts: voiceAvail && online, voice: ttsVoice || undefined, onEnd: () => setSpeaking(false) }); }}>Read aloud</button>
             )}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
             {msgMenu.kind === "user" && <button onClick={() => editIntoComposer(msgMenu.text)}>Edit</button>}
@@ -1377,7 +1391,7 @@ function App() {
           </div>
         </>
       )}
-      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} />
+      <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} ttsVoice={ttsVoice || undefined} />
     </div>
   );
 }

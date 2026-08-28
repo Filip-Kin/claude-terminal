@@ -7,7 +7,20 @@
 
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
-import { getOrCreate, get, liveStatuses, replayTranscript, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, type AppEvent, type AskNotifier } from "./app-runner";
+
+// Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
+// sidecar's own default. The picker in Settings lets the user switch male/female/accent.
+const TTS_VOICES = [
+  { id: "af_heart", label: "Female · Heart (default)" },
+  { id: "af_bella", label: "Female · Bella" },
+  { id: "af_nicole", label: "Female · Nicole" },
+  { id: "am_michael", label: "Male · Michael" },
+  { id: "am_adam", label: "Male · Adam" },
+  { id: "am_fenrir", label: "Male · Fenrir" },
+  { id: "bf_emma", label: "British female · Emma" },
+  { id: "bm_george", label: "British male · George" },
+];
 
 export interface AppCtx {
   allowed: (req: Request) => boolean;
@@ -179,7 +192,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   // --- API ---
-  if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, moreModels: ctx.moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl) }, ctx, req);
+  if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, moreModels: ctx.moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
 
   // --- Voice mode proxies (owner-gated above). Forward to the loopback Whisper/Kokoro
   //     services so the mic audio + synthesized speech never leave the box unproxied. ---
@@ -378,8 +391,9 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   // Start a chat: brand-new (no resume) or resume an existing session id. Kicks the first turn.
   if (req.method === "POST" && path === "/app/api/start") {
     let b: any = {}; try { b = await req.json(); } catch {}
-    const text = String(b.text ?? "").trim();
-    if (!text) return jsonRes({ error: "empty message" }, ctx, req, 400);
+    const rawText = String(b.text ?? "").trim();
+    if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
+    const text = b.voice ? decorateVoiceTurn(rawText) : rawText; // voice mode -> append the brief/TTS directive
     const resume: string | undefined = b.resume && /^[A-Za-z0-9-]{6,}$/.test(b.resume) ? b.resume : undefined;
     let cwd: string = ctx.defaultCwd;
     if (resume) { const found = findTranscript(ctx, resume); if (found) { const m = await convMeta(found.path); if (m.cwd) cwd = m.cwd; } }
@@ -398,9 +412,9 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     let b: any = {}; try { b = await req.json(); } catch {}
     const conv = b.id ? get(String(b.id)) : undefined;
     if (!conv) return jsonRes({ error: "no live conversation for id (start or resume it first)" }, ctx, req, 409);
-    const text = String(b.text ?? "").trim();
-    if (!text) return jsonRes({ error: "empty message" }, ctx, req, 400);
-    conv.send(text);
+    const rawText = String(b.text ?? "").trim();
+    if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
+    conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText); // voice mode -> append the brief/TTS directive
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
   }
 
