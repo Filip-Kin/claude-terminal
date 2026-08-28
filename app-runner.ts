@@ -10,6 +10,7 @@
 import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { mkdirSync } from "node:fs";
 import { z } from "zod";
+import { armResume, cancelResume } from "./subscription-resume.ts";
 
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
@@ -133,6 +134,8 @@ export class Conversation {
   // get this turn's events, not the whole multi-turn history (which the client already has
   // from the transcript). Otherwise reopening a live conversation replays every prior turn.
   private seqCounter = 0; // stable per-conversation sequence so a reconnect can dedupe
+  private currentTurnText = ""; // text of the in-flight user turn — re-sent if the limit cuts it off
+  private pendingRateLimit: { resumeAt: number; type?: string } | null = null; // set when a turn is rejected by the subscription limit
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -176,6 +179,10 @@ export class Conversation {
     if (this.closed) return;
     this.lastActivity = Date.now();
     this.busy = true;
+    this.currentTurnText = text; // remember it so a subscription-limit rejection can re-run this turn
+    // The user is actively driving this conversation, so any auto-resume we had queued for it is
+    // no longer wanted (this counts as the "easy cancel" for the default-on behaviour).
+    try { cancelResume(this.id); } catch { /* */ }
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
     this.emit({ t: "user", text });
     this.emit({ t: "busy", busy: true });
@@ -265,6 +272,7 @@ export class Conversation {
   private async *inputGen(first?: string): AsyncGenerator<SDKUserMessage> {
     if (first !== undefined) {
       this.busy = true;
+      this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
       this.runStart = this.log.length; // first turn's replay boundary
       this.emit({ t: "user", text: first });
       this.emit({ t: "busy", busy: true });
@@ -299,11 +307,35 @@ export class Conversation {
       for await (const m of this.q) this.handle(m);
     } catch (e: any) {
       this.emit({ t: "error", message: String(e?.message || e) });
+      this.armRateLimitedResume(); // backstop: the query threw while rate-limited -> still auto-resume
     } finally {
       this.busy = false;
       this.emit({ t: "busy", busy: false });
       this.emit({ t: "closed" });
     }
+  }
+
+  // Reset time (unix ms) for a rate-limit rejection: prefer the event's own resetsAt (epoch s or
+  // ms), else fall back to the cached subscription snapshot's matching window.
+  private resetAtFrom(info: any): number | null {
+    const raw = info?.resetsAt;
+    if (typeof raw === "number" && isFinite(raw) && raw > 0) return raw < 1e12 ? Math.round(raw * 1000) : Math.round(raw);
+    const snap = getSubscriptionUsage();
+    const iso = String(info?.rateLimitType || "").startsWith("seven_day") ? snap?.sevenDay?.resetsAt : snap?.fiveHour?.resetsAt;
+    const t = iso ? Date.parse(iso) : NaN;
+    return isFinite(t) ? t : null;
+  }
+
+  // If the turn just ended was rejected by the subscription limit, queue it to auto-resume at reset.
+  private armRateLimitedResume(): void {
+    const rl = this.pendingRateLimit;
+    this.pendingRateLimit = null;
+    if (!rl || !this.currentTurnText || !this.id) return;
+    try {
+      armResume({ convId: this.id, text: this.currentTurnText, resumeAt: rl.resumeAt, rateLimitType: rl.type, createdAt: Date.now() });
+      const when = new Date(rl.resumeAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      this.emit({ t: "notice", kind: "info", text: `Subscription limit reached — this turn will auto-resume around ${when} when the limit resets.` });
+    } catch { /* */ }
   }
 
   private handle(m: SDKMessage) {
@@ -376,8 +408,19 @@ export class Conversation {
         if (sk) this.emit({ t: "notice", kind: "skill", text: sk });
         break;
       }
+      // claude.ai subscription rate-limit signal. A 'rejected' status means this turn was blocked
+      // because the shared 5h/7d limit is exhausted; remember it so the turn auto-resumes at reset.
+      case "rate_limit_event": {
+        const info = anyM.rate_limit_info || {};
+        if (info.status === "rejected") {
+          const resumeAt = this.resetAtFrom(info);
+          if (resumeAt) this.pendingRateLimit = { resumeAt, type: info.rateLimitType };
+        }
+        break;
+      }
       case "result": {
         this.busy = false;
+        this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
         const u = anyM.usage || {};
         const input = u.input_tokens || 0;
         const cacheCreate = u.cache_creation_input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0;

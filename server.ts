@@ -15,6 +15,7 @@ import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
 import { Connections } from "./connections.ts";
 import { appRoutes, type AppCtx } from "./app-server.ts";
+import { initSubscriptionResume } from "./subscription-resume.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -990,5 +991,12 @@ setInterval(() => {
   const enc = new TextEncoder();
   for (const c of [...sseClients]) { try { c.enqueue(enc.encode(": ping\n\n")); } catch { sseClients.delete(c); } }
 }, 25000);
+
+// Auto-resume /app turns that the shared subscription limit cut off: re-arm any persisted intents
+// (they survive a restart) and re-run each at its window reset. Non-fatal — a failure here must
+// never stop the server from serving.
+try {
+  initSubscriptionResume({ file: join(STATE_DIR, "claude-app-subscription-resume.json"), port: PORT, owner: OWNER });
+} catch (e) { console.error("subscription-resume init failed", e); }
 
 console.log(`claude-terminal listening on http://${server.hostname}:${server.port} (owner=${OWNER}, db=${DB_PATH})`);
