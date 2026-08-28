@@ -591,7 +591,7 @@ function App() {
       .then((d) => {
         const list: Conv[] = d.conversations || [];
         const favs: Conv[] = d.favorites || [];
-        const merged = dedupeConvs([...favs, ...list]); // favorites always present, even if aged out
+        const merged = dedupeConvs([...favs, ...list]).sort((a, b) => b.mtime - a.mtime); // most-recent first
         setConvs(merged); offline.cacheList(merged);
         nextOffsetRef.current = typeof d.nextOffset === "number" ? d.nextOffset : list.length;
         setHasMore(!!d.hasMore);
@@ -605,7 +605,7 @@ function App() {
     api.convs(nextOffsetRef.current)
       .then((d) => {
         const more: Conv[] = d.conversations || [];
-        setConvs((prev) => dedupeConvs([...prev, ...more]));
+        setConvs((prev) => dedupeConvs([...prev, ...more]).sort((a, b) => b.mtime - a.mtime));
         nextOffsetRef.current = typeof d.nextOffset === "number" ? d.nextOffset : nextOffsetRef.current;
         setHasMore(!!d.hasMore);
       })
@@ -653,10 +653,14 @@ function App() {
     setQueued(q.length);
     setQueuedIds(new Set(q.map((it: any) => it.body?.resume).filter(Boolean)));
   }, []);
-  // Mark a conversation read (its unread dot clears until new activity bumps mtime past this).
+  // Mark a conversation read. Store the conversation's OWN mtime (the NAS file clock, same source the
+  // unread check compares against) — NOT Date.now(), whose phone clock can lag the NAS and leave the
+  // dot stuck "unread" forever. max() so a stale local mtime never lowers the marker.
   const markRead = useCallback((id: string | null) => {
     if (!id || id.startsWith("pending-")) return;
-    lastReadRef.current[id] = Date.now(); saveLastRead(lastReadRef.current); setReadTick((t) => t + 1);
+    const conv = convsRef.current.find((c) => c.sessionId === id);
+    const mark = conv ? Math.max(conv.mtime, lastReadRef.current[id] || 0) : (lastReadRef.current[id] || Date.now());
+    lastReadRef.current[id] = mark; saveLastRead(lastReadRef.current); setReadTick((t) => t + 1);
   }, []);
   const toggleFav = useCallback((id: string) => {
     setFavorites((s) => {
@@ -695,8 +699,12 @@ function App() {
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
   }, [refreshQueue]);
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
-  useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, markRead]);
+  // Re-mark on convs updates too: after a turn finishes, refreshConvs bumps the active conversation's
+  // mtime a beat later — without this, switching away right then would show it falsely unread.
+  useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, convs, markRead]);
   useEffect(() => { itemsRef.current = items; }, [items]); // for the context estimate
+  const convsRef = useRef<Conv[]>([]);
+  useEffect(() => { convsRef.current = convs; }, [convs]); // latest list for read-marking / lookups
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
   // Snapshot the on-screen conversation into the per-message cache. We diff against what we last
@@ -1284,7 +1292,7 @@ function App() {
   const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || model || "Model";
 
   // sidebar grouping — favorites pulled into their own section, the rest grouped by recency
-  const favConvs = useMemo(() => convs.filter((c) => favorites.has(c.sessionId)), [convs, favorites]);
+  const favConvs = useMemo(() => convs.filter((c) => favorites.has(c.sessionId)).sort((a, b) => b.mtime - a.mtime), [convs, favorites]);
   const groups = useMemo(() => {
     const g: { label: string; items: Conv[] }[] = [];
     for (const c of convs) {
