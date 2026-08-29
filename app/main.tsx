@@ -591,7 +591,7 @@ function CompactionBanner({ start }: { start: number }) {
   const secs = Math.max(0, Math.round((now - start) / 1000));
   return (
     <div className="compact-banner">
-      <div className="compact-row"><span className="spin" />Compacting conversation to free context… <span className="compact-secs">{secs}s</span></div>
+      <div className="compact-row">Compacting conversation to free context… <span className="compact-secs">{secs}s</span></div>
       <div className="compact-bar" />
     </div>
   );
@@ -1002,6 +1002,7 @@ function App() {
   const doCompact = useCallback(async () => {
     const s = activeStoreRef.current;
     if (!s || s.compacting) return;
+    stickBottom.current = true; forceBottom.current = true; // pin to the bottom so the banner (then the card) is in view
     s.beginCompact(); // optimistic banner; the backend "compacting"/"compact" events keep it honest
     try { await api.compact(s.id); } catch { /* */ }
     // Safety net: if the compact events never arrive (e.g. dropped stream), clear the banner anyway.
@@ -1211,7 +1212,7 @@ function App() {
     // Follow new content ONLY while the user is parked at the bottom. The moment they scroll up to
     // read, stickBottom goes false (see onThreadScroll) and we stop yanking them back down.
     if (stickBottom.current) el.scrollTop = el.scrollHeight;
-  }, [items, busy]);
+  }, [items, busy, compacting]);
 
   // Track whether the user is at the bottom. Programmatic scroll-to-bottom lands here too and
   // (correctly) re-sticks; scrolling up to read un-sticks and shows the jump-to-latest button.
@@ -1240,7 +1241,9 @@ function App() {
         if (store !== activeStoreRef.current) return;
         lastEventAt.current = Date.now(); // stall watchdog: the active stream is alive
         for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode
-        if (e.t === "compact") flushCompactRef.current(); // release messages typed during compaction
+        // Release messages typed during compaction. Deferred a microtask because onEvent runs BEFORE
+        // ingest applies the compact card — this way the queued turns render AFTER the divider.
+        if (e.t === "compact") queueMicrotask(() => flushCompactRef.current());
       },
       onContext: (store) => { if (store === activeStoreRef.current) refreshContext(store.id); },
     };
@@ -1281,15 +1284,18 @@ function App() {
   }, []);
   useEffect(() => () => manager.closeAll(), []); // close every socket on unmount
 
-  // Messages typed DURING a compaction are held (submitText renders them optimistically, then queues
-  // the text), and sent once compaction finishes — the compact event fires onEvent -> here.
+  // Messages typed DURING a compaction are held (text only, no optimistic render), then rendered +
+  // sent once compaction finishes — the compact event fires onEvent -> here (deferred a microtask so
+  // the compact card is already in items, landing these turns BELOW the divider instead of above it).
   flushCompactRef.current = () => {
     const q = compactQueue.current; compactQueue.current = [];
     const s = activeStoreRef.current; if (!q.length || !s) return;
     void (async () => {
       for (const text of q) {
-        const body = { text, resume: s.id.startsWith("new-") ? undefined : s.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
-        try { if (s.connected) await api.send({ id: s.id, text }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
+        s.addOptimisticUser(text); // now renders below the compaction divider (card already applied)
+        const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+        const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
+        try { if (s.connected) await api.send({ id: s.id, text, cid }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
         catch { await offline.enqueueSend(body); void refreshQueue(); }
       }
     })();
@@ -1433,6 +1439,9 @@ function App() {
     let s = activeStoreRef.current;
     const isNewChat = !s || s.id.startsWith("pending-");
     if (isNewChat) { s = manager.ensure("new-" + Date.now().toString(36) + Math.floor(performance.now())); setActiveStore(s); activeStoreRef.current = s; }
+    // During compaction, hold the message ENTIRELY (no optimistic render yet). flushCompact renders +
+    // sends it once the compact card is in place, so it lands BELOW the compaction divider, not above.
+    if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push(text); return s!.id; }
     s!.addOptimisticUser(text); // renders the turn, flips busy, sets sendState "sending"
     // Stable client id so a redelivery (offline queue OR a timeout requeue) is deduped server-side
     // instead of posting the same turn twice.
@@ -1450,9 +1459,6 @@ function App() {
       s!.setBusy(false); s!.setSendState("queued"); // visibly waiting to send, not lost
     };
     if (typeof navigator !== "undefined" && !navigator.onLine) { await queue(); return null; } // offline: hold it, send on reconnect
-    // During compaction, hold the message (already rendered optimistically) and send it once the
-    // compaction finishes, so it isn't lost or racing the /compact turn.
-    if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push(text); return s!.id; }
     try {
       // withTimeout so a hung request on a weak link fails fast into the queue instead of sitting
       // "sending" forever. A redelivery is deduped by cid, so the timeout can't double-send.
