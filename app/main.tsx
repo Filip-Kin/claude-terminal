@@ -332,11 +332,13 @@ class ConvStore {
     this.es = es;
     es.onmessage = (ev) => { let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; } this.ingest(e); };
     es.onerror = () => { if (es.readyState === EventSource.CLOSED) this.disconnect(); }; // 404/fatal -> drop; transient -> browser retries the same socket
+    this.signal(); // connected flips -> re-render (the Stop button depends on it)
   }
   disconnect() {
     if (!this.es) return;
     try { this.es.onmessage = null; this.es.onerror = null; this.es.close(); } catch { /* */ }
     this.es = null;
+    this.signal(); // connected flips -> re-render so a stale Stop button clears
   }
   get connected() { return !!this.es; }
 
@@ -1906,7 +1908,7 @@ function App() {
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z" stroke="currentColor" strokeWidth="1.7" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /></svg>
                 </button>
               )}
-              {busy && (
+              {busy && activeStore?.connected && (
                 <button className="send-btn stop-btn" onClick={stop} title="Stop the current turn">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
                 </button>
