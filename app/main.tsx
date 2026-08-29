@@ -1566,6 +1566,9 @@ function App() {
   const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => { setInput(e.target.value); const ta = e.target; ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; };
 
   const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || model || "Model";
+  // Collapsed pill: drop any "(…)" qualifier so it stays short and single-line (e.g. "Default
+  // (recommended)" -> "Default"). The dropdown row keeps the full name + description.
+  const modelBtnLabel = modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel;
 
   // sidebar grouping — favorites pulled into their own section, the rest grouped by recency
   const favConvs = useMemo(() => convs.filter((c) => favorites.has(c.sessionId)).sort((a, b) => b.mtime - a.mtime), [convs, favorites]);
@@ -1873,7 +1876,7 @@ function App() {
           <div className="composer-foot">
             <div className="model-picker up">
               <button className="model-btn" onClick={() => setMenuOpen((o) => !o)}>
-                {modelLabel}
+                <span>{modelBtnLabel}</span>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
               </button>
               {menuOpen && (
