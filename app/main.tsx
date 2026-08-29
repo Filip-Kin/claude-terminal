@@ -405,7 +405,9 @@ class ConvStore {
     this.cwd = meta.cwd; this.hydrated = true;
     const localAhead = this.pendingEcho.length > 0 || (this.busy && this.items.length >= items.length);
     if (!localAhead) { this.items = items; this.cachedItems = items; }
-    this.busy = meta.busy || this.busy;
+    // Trust the server's busy on a fresh reconcile so a stale cached busy clears (otherwise a finished
+    // turn keeps the Stop button up). Stay busy only while we hold an unacknowledged optimistic send.
+    this.busy = this.pendingEcho.length > 0 ? true : meta.busy;
     this.signal();
   }
 
