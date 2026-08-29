@@ -158,6 +158,11 @@ a { color: var(--accent-2); }
 }
 .model-menu button:hover { background: var(--bg-3); }
 .model-menu .dot { color: var(--accent); }
+/* Dynamic model rows carry a description subtitle, so they stack instead of the single-line layout. */
+.model-menu button.model-row { flex-direction: column; align-items: stretch; gap: 2px; }
+.model-menu .model-row { max-width: 320px; }
+.model-menu .model-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.model-menu .model-desc { color: var(--text-2); font-size: 11.5px; line-height: 1.35; white-space: normal; }
 .model-menu .model-other { border-top: 1px solid var(--line-2); margin-top: 4px; padding-top: 9px; color: var(--text-2); font-size: 13px; }
 /* In the composer foot the menu opens UPWARD (it sits at the bottom of the screen) and to the left. */
 .model-picker.up .model-menu { top: auto; bottom: 40px; left: 0; right: auto; }

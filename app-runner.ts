@@ -53,6 +53,50 @@ type Sub = (e: AppEvent) => void;
 // so replay strips it from the visible transcript; the live UI already renders the user's own words.
 const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; your reply will be read aloud by text-to-speech. Keep it brief and conversational: lead with the answer in one or two spoken sentences. Do not use markdown, bullet or numbered lists, tables, code blocks, headings, or URLs unless explicitly asked. Write times and numbers as words a voice would say (for example 'five thirty PM', not '5:30 PM'). Only expand if the user asks for detail.";
 export function decorateVoiceTurn(text: string): string { return `${text}\n\n<voice-mode>${VOICE_DIRECTIVE}</voice-mode>`; }
+// #endregion
+
+// #region dynamic model list
+// The chat model picker mirrors the CLI's OWN supported-models menu (display names, order,
+// descriptions) instead of a hardcoded list, so a new/renamed model appears without a redeploy.
+// Sourced from a throwaway streaming query whose supportedModels() is a control request — it spends
+// no tokens and runs no turn. Stale-while-revalidate cached (the probe spawns a CLI subprocess, ~1-2s,
+// so we never do it per request); falls back to the caller's config list when the probe fails.
+export type AppModel = { id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean };
+let modelCache: { at: number; models: AppModel[] } | null = null;
+let modelInFlight: Promise<AppModel[]> | null = null;
+const MODEL_TTL_MS = 10 * 60_000;
+
+async function probeSupportedModels(): Promise<AppModel[]> {
+  // A prompt generator that never yields keeps the query in streaming-input mode with no turn;
+  // we only issue the supportedModels() control request, then close the subprocess.
+  async function* idle(): AsyncGenerator<SDKUserMessage> { await new Promise<void>(() => {}); }
+  const q = query({ prompt: idle(), options: { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
+  try {
+    const raw = await q.supportedModels();
+    return (raw || []).map((m) => ({ id: m.value, label: m.displayName || m.value, description: m.description, resolvedModel: m.resolvedModel, supportsEffort: m.supportsEffort }));
+  } finally {
+    try { q.close(); } catch { /* */ }
+  }
+}
+
+function refreshModels(): Promise<AppModel[]> {
+  if (modelInFlight) return modelInFlight;
+  modelInFlight = probeSupportedModels()
+    .then((m) => { if (m.length) modelCache = { at: Date.now(), models: m }; return m; })
+    .finally(() => { modelInFlight = null; });
+  return modelInFlight;
+}
+
+// Warm cache: serve immediately and revalidate in the background when stale. Cold: probe now
+// (concurrent callers share one in-flight probe). Returns [] only if a cold probe fails, so the
+// endpoint can fall back to its config list.
+export async function getSupportedModels(): Promise<AppModel[]> {
+  if (modelCache) {
+    if (Date.now() - modelCache.at >= MODEL_TTL_MS) void refreshModels().catch(() => {});
+    return modelCache.models;
+  }
+  try { return await refreshModels(); } catch { return []; }
+}
 
 // Appended to the Claude Code system prompt for /app chats so Claude actually USES the chat UI's rich
 // rendering (it otherwise defaults to terminal-style plain text). The UI renders these inline.

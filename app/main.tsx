@@ -56,7 +56,7 @@ function longPressBind(open: (x: number, y: number) => void) {
 }
 
 // #region types
-type Model = { id: string; label: string };
+type Model = { id: string; label: string; description?: string };
 type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean; queuedText?: string };
 type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
@@ -1879,7 +1879,10 @@ function App() {
               {menuOpen && (
                 <div className="model-menu" onMouseLeave={() => setMenuOpen(false)}>
                   {models.map((m) => (
-                    <button key={m.id} onClick={() => onPickModel(m.id)}>{m.label}{m.id === model && <span className="dot">●</span>}</button>
+                    <button key={m.id} className="model-row" onClick={() => onPickModel(m.id)}>
+                      <span className="model-line">{m.label}{m.id === model && <span className="dot">●</span>}</span>
+                      {m.description && <span className="model-desc">{m.description}</span>}
+                    </button>
                   ))}
                   {moreModels.length > 0 && <button className="model-other" onClick={() => { setMenuOpen(false); setOtherOpen(true); }}>Other versions…</button>}
                 </div>

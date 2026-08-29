@@ -7,7 +7,7 @@
 
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getSubscriptionUsage, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getSubscriptionUsage, getSupportedModels, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -253,7 +253,13 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   // --- API ---
-  if (req.method === "GET" && path === "/app/api/models") return jsonRes({ models: ctx.models, moreModels: ctx.moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
+  if (req.method === "GET" && path === "/app/api/models") {
+    // Prefer the CLI's live supported-models menu; fall back to the config list if the probe fails.
+    // A dynamic list is already the curated menu, so there's no separate "Other…" list.
+    let models = ctx.models, moreModels = ctx.moreModels;
+    try { const dyn = await getSupportedModels(); if (dyn.length) { models = dyn; moreModels = []; } } catch { /* keep config fallback */ }
+    return jsonRes({ models, moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
+  }
 
   // --- Voice mode proxies (owner-gated above). Forward to the loopback Whisper/Kokoro
   //     services so the mic audio + synthesized speech never leave the box unproxied. ---
