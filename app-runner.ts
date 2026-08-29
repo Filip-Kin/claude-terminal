@@ -43,6 +43,8 @@ export type AppEvent =
 // thinking is the exact reasoning subset; context = tokens read to answer (mostly cached history);
 // durationMs = the run's real wall-clock.
 export type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
+// Result of the file-rollback half of an edit-and-rerun (from Query.rewindFiles).
+export type RewindInfo = { canRewind?: boolean; error?: string; filesChanged?: string[]; insertions?: number; deletions?: number };
 
 type Sub = (e: AppEvent) => void;
 // #endregion
@@ -180,6 +182,10 @@ export class Conversation {
   private seqCounter = 0; // stable per-conversation sequence so a reconnect can dedupe
   private currentTurnText = ""; // text of the in-flight user turn — re-sent if the limit cuts it off
   private pendingRateLimit: { resumeAt: number; type?: string } | null = null; // set when a turn is rejected by the subscription limit
+  private forkAt?: string;      // resumeSessionAt for the next (forked) run — the kept history's last entry
+  private forkNext = false;     // one-shot: the next run() should fork the session (edit-and-rerun)
+  private runGen = 0;           // bumped per run() so a superseded run's finally stays quiet
+  private inited = false;       // an init event has been seen (the SDK session is live)
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -241,6 +247,51 @@ export class Conversation {
   }
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
+
+  // Boot the SDK query for a conversation that isn't live yet (resume, no turn), so an edit-and-rerun
+  // has a query to call rewindFiles on. Waits until the session reports init.
+  async bootForRewind(): Promise<void> {
+    if (this.q) return;
+    this.closed = false;
+    void this.run();
+    await this.waitForInit();
+  }
+
+  private waitForInit(ms = 8000): Promise<void> {
+    if (this.inited) return Promise.resolve();
+    return new Promise<void>((res) => {
+      let done = false;
+      const finish = () => { if (done) return; done = true; clearTimeout(to); off(); res(); };
+      const to = setTimeout(finish, ms);
+      const off = this.subscribe((e) => { if (e.t === "init") finish(); }, true);
+    });
+  }
+
+  // Edit an earlier user turn and re-run from there. (1) Roll files back to that turn's checkpoint
+  // (best-effort — only sessions that ran with checkpointing have one). (2) Fork the transcript so
+  // the edited turn and everything after it are dropped, then run the edited text on the new forked
+  // session. forkAtUuid = the kept history's last transcript entry (null when editing the very first
+  // turn -> start a fresh session). rewindToUuid = the edited user message's uuid (files restore to
+  // its pre-turn state). The forked session's new id arrives on the next init event, which re-keys
+  // the map and rebinds the client automatically.
+  async editTurn(forkAtUuid: string | null, rewindToUuid: string | null, text: string): Promise<RewindInfo> {
+    let rewind: RewindInfo = {};
+    if (rewindToUuid && this.q) {
+      try {
+        const r = await (this.q as any).rewindFiles?.(rewindToUuid);
+        if (r) rewind = { canRewind: r.canRewind, error: r.error, filesChanged: r.filesChanged, insertions: r.insertions, deletions: r.deletions };
+      } catch (e: any) { rewind = { canRewind: false, error: String(e?.message || e) }; }
+    }
+    const oldQ = this.q;
+    this.queue = [];
+    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); } // release the old input generator
+    if (forkAtUuid) { this.resume = this.id; this.forkAt = forkAtUuid; this.forkNext = true; }
+    else { this.resume = undefined; this.forkAt = undefined; this.forkNext = false; } // editing the first turn -> fresh session
+    this.closed = false;
+    void this.run(text);                         // bumps runGen, starts the forked query, emits the edited user turn
+    try { oldQ?.close(); } catch { /* the old run's finally is superseded (older gen) -> stays silent */ }
+    return rewind;
+  }
 
   // The user tapped an option (or dismissed) for an ask_user prompt.
   answerAsk(askId: string, answer: string): boolean {
@@ -332,17 +383,27 @@ export class Conversation {
   // Start the SDK query. `first` is the opening user turn for a brand-new chat;
   // omit it when resuming (the client sends the next turn via send()).
   async run(first?: string) {
+    // A refork tears down the current query and starts a fresh one; each run() gets a generation
+    // token so the OLD run's finally (fired when its query ends) knows it was superseded and stays
+    // quiet — otherwise it would emit a spurious closed/busy:false that drops the client's stream.
+    const myGen = ++this.runGen;
+    // Fork options for an edit-and-rerun: resume the current session but truncate at forkAt (drop
+    // the edited turn + everything after) into a new forked session. One-shot: cleared after use.
+    const forkOpts = this.forkNext ? { ...(this.forkAt ? { resumeSessionAt: this.forkAt } : {}), forkSession: true } : {};
+    this.forkNext = false; this.forkAt = undefined;
     this.q = query({
       prompt: this.inputGen(first),
       options: {
         cwd: this.cwd,
         ...(this.model ? { model: this.model } : {}),
         ...(this.resume ? { resume: this.resume } : {}),
+        ...forkOpts,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
         thinking: { type: "adaptive" }, // let Claude think; we render it streaming
         autoCompactEnabled: true, // compact automatically before the context window fills (default, set explicit)
+        enableFileCheckpointing: true, // back up files before edits so an edit-and-rerun can roll them back (Query.rewindFiles)
         systemPrompt: { type: "preset", preset: "claude_code", append: APP_UI_SYSTEM_APPEND }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
         mcpServers: { "app-ui": this.makeAskServer() }, // ask_user tool -> tappable options in the UI
       },
@@ -350,12 +411,15 @@ export class Conversation {
     try {
       for await (const m of this.q) this.handle(m);
     } catch (e: any) {
-      this.emit({ t: "error", message: String(e?.message || e) });
+      if (myGen === this.runGen) this.emit({ t: "error", message: String(e?.message || e) });
       this.armRateLimitedResume(); // backstop: the query threw while rate-limited -> still auto-resume
     } finally {
-      this.busy = false;
-      this.emit({ t: "busy", busy: false });
-      this.emit({ t: "closed" });
+      // Superseded by a refork -> stay silent; the new run owns the stream now.
+      if (myGen === this.runGen) {
+        this.busy = false;
+        this.emit({ t: "busy", busy: false });
+        this.emit({ t: "closed" });
+      }
     }
   }
 
@@ -387,7 +451,7 @@ export class Conversation {
     if (anyM.session_id && anyM.session_id !== this.id) this.id = anyM.session_id;
     switch (m.type) {
       case "system":
-        if (anyM.subtype === "init") this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
+        if (anyM.subtype === "init") { this.inited = true; this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd }); }
         else if (anyM.subtype === "compact_boundary") {
           const md = anyM.compact_metadata || {};
           this.emit({ t: "compacting", active: false });
@@ -613,6 +677,43 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
     }
   }
   return out;
+}
+
+// Resolve the fork points for editing the user turn at ordinal `userIndex` (0-based, counting only
+// real user prompts — the same turns the UI renders as `user` bubbles). Returns the edited turn's
+// transcript uuid (rewindTo, for the file rollback), the uuid of the kept history's last chain entry
+// (forkAt, for resumeSessionAt — null when editing the first turn), and the original prompt text (so
+// the caller can guard against a stale index). Mirrors replayTranscript's notion of a "user turn".
+export async function resolveEditPoints(path: string, userIndex: number): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
+  let text: string;
+  try { text = await Bun.file(path).text(); } catch { return null; }
+  const entries: { uuid: string; isPrompt: boolean; isSidechain: boolean; text: string }[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let o: any;
+    try { o = JSON.parse(line); } catch { continue; }
+    if (!o.uuid) continue;
+    const isSidechain = !!o.isSidechain;
+    let isPrompt = false, ptext = "";
+    if (o.type === "user" && o.message && !o.isCompactSummary && !isSidechain) {
+      const c = o.message.content;
+      const hasToolResult = Array.isArray(c) && c.some((b: any) => b?.type === "tool_result");
+      if (!hasToolResult) {
+        const t = textOfContent(c).replace(VOICE_STRIP, "");
+        if (t.trim() && !t.startsWith("<") && !skillLoadName(t)) { isPrompt = true; ptext = t; }
+      }
+    }
+    entries.push({ uuid: o.uuid, isPrompt, isSidechain, text: ptext });
+  }
+  const prompts = entries.filter((e) => e.isPrompt);
+  const target = prompts[userIndex];
+  if (!target) return null;
+  const pos = entries.indexOf(target);
+  // Fork at the last MAIN-chain (non-sidechain) entry before the edited turn: that's the kept
+  // history's tail. Subagent (sidechain) entries aren't valid main-chain fork points.
+  let forkAtUuid: string | null = null;
+  for (let i = pos - 1; i >= 0; i--) { if (!entries[i].isSidechain) { forkAtUuid = entries[i].uuid; break; } }
+  return { rewindToUuid: target.uuid, forkAtUuid, promptText: target.text };
 }
 // #endregion
 

@@ -340,6 +340,15 @@ a { color: var(--accent-2); }
 }
 .composer:focus-within { border-color: #55493f; }
 .attach-row { display: flex; flex-wrap: wrap; gap: 6px; }
+/* Edit-and-rerun banner above the composer: signals the next send rewinds instead of appending. */
+.edit-banner {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 8px; padding: 8px 12px;
+  background: var(--bg-2); border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  border-radius: 10px; color: var(--text-2); font-size: 12.5px; line-height: 1.4;
+}
+.edit-banner span { flex: 1 1 auto; }
+.edit-banner button { flex: 0 0 auto; background: transparent; border: none; color: var(--text-2); font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.edit-banner button:hover { color: var(--text); }
 .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; padding: 3px 8px; font-size: 12px; color: var(--text-2); }
 .chip button { background: none; border: none; color: var(--text-3); padding: 0; line-height: 1; font-size: 14px; }
 .chip-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

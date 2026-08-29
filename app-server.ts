@@ -7,7 +7,7 @@
 
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getSubscriptionUsage, getSupportedModels, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getSubscriptionUsage, getSupportedModels, resolveEditPoints, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -497,6 +497,34 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText); // voice mode -> append the brief/TTS directive
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
+  }
+
+  // Edit an earlier user turn and re-run from there (full rollback): roll files back to that turn's
+  // checkpoint, fork the transcript so the turn and everything after it are dropped, then run the
+  // edited text. index = 0-based ordinal among user turns (matches the UI's user bubbles). The new
+  // forked session id arrives on the stream (init), which rebinds the client automatically.
+  if (req.method === "POST" && path === "/app/api/edit") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const id = String(b.id || "");
+    const index = Number(b.index);
+    const rawText = String(b.text ?? "").trim();
+    if (!id || !Number.isInteger(index) || index < 0 || !rawText) return jsonRes({ error: "id, index (>=0) and text required" }, ctx, req, 400);
+    if (dedupSeen(b.cid)) return jsonRes({ ok: true, id, deduped: true }, ctx, req);
+    const found = findTranscript(ctx, id);
+    if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
+    const points = await resolveEditPoints(found.path, index);
+    if (!points) return jsonRes({ error: "could not resolve the edited turn (reload and retry)" }, ctx, req, 409);
+    // Guard against a stale client view: if the client told us the original text, it must still match
+    // the turn at that index, or we'd fork at the wrong place.
+    if (typeof b.orig === "string" && b.orig.trim() && points.promptText.trim() !== String(b.orig).trim())
+      return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);
+    const meta = await convMeta(found.path);
+    let conv = get(id);
+    if (!conv) { conv = getOrCreate(id, { cwd: meta.cwd || ctx.defaultCwd, model: b.model || undefined, resume: id, notifier: ctx.notifyAsk }); await conv.bootForRewind(); }
+    const text = b.voice ? decorateVoiceTurn(rawText) : rawText;
+    const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text);
+    dedupRecord(b.cid, conv.id);
+    return jsonRes({ ok: true, id: conv.id, rewind }, ctx, req);
   }
 
   // Live event stream (SSE). Must already be started (GET can't carry the first turn).

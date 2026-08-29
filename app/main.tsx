@@ -113,6 +113,8 @@ const api = {
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
     fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+  edit: (b: { id: string; index: number; text: string; cid?: string; orig?: string; model?: string }) =>
+    fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   setModel: (b: { id: string; model: string }) =>
     fetch("/app/api/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   interrupt: (id: string) => fetch("/app/api/interrupt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }),
@@ -375,6 +377,10 @@ class ConvStore {
 
   // ---- mutations from the UI ----
   addOptimisticUser(text: string) { this.pendingEcho.push(text); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
+  // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
+  // below), and restore the pre-edit view if the server rejects the edit.
+  truncateFrom(index: number) { this.items = this.items.slice(0, Math.max(0, index)); this.pendingEcho = []; this.touch(); }
+  restore(items: Item[]) { this.items = items; this.pendingEcho = []; this.busy = false; this.setSendState(null); this.touch(); }
   // Delivery ticks for the most-recent sent turn (Google Messages: 1 tick sending -> 2 ticks delivered
   // -> 2 filled ticks when the agent reads/starts). Persists on the turn (no fade); a new send resets it.
   setSendState(s: ConvStore["sendState"]) { this.sendState = s; this.signal(); }
@@ -875,6 +881,9 @@ function App() {
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
   const [readTick, setReadTick] = useState(0); // bump to re-render unread dots after marking read
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant"; i: number } | null>(null);
+  // Editing a past user turn: its item index + original text. Set by the message "Edit" action;
+  // on submit the turn is rewound-and-rerun (full rollback) instead of appended as a new turn.
+  const [editing, setEditing] = useState<{ i: number; orig: string } | null>(null);
   const [convMenu, setConvMenu] = useState<{ x: number; y: number; id: string; title: string; fav: boolean } | null>(null);
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
   const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
@@ -1306,6 +1315,7 @@ function App() {
   // continuously, so a switch is a pointer change — no reconnect, no re-fetch when it's already in memory.
   const loadConv = useCallback(async (id: string, highlight?: string) => {
     activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
+    setEditing(null); // a stale edit target from another conversation must not carry over
     const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
     const s = manager.ensure(id);
     setActiveStore(s); activeStoreRef.current = s;
@@ -1340,7 +1350,7 @@ function App() {
     } finally { if (activeStoreRef.current === s) setLoadingConv(false); }
   }, [defaultCwd]);
 
-  const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
+  const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setEditing(null); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
   // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
   // to drain into a real conversation. A pending- store never caches or connects.
@@ -1480,6 +1490,8 @@ function App() {
     saveDraft(activeIdRef.current, "");
     setInput(""); setAttachments([]);
     if (taRef.current) taRef.current.style.height = "auto";
+    // Editing a past turn -> rewind-and-rerun instead of appending. Attachments don't apply to an edit.
+    if (editing) { const ed = editing; setEditing(null); await doEdit(ed, raw); return; }
     await submitText(text);
   };
 
@@ -1494,7 +1506,32 @@ function App() {
   // #region context menus (long-press / right-click): message copy+edit, conversation rename+delete
   const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant", i: number) => setMsgMenu({ x, y, text, kind, i }), []);
   const copyText = (t: string) => { try { void navigator.clipboard?.writeText(t); } catch { /* */ } };
-  const editIntoComposer = (t: string) => { setInput(t); setMsgMenu(null); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
+  // Enter edit mode for a past user turn: prefill the composer and remember which turn, so submit
+  // rewinds-and-reruns from there (see doEdit) instead of appending a new turn.
+  const startEdit = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
+  const cancelEdit = () => { setEditing(null); setInput(""); if (taRef.current) taRef.current.style.height = "auto"; };
+  // Rewind-and-rerun: drop the edited turn + everything after (optimistically), then ask the server to
+  // roll files back to that turn's checkpoint, fork the transcript, and re-run the edited text. The
+  // forked session's new id + reply stream back in on the existing socket. Degrades to a normal append
+  // when the conversation has no server id yet or we're offline (no session to fork).
+  const doEdit = async (ed: { i: number; orig: string }, text: string) => {
+    const s = activeStoreRef.current;
+    const realId = !!s && !s.id.startsWith("new-") && !s.id.startsWith("pending-");
+    if (!s || !realId || (typeof navigator !== "undefined" && !navigator.onLine)) { await submitText(text); return; }
+    // 0-based ordinal among user turns up to the edited item — matches the server's user-turn count.
+    let uindex = -1; for (let k = 0; k <= ed.i && k < s.items.length; k++) if (s.items[k].kind === "user") uindex++;
+    if (uindex < 0) { await submitText(text); return; }
+    stickBottom.current = true; setAtBottom(true);
+    const snapshot = s.items;
+    s.truncateFrom(ed.i);      // drop the edited bubble + everything after
+    s.addOptimisticUser(text); // re-render the edited text below; arms the echo dedup
+    const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    try {
+      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: ed.orig, model: modelRef.current || undefined }), 30000);
+      if (r?.error) { s.restore(snapshot); s.showItems([...snapshot, { kind: "notice", noticeKind: "info", text: "Couldn't edit that message: " + r.error }]); }
+      else if (s.sendState === "sending") s.setSendState("delivered");
+    } catch { s.restore(snapshot); s.showItems([...snapshot, { kind: "notice", noticeKind: "info", text: "Couldn't reach the server to edit — try again." }]); }
+  };
   const deleteConv = useCallback(async (id: string) => {
     setConvMenu(null);
     setConvs((cs) => cs.filter((c) => c.sessionId !== id)); // optimistic
@@ -1830,6 +1867,12 @@ function App() {
             </button>
           )}
           {todos && <TodoChecklist todos={todos} />}
+          {editing && (
+            <div className="edit-banner">
+              <span>Editing your message — this rewinds the chat and reruns from here, undoing any file changes since.</span>
+              <button onClick={cancelEdit} aria-label="Cancel edit">×</button>
+            </div>
+          )}
           <div className="composer">
             {attachments.length > 0 && (
               <div className="attach-row">
@@ -1931,7 +1974,7 @@ function App() {
               }}>Read aloud</button>
             )}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
-            {msgMenu.kind === "user" && <button onClick={() => editIntoComposer(msgMenu.text)}>Edit</button>}
+            {msgMenu.kind === "user" && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
           </div>
         </>
       )}
