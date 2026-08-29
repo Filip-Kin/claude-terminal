@@ -396,14 +396,7 @@ class ConvStore {
   reconcile(items: Item[], meta: { busy: boolean; cwd: string | null }) {
     this.cwd = meta.cwd; this.hydrated = true;
     const localAhead = this.pendingEcho.length > 0 || (this.busy && this.items.length >= items.length);
-    if (!localAhead) {
-      // Only swap in the server items when they actually differ from what we already show (typically
-      // the cache paint). Replacing them with an equal array would give the view a fresh `items`
-      // reference and fire a second scroll-to-bottom right after the cache one — the "scrolls twice on
-      // open". Keeping the same reference lets the scroll effect (keyed on items) skip the redundant run.
-      const changed = this.items.length !== items.length || JSON.stringify(this.items) !== JSON.stringify(items);
-      if (changed) { this.items = items; this.cachedItems = items; }
-    }
+    if (!localAhead) { this.items = items; this.cachedItems = items; }
     this.busy = meta.busy || this.busy;
     this.signal();
   }
@@ -1105,6 +1098,14 @@ function App() {
   // Persist the composer draft under the current conversation as it changes (so a switch or reload keeps
   // it). activeIdRef holds the live conversation id; a new chat saves under the "__new__" key.
   useEffect(() => { saveDraft(activeIdRef.current, input); }, [input]);
+  // Switching conversation / starting a new chat swaps the composer text programmatically (loadDraft),
+  // which doesn't fire the onInput auto-resize. Recompute the textarea height so it fits the new draft
+  // and shrinks back down from a tall unsent message left in the previous chat.
+  useEffect(() => {
+    const ta = taRef.current; if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+  }, [activeId]);
   const convsRef = useRef<Conv[]>([]);
   useEffect(() => { convsRef.current = convs; }, [convs]); // latest list for read-marking / lookups
   const busyRef = useRef(false);

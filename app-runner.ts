@@ -512,6 +512,10 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
     try { o = JSON.parse(line); } catch { continue; }
     const msg = o.message;
     if (o.type === "user" && msg) {
+      // The compaction summary is a synthesized user message (isCompactSummary) carrying the whole
+      // "This session is being continued…" recap. It's context, not a turn to show: the
+      // compact_boundary below already renders the "Compacted" divider card, so skip the summary.
+      if (o.isCompactSummary) continue;
       const c = msg.content;
       if (Array.isArray(c)) {
         const toolResults = c.filter((b: any) => b?.type === "tool_result");
