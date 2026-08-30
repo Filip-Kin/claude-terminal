@@ -13,11 +13,14 @@
 // so keep them in sync if you rename anything here.
 
 export const DB_NAME = "ct-app";
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 export const CONV_STORE = "conversations"; // legacy whole-blob cache { id, payload, size, at } — read fallback only
 export const ITEM_STORE = "conv_items"; // one record PER MESSAGE: { cid, idx, item, size, at } — tail-only writes
 export const CONVMETA_STORE = "conv_meta"; // per-conversation metadata: { cid, count, busy, cwd, live, at }
 export const QUEUE_STORE = "queue"; // { qid (auto), body, createdAt }
+export const PENDING_STORE = "conv_pending"; // { cid, events, at } — transcript events the service worker
+// fetched while the app was closed. The SW cannot run applyEvent (the reducer lives in the bundle), so it
+// parks RAW events here and the app folds them into items on next open. Keeps one copy of the reducer.
 export const META_STORE = "meta"; // small kv: { k, v }
 export const SYNC_TAG = "ct-send-queue"; // Background Sync tag (also referenced in sw.js)
 export const CACHE_LIMIT = 50 * 1024 * 1024; // 50 MB
@@ -49,6 +52,9 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(CONVMETA_STORE)) {
         const s = db.createObjectStore(CONVMETA_STORE, { keyPath: "cid" });
         s.createIndex("by_at", "at"); // LRU order
+      }
+      if (!db.objectStoreNames.contains(PENDING_STORE)) {
+        db.createObjectStore(PENDING_STORE, { keyPath: "cid" });
       }
     };
     req.onblocked = () => reject(req.error || new Error("idb upgrade blocked")); // don't hang the caller; it falls back to network
@@ -103,7 +109,10 @@ export async function getCachedConversation(id: string): Promise<unknown | null>
 }
 
 // #region per-message conversation cache (tail-only writes)
-export interface ConvMeta { busy?: boolean; cwd?: string | null; live?: boolean }
+// evCount = how many RAW transcript events these items were reduced from. It is the delta cursor: the
+// next fetch asks for events after it. Distinct from `count` (number of reduced items), because
+// applyEvent folds many events into one item (every text_delta grows the same bubble).
+export interface ConvMeta { busy?: boolean; cwd?: string | null; live?: boolean; evCount?: number }
 
 // Write ONLY the messages from `fromIdx` onward (the tail that changed while streaming), refresh the
 // per-conversation metadata, and drop any records past the new length (a shrink). Nothing else is
@@ -119,7 +128,7 @@ export async function saveConvItems(cid: string, items: any[], fromIdx: number, 
       const is = t.objectStore(ITEM_STORE);
       for (let i = start; i < items.length; i++) is.put({ cid, idx: i, item: items[i], size: sizeOf(items[i]), at: now });
       is.delete(IDBKeyRange.bound([cid, items.length], [cid, []])); // prune leftovers if the list shrank
-      t.objectStore(CONVMETA_STORE).put({ cid, count: items.length, busy: !!meta.busy, cwd: meta.cwd ?? null, live: !!meta.live, at: now });
+      t.objectStore(CONVMETA_STORE).put({ cid, count: items.length, busy: !!meta.busy, cwd: meta.cwd ?? null, live: !!meta.live, evCount: meta.evCount ?? 0, at: now });
       t.oncomplete = () => resolve();
       t.onerror = () => reject(t.error);
       t.onabort = () => reject(t.error);
@@ -130,7 +139,7 @@ export async function saveConvItems(cid: string, items: any[], fromIdx: number, 
 
 // Reconstruct a conversation from its message records (ordered by idx). Falls back to the legacy
 // whole-blob cache for anything stored before the per-message store existed.
-export async function getConv(cid: string): Promise<{ items: any[]; busy: boolean; cwd: string | null; live: boolean } | null> {
+export async function getConv(cid: string): Promise<{ items: any[]; busy: boolean; cwd: string | null; live: boolean; evCount: number } | null> {
   try {
     const db = await openDB();
     const res = await new Promise<{ items: any[]; meta: any } | null>((resolve) => {
@@ -147,12 +156,26 @@ export async function getConv(cid: string): Promise<{ items: any[]; busy: boolea
     });
     if (res) {
       tx(CONVMETA_STORE, "readwrite", (s) => s.put({ ...res.meta, at: Date.now() })).catch(() => {}); // bump LRU
-      return { items: res.items, busy: !!res.meta.busy, cwd: res.meta.cwd ?? null, live: !!res.meta.live };
+      return { items: res.items, busy: !!res.meta.busy, cwd: res.meta.cwd ?? null, live: !!res.meta.live, evCount: Number(res.meta.evCount) || 0 };
     }
     const legacy: any = await getCachedConversation(cid);
-    if (legacy && Array.isArray(legacy.items)) return { items: legacy.items, busy: !!legacy.busy, cwd: legacy.cwd ?? null, live: !!legacy.live };
+    // Legacy blob has no cursor, so evCount 0 forces one full refetch, then it is delta from there on.
+    if (legacy && Array.isArray(legacy.items)) return { items: legacy.items, busy: !!legacy.busy, cwd: legacy.cwd ?? null, live: !!legacy.live, evCount: 0 };
     return null;
   } catch { return null; }
+}
+
+// Events the service worker parked while the app was closed. Returned in arrival order; the caller
+// folds them onto the cached items and then clears them.
+export async function takePendingEvents(cid: string): Promise<{ events: any[]; evCount: number } | null> {
+  try {
+    const rec = await tx<any>(PENDING_STORE, "readonly", (s) => s.get(cid));
+    if (!rec || !Array.isArray(rec.events) || !rec.events.length) return null;
+    return { events: rec.events, evCount: Number(rec.evCount) || 0 };
+  } catch { return null; }
+}
+export async function clearPendingEvents(cid: string): Promise<void> {
+  try { await tx(PENDING_STORE, "readwrite", (s) => s.delete(cid)); } catch { /* best effort */ }
 }
 
 export async function hasConv(cid: string): Promise<boolean> {
@@ -163,10 +186,11 @@ export async function deleteConvCache(cid: string): Promise<void> {
   try {
     const db = await openDB();
     await new Promise<void>((resolve) => {
-      const t = db.transaction([ITEM_STORE, CONVMETA_STORE, CONV_STORE], "readwrite");
+      const t = db.transaction([ITEM_STORE, CONVMETA_STORE, CONV_STORE, PENDING_STORE], "readwrite");
       t.objectStore(ITEM_STORE).delete(IDBKeyRange.bound([cid], [cid, []]));
       t.objectStore(CONVMETA_STORE).delete(cid);
       t.objectStore(CONV_STORE).delete(cid);
+      t.objectStore(PENDING_STORE).delete(cid);
       t.oncomplete = () => resolve();
       t.onerror = () => resolve();
     });

@@ -16,6 +16,8 @@ import { buildCostReport } from "./cost.ts";
 import { Connections } from "./connections.ts";
 import { appRoutes, type AppCtx } from "./app-server.ts";
 import { initSubscriptionResume } from "./subscription-resume.ts";
+import { startStatusPush, type StatusPayload } from "./status-push.ts";
+import { liveActivity } from "./app-runner.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -344,26 +346,39 @@ try {
 }
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
-type PushSub = { endpoint: string; keys?: { p256dh: string; auth: string } };
+// `cadence` marks a subscription that can take the every-15s status pushes. Only Android Chrome can:
+// it updates a same-tag notification silently, so the stream costs one quiet tray entry. iOS alerts on
+// most pushes, so a cadence stream there would buzz the phone every cycle. Unknown (an older
+// subscription that predates the flag) is treated as NOT cadence-capable, so the worst case is the
+// feature stays off for that device until it re-registers, never a phone buzzing every 15 seconds.
+type PushSub = { endpoint: string; keys?: { p256dh: string; auth: string }; cadence?: boolean; ua?: string };
 let subs: PushSub[] = [];
 try { const s = JSON.parse(await Bun.file(SUBS_FILE).text()); if (Array.isArray(s)) subs = s; } catch {}
 let subsSaveTimer: any = null;
 function saveSubs() { clearTimeout(subsSaveTimer); subsSaveTimer = setTimeout(() => { Bun.write(SUBS_FILE, JSON.stringify(subs)).catch(() => {}); }, 200); }
-function addSub(s: PushSub) { if (!s?.endpoint) return; if (!subs.some((x) => x.endpoint === s.endpoint)) { subs.push(s); saveSubs(); } }
+function addSub(s: PushSub) {
+  if (!s?.endpoint) return;
+  const i = subs.findIndex((x) => x.endpoint === s.endpoint);
+  // Re-registering an existing endpoint UPDATES its flags rather than being a no-op, so a device that
+  // subscribed before the cadence flag existed picks it up the next time the app opens.
+  if (i !== -1) { subs[i] = { ...subs[i], ...s }; saveSubs(); return; }
+  subs.push(s); saveSubs();
+}
 function removeSub(endpoint: string) { const n = subs.length; subs = subs.filter((x) => x.endpoint !== endpoint); if (subs.length !== n) saveSubs(); }
 
-type NotifPayload = { title: string; body?: string; url?: string; tag?: string; icon?: string; requireInteraction?: boolean; sessionId?: string };
-async function pushAll(payload: NotifPayload): Promise<{ sent: number; pruned: number }> {
+type NotifPayload = { title: string; body?: string; url?: string; tag?: string; icon?: string; requireInteraction?: boolean; sessionId?: string; renotify?: boolean; silent?: boolean; status?: StatusPayload };
+async function pushAll(payload: NotifPayload, opts?: { cadenceOnly?: boolean }): Promise<{ sent: number; pruned: number }> {
   const data = JSON.stringify(payload);
   const dead: string[] = [];
-  await Promise.all(subs.map(async (s) => {
+  const targets = opts?.cadenceOnly ? subs.filter((s) => s.cadence) : subs;
+  await Promise.all(targets.map(async (s) => {
     // urgency:high tells the push service (FCM/Mozilla/APNs) to deliver immediately
     // instead of batching for power-saving, which is what made pushes feel slow.
     try { await webpush.sendNotification(s as any, data, { TTL: 120, urgency: "high" }); }
     catch (e: any) { const c = e?.statusCode; if (c === 404 || c === 410) dead.push(s.endpoint); }
   }));
   for (const d of dead) removeSub(d);
-  return { sent: subs.length, pruned: dead.length };
+  return { sent: targets.length, pruned: dead.length };
 }
 
 // Focus heartbeat: each open terminal POSTs the session it is actively watching so we
@@ -659,6 +674,28 @@ const appCtx: AppCtx = {
     });
   },
 };
+// Status push: one coalesced, silently-updating notification while agents work, which is also the
+// service worker's wake-up to pull transcript deltas into the offline cache. Android-only by design
+// (see the `cadence` flag above). Cadence is a battery-vs-freshness dial: at 15s the cache is never
+// more than a cycle behind, and nothing is sent at all while everything is idle.
+const STATUS_PUSH_SECONDS: number = Number(cfg.statusPushSeconds) > 0 ? Number(cfg.statusPushSeconds) : 15;
+if (cfg.statusPush !== false) {
+  startStatusPush({
+    intervalMs: STATUS_PUSH_SECONDS * 1000,
+    snapshot: () => liveActivity(),
+    push: (p) => {
+      // Suppress the whole stream while a device is actively watching one of the working conversations:
+      // the app is open and streaming over SSE, so it needs neither the tray entry nor the cache warm.
+      if (p.convs.some((id) => isWatched(id))) return;
+      void pushAll({
+        title: p.title, body: p.body, url: "/app", tag: "ct-status",
+        // renotify stays off: a same-tag replacement with renotify:false updates with no sound or
+        // vibration, which is the whole reason this cadence is tolerable.
+        renotify: false, silent: true, status: p,
+      }, { cadenceOnly: true });
+    },
+  });
+}
 // #endregion
 
 const server = Bun.serve({
@@ -781,7 +818,7 @@ const server = Bun.serve({
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });
       let body: any = {}; try { body = await req.json(); } catch {}
       if (!body?.endpoint) return new Response("Bad subscription", { status: 400 });
-      addSub(body);
+      addSub({ endpoint: String(body.endpoint), keys: body.keys, cadence: !!body.cadence, ua: body.ua ? String(body.ua).slice(0, 200) : undefined });
       return Response.json({ ok: true, subscribed: subs.length }, { headers: cors(req) });
     }
     if (req.method === "POST" && path === "/unsubscribe") {

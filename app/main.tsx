@@ -106,10 +106,19 @@ function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
     p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
   });
 }
+// Every READ goes through withTimeout. A weak link that HANGS rather than fails never settles a bare
+// fetch, so loadConv's await would sit inside setLoadingConv(true) forever and the app looked like it
+// was "waiting for the connection" with no way out. Failing fast lets us fall back to the cached view.
 const api = {
-  models: () => fetch("/app/api/models").then(J),
-  convs: (offset = 0) => fetch(`/app/api/conversations?offset=${offset}`).then(J),
-  conversation: (id: string) => fetch(`/app/api/conversation/${encodeURIComponent(id)}`).then(J),
+  models: () => withTimeout(fetch("/app/api/models").then(J)),
+  convs: (offset = 0) => withTimeout(fetch(`/app/api/conversations?offset=${offset}`).then(J)),
+  // `since` = the caller's transcript-event cursor; the server replies delta:true with only the events
+  // after it. Reopening a long chat costs a few KB instead of the whole transcript.
+  // Cursor only, no events. Used to make a live-streamed conversation warmable again without paying
+  // for the whole transcript.
+  convMeta: (id: string) => withTimeout(fetch(`/app/api/conversation/${encodeURIComponent(id)}?meta=1`).then(J)),
+  conversation: (id: string, since?: number) =>
+    withTimeout(fetch(`/app/api/conversation/${encodeURIComponent(id)}${since && since > 0 ? `?since=${since}` : ""}`).then(J)),
   start: (b: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean }) =>
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
@@ -123,17 +132,17 @@ const api = {
     const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
     return fetch("/app/api/upload", { method: "POST", body: fd }).then(J);
   },
-  favorites: () => fetch("/app/api/favorites").then(J),
+  favorites: () => withTimeout(fetch("/app/api/favorites").then(J)),
   toggleFav: (id: string, fav: boolean) =>
     fetch("/app/api/favorites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, fav }) }).then(J),
   setTitle: (id: string, title: string) =>
     fetch("/app/api/title", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, title }) }).then(J),
   del: (id: string) => fetch("/app/api/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
-  context: (id: string) => fetch(`/app/api/context?id=${encodeURIComponent(id)}`).then(J),
+  context: (id: string) => withTimeout(fetch(`/app/api/context?id=${encodeURIComponent(id)}`).then(J)),
   compact: (id: string) => fetch("/app/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
-  usage: () => fetch("/app/api/usage").then(J),
-  statuses: () => fetch("/app/api/statuses").then(J),
-  search: (q: string) => fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J),
+  usage: () => withTimeout(fetch("/app/api/usage").then(J)),
+  statuses: () => withTimeout(fetch("/app/api/statuses").then(J)),
+  search: (q: string) => withTimeout(fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J)),
   answerAsk: (id: string, askId: string, answer: string) =>
     fetch("/app/api/ask-answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, askId, answer }) }).then(J),
 };
@@ -314,6 +323,12 @@ class ConvStore {
   compacting = false;
   compactStart = 0;
   hydrated = false;     // items loaded from cache or network at least once
+  evCount = 0;          // transcript events these items were reduced from, ie the delta cursor
+  // Live SSE events grow `items` but are NOT transcript events, so they do not advance evCount. Once
+  // that has happened the cursor no longer describes what we hold, and asking for events after it would
+  // re-deliver everything the stream already rendered (duplicate bubbles). evDirty marks the cursor
+  // untrustworthy; it is cleared only by a full reconcile or a clean delta fold.
+  evDirty = false;
   touched = Date.now(); // LRU key for evicting idle in-memory stores
   es: EventSource | null = null;
   // Optimistic user turns awaiting their SSE echo. Timestamped, because an echo that never arrives
@@ -353,6 +368,7 @@ class ConvStore {
   // ---- event reduction (the single applyEvent per conversation) ----
   ingest(e: AppEvent) {
     if (typeof e._seq === "number") { if (e._seq <= this.seq) return; this.seq = e._seq; }
+    this.evDirty = true; // a live event: the transcript cursor no longer matches what we hold
     this.mgr.hooks?.onEvent(this, e);
     // The agent has "read" our turn the moment it starts producing (fills the delivery ticks).
     if ((this.sendState === "sending" || this.sendState === "delivered") && (e.t === "text" || e.t === "text_delta" || e.t === "thinking" || e.t === "thinking_delta" || e.t === "thinking_progress" || e.t === "tool_use")) this.setSendState("read");
@@ -410,16 +426,44 @@ class ConvStore {
   }
 
   // ---- hydration + reconcile (the cache-vs-network policy) ----
-  hydrate(items: Item[], meta: { busy?: boolean; cwd?: string | null }) {
+  hydrate(items: Item[], meta: { busy?: boolean; cwd?: string | null; evCount?: number }) {
     this.items = items; this.cachedItems = items; this.hydrated = true;
     if (meta.busy != null) this.busy = meta.busy;
     if (meta.cwd != null) this.cwd = meta.cwd;
+    if (meta.evCount != null) { this.evCount = meta.evCount; this.evDirty = meta.evCount <= 0; }
     this.signal();
+  }
+  // Fold a tail of raw transcript events onto what we already have. Used for the `?since=` catch-up and
+  // for the events the service worker parked while the app was closed. Appending, never replacing, so
+  // it needs none of reconcile's localAhead protection — but it must still swallow the echo of a turn
+  // we rendered optimistically, or the bubble would appear twice.
+  applyDelta(events: AppEvent[], evTotal: number, meta?: { busy?: boolean; cwd?: string | null }) {
+    const cut = Date.now() - ECHO_TTL;
+    this.pendingEcho = this.pendingEcho.filter((p) => p.at > cut);
+    let items = this.items;
+    for (const e of events) {
+      if (e.t === "user") {
+        const clean = sanitizeUserText(e.text);
+        const i = this.pendingEcho.findIndex((p) => p.text === clean);
+        if (i !== -1) { this.pendingEcho.splice(i, 1); continue; }
+        const last = items[items.length - 1];
+        if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) continue;
+      }
+      items = applyEvent(items, e);
+    }
+    this.items = items;
+    this.evCount = evTotal;
+    this.evDirty = false; // items and cursor were advanced together, so it is trustworthy again
+    this.hydrated = true;
+    if (meta?.cwd !== undefined) this.cwd = meta.cwd;
+    if (meta?.busy != null) this.busy = this.pendingEcho.length > 0 ? true : meta.busy;
+    this.touch();
   }
   // Server transcript is truth for committed history. We keep our own tail when it's AHEAD of the
   // server (live tokens, or a just-sent turn not yet in the transcript) so nothing flickers away.
-  reconcile(items: Item[], meta: { busy: boolean; cwd: string | null }) {
+  reconcile(items: Item[], meta: { busy: boolean; cwd: string | null; evCount?: number }) {
     this.cwd = meta.cwd; this.hydrated = true;
+    if (meta.evCount != null) { this.evCount = meta.evCount; this.evDirty = false; }
     // Expire orphaned optimistic echoes BEFORE computing localAhead below. The server emits the user
     // echo within a second of accepting a turn, so one this old is never arriving (dead turn, backend
     // restart). Left in place it pins localAhead true forever, and the client then discards the server
@@ -450,7 +494,10 @@ class ConvStore {
     const prev = this.cachedItems, n = Math.min(prev.length, its.length);
     let i = 0; while (i < n && its[i] === prev[i]) i++;
     this.cachedItems = its;
-    void offline.saveConvItems(this.id, its, i, { busy: this.busy, cwd: this.cwd, live: this.busy });
+    // 0 means "no trustworthy cursor": the next reader (this app, the prewarm, or the service worker)
+    // does one full fetch and re-establishes it, rather than folding a delta onto items that already
+    // contain it.
+    void offline.saveConvItems(this.id, its, i, { busy: this.busy, cwd: this.cwd, live: this.busy, evCount: this.evDirty ? 0 : this.evCount });
   }
 
   teardown() { this.disconnect(); this.flushCache(); this.subs.clear(); }
@@ -984,10 +1031,22 @@ function App() {
         if (c.sessionId === activeIdRef.current) continue;
         if (busyRef.current) return; // don't compete with a live turn for bandwidth
         try {
-          if (await offline.hasConv(c.sessionId)) continue; // already cached
-          const d = await api.conversation(c.sessionId);
-          const built = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
-          await offline.saveConvItems(c.sessionId, built, 0, { busy: !!d.busy, cwd: d.cwd, live: !!d.live });
+          // Was: skip anything already cached. That froze the cache at first-write, so the most-used
+          // conversations paint instantly with STALE content and you wait for the full refetch to see
+          // what actually happened. Now a cached conversation is topped up by delta, which is cheap
+          // enough to do for all of them on every pass.
+          const cached = await offline.getConv(c.sessionId).catch(() => null);
+          const d = await api.conversation(c.sessionId, cached?.evCount || 0);
+          const events: AppEvent[] = d.events || [];
+          if (d.delta === true && cached) {
+            if (!events.length) continue; // already current
+            const merged = events.reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), cached.items as Item[]);
+            // applyEvent can grow the LAST existing bubble (a text_delta), so rewrite from there.
+            await offline.saveConvItems(c.sessionId, merged, Math.max(0, cached.items.length - 1), { busy: !!d.busy, cwd: d.cwd, live: !!d.live, evCount: d.evTotal });
+          } else {
+            const built = events.reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+            await offline.saveConvItems(c.sessionId, built, 0, { busy: !!d.busy, cwd: d.cwd, live: !!d.live, evCount: d.evTotal });
+          }
         } catch { /* skip this one */ }
         await new Promise((r) => setTimeout(r, 500)); // gentle on a weak link
       }
@@ -1137,6 +1196,54 @@ function App() {
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
   }, [refreshQueue]);
+  // App-icon badge: how many agents are WAITING on you. Deliberately not "how many are busy" — the
+  // badge answers "does anything need me", and a working agent does not. The service worker sets the
+  // same badge from a status push while the app is closed, so the two agree.
+  useEffect(() => {
+    const nav = navigator as Navigator & { setAppBadge?: (n?: number) => Promise<void>; clearAppBadge?: () => Promise<void> };
+    if (typeof nav.setAppBadge !== "function") return;
+    const waiting = Object.values(statuses).filter((v) => v?.waiting).length;
+    try { void (waiting > 0 ? nav.setAppBadge(waiting) : nav.clearAppBadge?.()); } catch { /* unsupported */ }
+  }, [statuses]);
+
+  // Tell the server this device can take the coalesced status pushes. Only Android updates a same-tag
+  // notification silently; on iOS the 15s cadence would alert every cycle, so it stays off there. Re-sent
+  // on every boot so a subscription made before this flag existed gets upgraded in place.
+  useEffect(() => {
+    if (!("serviceWorker" in navigator) || typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+    void navigator.serviceWorker.ready.then(async (reg) => {
+      const sub = await reg.pushManager.getSubscription();
+      if (!sub) return;
+      const body = { ...(sub.toJSON() as Record<string, unknown>), cadence: /Android/i.test(navigator.userAgent), ua: navigator.userAgent };
+      await fetch("/_ct/subscribe", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    }).catch(() => { /* not subscribed / offline */ });
+  }, []);
+
+  // Re-establish the delta cursor after a turn we watched live. Streaming leaves evDirty set, which
+  // stops the service worker topping this conversation up while the app is closed — and "I watched it
+  // start, then closed the app" is the exact case the background cache exists for. Costs one tiny
+  // meta call, not a transcript. Settles first so the SDK has finished flushing the turn to the jsonl;
+  // adopting a count mid-write could leave a duplicate bubble on the next fold.
+  useEffect(() => {
+    if (busy || !activeId) return;
+    const s = activeStoreRef.current;
+    if (!s || !s.evDirty || !s.hydrated || s.id.startsWith("pending-") || s.id.startsWith("new-")) return;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void api.convMeta(s.id).then((d: { evTotal?: number; busy?: boolean }) => {
+        // Bail on anything that changed under us: a new turn started, the user switched away, or the
+        // store picked up more live events while the request was in flight.
+        if (cancelled || activeStoreRef.current !== s || s.busy || d.busy) return;
+        if (!(Number(d.evTotal) > 0)) return;
+        s.evCount = Number(d.evTotal);
+        s.evDirty = false;
+        s.flushCache(); // persist the recovered cursor so the SW can use it while we are closed
+      }).catch(() => { /* offline: stays dirty and self-heals with a full fetch on next open */ });
+    }, 3000);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [busy, activeId]);
+
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
   // Re-mark on convs updates too: after a turn finishes, refreshConvs bumps the active conversation's
   // mtime a beat later — without this, switching away right then would show it falsely unread.
@@ -1369,13 +1476,35 @@ function App() {
     // Instant paint: if the store isn't already hydrated in memory, fill it from the offline cache.
     if (!s.hydrated && !s.items.length) {
       const cached = await offline.getConv(id).catch(() => null);
-      if (cached && activeStoreRef.current === s) s.hydrate(cached.items, { busy: cached.busy, cwd: cached.cwd });
+      if (cached && activeStoreRef.current === s) s.hydrate(cached.items, { busy: cached.busy, cwd: cached.cwd, evCount: cached.evCount });
+    }
+    // Fold anything the service worker pulled in while the app was closed. This is the payoff of the
+    // background cache: the turns that landed while you were away are already on disk, so they paint
+    // with no network at all. Done before the fetch below so the screen is complete immediately.
+    if (activeStoreRef.current === s) {
+      const parked = await offline.takePendingEvents(id).catch(() => null);
+      if (parked && activeStoreRef.current === s) {
+        s.applyDelta(parked.events as AppEvent[], parked.evCount);
+        s.flushCache();                          // persist the folded result before dropping the parked copy
+        void offline.clearPendingEvents(id);
+      }
     }
     if (!navigator.onLine) { if (!s.items.length) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
     setLoadingConv(true);
     try {
-      const d = await api.conversation(id);
+      const useDelta = s.evCount > 0 && !s.evDirty;
+      const d = await api.conversation(id, useDelta ? s.evCount : 0);
       if (activeStoreRef.current !== s) return; // user switched away while we fetched
+      // Delta path: the server only sent what we were missing, so fold it instead of rebuilding. Skips
+      // reconcile entirely, which is safe because appending can't discard local state the way a full
+      // replace can. `delta:false` (no cursor, or a cursor the server couldn't honour) falls through to
+      // the original full-replace path below, so a diverged cache always self-heals.
+      if (d.delta === true && !(d.live && Array.isArray(d.pendingAsks) && d.pendingAsks.length)) {
+        if ((d.events || []).length) s.applyDelta(d.events as AppEvent[], d.evTotal, { busy: !!d.busy, cwd: d.cwd || defaultCwd });
+        else s.setBusy(!!d.busy);
+        if (d.live) s.connect(true);
+        return;
+      }
       const serverItems: Item[] = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
       // A live conversation blocked on an ask_user: the transcript's ask id can't unblock the tool, so
       // swap any unanswered asks for the server's real pending asks.
@@ -1383,7 +1512,7 @@ function App() {
         for (let i = serverItems.length - 1; i >= 0; i--) if (serverItems[i].kind === "ask" && (serverItems[i] as any).answered === undefined) serverItems.splice(i, 1);
         for (const a of d.pendingAsks) serverItems.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
       }
-      s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd });
+      s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd, evCount: d.evTotal });
       if (d.live) s.connect(true); // stream follow-up events; connect() is a no-op if already connected
     } catch {
       if (!s.items.length && activeStoreRef.current === s) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);

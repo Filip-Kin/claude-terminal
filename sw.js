@@ -118,6 +118,11 @@ function idbOpenApp() {
 async function drainSendQueue() {
   let db;
   try { db = await idbOpenApp(); } catch { return; }
+  // Always release the connection: a handle held open here BLOCKS the page's schema upgrade, which
+  // would strand the app on the old DB version.
+  try { await drainWith(db); } finally { try { db.close(); } catch { /* */ } }
+}
+async function drainWith(db) {
   if (!db.objectStoreNames.contains("queue")) return;
   const all = await new Promise((res) => { const t = db.transaction("queue", "readonly"); const rq = t.objectStore("queue").getAll(); rq.onsuccess = () => res(rq.result || []); rq.onerror = () => res([]); });
   all.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
@@ -128,6 +133,77 @@ async function drainSendQueue() {
       await new Promise((res) => { const t = db.transaction("queue", "readwrite"); t.objectStore("queue").delete(it.qid); t.oncomplete = () => res(); t.onerror = () => res(); });
     } catch { break; } // still offline
   }
+}
+// #endregion
+
+// #region status push -> offline cache warming
+// The server names the conversations that advanced; we fetch each one's delta and park the RAW events
+// in `conv_pending`. We deliberately do NOT reduce them into items here: applyEvent lives in the app
+// bundle and duplicating it in the worker would give us two reducers to keep in step. The app folds
+// them on next open, which is cheap and keeps one source of truth.
+const PENDING_CAP = 2000; // stop appending past this; the app then fetches the remainder on open
+
+function idbReq(store, mode, fn) {
+  return new Promise((resolve) => {
+    try {
+      const t = store.db.transaction(store.name, mode);
+      const rq = fn(t.objectStore(store.name));
+      t.oncomplete = () => resolve(rq ? rq.result : undefined);
+      t.onerror = () => resolve(undefined);
+      t.onabort = () => resolve(undefined);
+    } catch { resolve(undefined); }
+  });
+}
+
+async function warmConv(db, id) {
+  // Only top up conversations already in the cache. One we have never opened would mean pulling a
+  // whole transcript through the worker, which is not what a 15s wake-up is for; the app caches it
+  // when it is opened or prewarmed.
+  const meta = await idbReq({ db, name: "conv_meta" }, "readonly", (s) => s.get(id));
+  if (!meta) return false;
+  const pending = await idbReq({ db, name: "conv_pending" }, "readonly", (s) => s.get(id));
+  const have = Array.isArray(pending?.events) ? pending.events : [];
+  if (have.length >= PENDING_CAP) return false;
+  const cursor = pending && pending.evCount > 0 ? pending.evCount : (Number(meta.evCount) || 0);
+  // evCount 0 means the page could not vouch for the cursor (it had streamed live events onto these
+  // items). Folding a delta from an untrusted cursor would double every message the stream already
+  // rendered, so leave it alone: the app does one full fetch on open and re-establishes it.
+  if (!(cursor > 0)) return false;
+  let data;
+  try {
+    const r = await fetch(`/app/api/conversation/${encodeURIComponent(id)}?since=${cursor}`, { credentials: "same-origin" });
+    if (!r.ok) return false;
+    data = await r.json();
+  } catch { return false; } // offline or the session expired: cache just stays where it is
+  // delta:false means the cursor was out of range and the server sent the whole transcript. We cannot
+  // fold that here, so leave it: the app does a full fetch on open and self-heals.
+  if (!data || data.delta !== true || !Array.isArray(data.events) || !data.events.length) return false;
+  const events = have.concat(data.events).slice(0, PENDING_CAP);
+  await idbReq({ db, name: "conv_pending" }, "readwrite", (s) => s.put({ cid: id, events, evCount: data.evTotal, at: Date.now() }));
+  return true;
+}
+
+async function warmFromStatus(status) {
+  const ids = Array.isArray(status.convs) ? status.convs.slice(0, 8) : [];
+  if (!ids.length) return;
+  let db;
+  try { db = await idbOpenApp(); } catch { return; }
+  try {
+    // The pending store only exists from DB v3. An older page has not upgraded yet, so skip quietly
+    // rather than throwing; the next app open creates it.
+    if (!db.objectStoreNames.contains("conv_pending") || !db.objectStoreNames.contains("conv_meta")) return;
+    for (const id of ids) { try { await warmConv(db, id); } catch { /* skip this one */ } }
+  } finally { try { db.close(); } catch { /* */ } }
+}
+
+async function applyBadge(status) {
+  try {
+    if (!self.navigator || typeof self.navigator.setAppBadge !== "function") return;
+    // The badge answers one question at a glance: does anything need me. So it counts only agents
+    // that are WAITING on input, not agents that are merely busy.
+    if (status.idle || !status.waiting) await self.navigator.clearAppBadge();
+    else await self.navigator.setAppBadge(status.waiting);
+  } catch { /* Badging unsupported here */ }
 }
 // #endregion
 
@@ -145,12 +221,24 @@ self.addEventListener("push", (event) => {
     body: data.body || "",
     badge: BADGE,
     tag: data.tag || undefined,
-    renotify: !!data.tag,
+    // Opt-in, not "any tagged push". A same-tag replacement with renotify:false updates the existing
+    // notification with NO sound or vibration, which is what makes the 15s status cadence bearable;
+    // the old `!!data.tag` re-alerted on every single one.
+    renotify: !!data.renotify,
+    silent: !!data.silent,
     requireInteraction: !!data.requireInteraction,
     data: { url: data.url || "/", sessionId: data.sessionId || null },
   };
   if (data.icon) opts.icon = data.icon; // only when explicitly provided (avoids the duplicate app icon)
-  event.waitUntil(self.registration.showNotification(title, opts));
+  // Show first, then do the background work. showNotification is what satisfies userVisibleOnly, so it
+  // must not be able to lose a race with a slow delta fetch.
+  event.waitUntil((async () => {
+    await self.registration.showNotification(title, opts);
+    const status = data.status;
+    if (!status) return;
+    await applyBadge(status);
+    await warmFromStatus(status);
+  })());
 });
 
 // Clicking a notification: focus an already-open terminal (and tell the overlay

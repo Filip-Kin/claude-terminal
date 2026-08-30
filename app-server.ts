@@ -509,7 +509,28 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const events = await replayTranscript(found.path);
     const meta = await convMeta(found.path);
     const live = get(id);
-    return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.title, events, live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [] }, ctx, req);
+    // Delta fetch: `?since=N` returns only the events after the caller's cursor. The transcript is
+    // append-only, so events[0..N] are stable and folding the tail onto the caller's already-reduced
+    // items gives the same result as reducing the whole thing (it is a plain fold). Reopening a long
+    // chat then costs a few KB instead of the whole transcript, which is what makes it survive a weak
+    // link. Out-of-range or absent cursor falls back to a full send with delta:false, so a client that
+    // has diverged (or a legacy cache with no cursor) always self-heals.
+    // `?meta=1` answers with the cursor and nothing else. A conversation the app streamed live has an
+    // untrustworthy cursor (live events are not transcript events), and re-establishing it by pulling
+    // the whole transcript would cost hundreds of KB on exactly the link we are trying to protect.
+    // This costs about 20 bytes instead.
+    if (new URL(req.url).searchParams.get("meta") === "1") {
+      return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.title, evTotal: events.length, live: !!live, busy: !!live?.busy }, ctx, req);
+    }
+    const sinceRaw = new URL(req.url).searchParams.get("since");
+    const since = sinceRaw == null ? -1 : parseInt(sinceRaw, 10);
+    const delta = Number.isInteger(since) && since >= 0 && since <= events.length;
+    return jsonRes({
+      sessionId: id, cwd: meta.cwd, title: meta.title,
+      events: delta ? events.slice(since) : events,
+      delta, evTotal: events.length,
+      live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [],
+    }, ctx, req);
   }
 
   // Start a chat: brand-new (no resume) or resume an existing session id. Kicks the first turn.

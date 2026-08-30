@@ -1370,7 +1370,10 @@
         const { key } = await kr.json();
         sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) });
       }
-      await api("subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub) });
+      // cadence: this device can take the coalesced status pushes (silent same-tag updates). Android
+      // only; iOS would alert on every one of them.
+      const subBody = Object.assign({}, sub.toJSON(), { cadence: /Android/i.test(navigator.userAgent), ua: navigator.userAgent });
+      await api("subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(subBody) });
       showToast("Notifications enabled 🦆", "success");
     } catch (e) {
       log("subscribe failed", e);

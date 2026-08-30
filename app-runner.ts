@@ -404,6 +404,10 @@ export class Conversation {
   }
 
   hasSubscribers(): boolean { return this.subs.size > 0; }
+  // Monotonic "has anything happened" counter. The status coalescer polls it to decide whether a
+  // conversation actually advanced since the last push, so a long-running turn that is quiet does not
+  // spend a push (and a radio wake) every cycle just for being busy.
+  get activitySeq(): number { return this.seqCounter; }
   // Live status for the conversation-list indicators: generating vs waiting on a tappable question.
   statusInfo(): { busy: boolean; waiting: boolean } { return { busy: this.busy && !this.closed, waiting: this.pendingAsks.size > 0 }; }
 
@@ -772,6 +776,17 @@ export function get(key: string): Conversation | undefined { return conversation
 export function liveStatuses(): Record<string, { busy: boolean; waiting: boolean }> {
   const out: Record<string, { busy: boolean; waiting: boolean }> = {};
   for (const c of new Set(conversations.values())) out[c.id] = c.statusInfo();
+  return out;
+}
+
+// Same set as liveStatuses, plus the activity counter, for the status-push coalescer. Kept separate
+// so the existing /app/api/statuses shape (consumed by the client list indicators) does not change.
+export function liveActivity(): { id: string; busy: boolean; waiting: boolean; activitySeq: number }[] {
+  const out: { id: string; busy: boolean; waiting: boolean; activitySeq: number }[] = [];
+  for (const c of new Set(conversations.values())) {
+    const s = c.statusInfo();
+    out.push({ id: c.id, busy: s.busy, waiting: s.waiting, activitySeq: c.activitySeq });
+  }
   return out;
 }
 
