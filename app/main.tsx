@@ -109,6 +109,66 @@ function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
 // Every READ goes through withTimeout. A weak link that HANGS rather than fails never settles a bare
 // fetch, so loadConv's await would sit inside setLoadingConv(true) forever and the app looked like it
 // was "waiting for the connection" with no way out. Failing fast lets us fall back to the cached view.
+// #region Web Push enable/disable (the /app Settings row)
+// The terminal overlay has had this for a while, but only there: on mobile its bell is hidden and the
+// control lives in the terminal's hamburger drawer. Since the background cache and the status stream
+// are /app features, the switch that turns them on belongs in /app too.
+const pushSupported = (): boolean =>
+  typeof navigator !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const isIOSDevice = (): boolean => /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+// Backed by an explicit ArrayBuffer (not the default ArrayBufferLike), because applicationServerKey
+// requires a BufferSource over a real ArrayBuffer.
+function b64ToUint8(base64: string): Uint8Array<ArrayBuffer> {
+  const pad = "=".repeat((4 - (base64.length % 4)) % 4);
+  const raw = atob((base64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(new ArrayBuffer(raw.length));
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+// cadence marks a device that can take the coalesced 15s status pushes. Android updates a same-tag
+// notification silently; iOS would alert on every one, so it never gets the stream.
+const cadenceCapable = (): boolean => /Android/i.test(navigator.userAgent);
+
+// navigator.serviceWorker.ready NEVER settles if no worker ever activates (a failed registration, or
+// the script 404ing). Awaiting it bare would leave the settings toggle stuck mid-flight with no
+// feedback, so it is bounded like every other await in this file.
+function swReady(ms = 5000): Promise<ServiceWorkerRegistration> {
+  return Promise.race([
+    navigator.serviceWorker.ready,
+    new Promise<never>((_, rej) => setTimeout(() => rej(new Error("no active service worker")), ms)),
+  ]);
+}
+async function getPushSub(): Promise<PushSubscription | null> {
+  try { const reg = await swReady(); return await reg.pushManager.getSubscription(); } catch { return null; }
+}
+async function enablePush(): Promise<{ ok: boolean; error?: string }> {
+  if (!pushSupported()) return { ok: false, error: isIOSDevice() ? "On iOS, install to the Home Screen first" : "Not supported in this browser" };
+  let perm = Notification.permission;
+  if (perm !== "granted") perm = await Notification.requestPermission();
+  if (perm !== "granted") return { ok: false, error: "Blocked in browser settings" };
+  try {
+    const reg = await swReady();
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const { key } = await withTimeout(fetch("/_ct/vapidPublicKey", { credentials: "same-origin" }).then((r) => r.json()));
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) });
+    }
+    await withTimeout(fetch("/_ct/subscribe", {
+      method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...(sub.toJSON() as Record<string, unknown>), cadence: cadenceCapable(), ua: navigator.userAgent }),
+    }));
+    return { ok: true };
+  } catch (e) { return { ok: false, error: String((e as Error)?.message || e) }; }
+}
+async function disablePush(): Promise<void> {
+  const sub = await getPushSub();
+  if (!sub) return;
+  await fetch("/_ct/unsubscribe", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => {});
+  try { await sub.unsubscribe(); } catch { /* already gone */ }
+}
+// #endregion
+
 const api = {
   models: () => withTimeout(fetch("/app/api/models").then(J)),
   convs: (offset = 0) => withTimeout(fetch(`/app/api/conversations?offset=${offset}`).then(J)),
@@ -942,6 +1002,10 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // null = still checking, so the row shows a neutral state instead of flashing "off" then "on".
+  const [pushOn, setPushOn] = useState<boolean | null>(null);
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushErr, setPushErr] = useState<string | null>(null);
   const [context, setContext] = useState<{ percentage: number; total: number; max: number; estimated?: boolean } | null>(null);
   const contextRef = useRef<typeof context>(null); // mirror, so the compact handler can read the pre-compaction context
   useEffect(() => { contextRef.current = context; }, [context]);
@@ -1243,6 +1307,26 @@ function App() {
     }, 3000);
     return () => { cancelled = true; clearTimeout(t); };
   }, [busy, activeId]);
+
+  // Reflect the real subscription state each time Settings opens: permission can be revoked in browser
+  // settings, or the subscription dropped by the browser, with the app none the wiser.
+  useEffect(() => {
+    if (!settingsOpen) return;
+    if (!pushSupported()) { setPushOn(false); return; }
+    void getPushSub().then((sub) => setPushOn(Notification.permission === "granted" && !!sub));
+  }, [settingsOpen]);
+
+  const togglePush = useCallback(async () => {
+    setPushBusy(true); setPushErr(null);
+    try {
+      if (pushOn) { await disablePush(); setPushOn(false); }
+      else {
+        const r = await enablePush();
+        setPushOn(r.ok);
+        if (!r.ok) setPushErr(r.error || "Could not enable");
+      }
+    } finally { setPushBusy(false); }
+  }, [pushOn]);
 
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
   // Re-mark on convs updates too: after a turn finishes, refreshConvs bumps the active conversation's
@@ -1934,6 +2018,27 @@ function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">Settings<button className="modal-x" onClick={() => setSettingsOpen(false)} aria-label="Close">×</button></div>
             <div className="settings-body">
+              <div className="settings-section">Notifications</div>
+              <label className="settings-row">
+                <span className="settings-row-main">
+                  <span className="settings-row-title">Push notifications</span>
+                  <span className="settings-row-desc">
+                    {pushSupported()
+                      ? "Get told when a turn finishes or an agent needs you, even with the app closed. On Android this also keeps conversations cached in the background, so reopening shows everything straight away with no loading."
+                      : isIOSDevice()
+                        ? "Install this to your Home Screen first, then come back and turn this on."
+                        : "This browser cannot do push notifications."}
+                  </span>
+                  {pushErr && <span className="settings-row-desc settings-row-err">{pushErr}</span>}
+                </span>
+                <button
+                  role="switch"
+                  aria-checked={!!pushOn}
+                  disabled={pushBusy || !pushSupported()}
+                  className={"toggle" + (pushOn ? " on" : "") + (pushBusy ? " busy" : "")}
+                  onClick={() => void togglePush()}
+                ><span className="knob" /></button>
+              </label>
               <div className="settings-section">Voice</div>
               <label className="settings-row">
                 <span className="settings-row-main">

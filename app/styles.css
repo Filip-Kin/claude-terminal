@@ -469,3 +469,8 @@ a { color: var(--accent-2); }
   .thread { padding: 18px 14px; }
   .composer-wrap { padding: 8px 12px calc(12px + env(safe-area-inset-bottom)); }
 }
+
+/* Settings: an error under a toggle (e.g. notifications blocked in browser settings) */
+.settings-row-err { color: var(--err, #ef4444); }
+/* A toggle mid-request (subscribing can take a moment on a weak link) */
+.toggle.busy { opacity: .6; pointer-events: none; }
