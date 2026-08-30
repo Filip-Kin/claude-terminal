@@ -471,6 +471,10 @@ class ConvStore {
   // -> 2 filled ticks when the agent reads/starts). Persists on the turn (no fade); a new send resets it.
   setSendState(s: ConvStore["sendState"]) { this.sendState = s; this.signal(); }
   answerAsk(askId: string, answer: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: answer } : it)); this.touch(); }
+  // Put an ask card back to unanswered: the optimistic mark is a lie if the answer never reached the
+  // server, and a card that looks answered while the turn is still parked in the tool call is the
+  // worst of both worlds (see deliverAsk).
+  unanswerAsk(askId: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: undefined } : it)); this.touch(); }
   setBusy(b: boolean) { if (this.busy === b) return; this.busy = b; this.signal(); }
   beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
   endCompactFallback() { if (this.compacting) { this.compacting = false; this.compactStart = 0; this.signal(); } }
@@ -1783,7 +1787,7 @@ function App() {
     const openAsk = attachments.length ? undefined : (askStore?.items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined);
     if (askStore && openAsk) {
       askStore.answerAsk(openAsk.askId, raw);
-      api.answerAsk(askStore.id, openAsk.askId, raw).catch(() => {});
+      void deliverAsk(askStore, openAsk.askId, raw);
       return;
     }
     await submitText(text);
@@ -1876,12 +1880,39 @@ function App() {
   };
   // #endregion
 
+  // Deliver an ask answer to the server and make sure it actually lands. Two ways it used to vanish
+  // without a trace: a dropped request on a weak link (the POST was fire-and-forget), and an askId
+  // taken from a transcript-rendered card, which is the tool_use id and does not match the live
+  // runner's key, so the server replied {ok:false} and nobody looked at it. Either way the card
+  // showed answered while the turn stayed parked inside the tool call, waiting forever. So: retry,
+  // re-target whatever ask is genuinely open, and if it still will not land, put the card back.
+  const deliverAsk = useCallback(async (s: ConvStore, askId: string, answer: string) => {
+    let id = askId;
+    const post = async () => { try { const r = await api.answerAsk(s.id, id, answer); return r?.ok === true; } catch { return null; } }; // null = request failed, false = server refused
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const ok = await post();
+      if (ok === true) return;
+      if (ok === false) {
+        // The server has no open ask under that id. Either it is already answered (nothing to do) or
+        // our id is stale, in which case answer the one the runner is really blocked on.
+        try {
+          const d = await api.conversation(s.id, s.evCount);
+          const open = (d.pendingAsks || [])[0];
+          if (!open) return;
+          if (open.askId !== id) { id = open.askId; continue; }
+        } catch { /* fall through to the backoff */ }
+      }
+      await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+    }
+    s.unanswerAsk(askId);
+  }, []);
+
   // User tapped an ask_user option: mark it chosen locally + tell the server (unblocks Claude).
   const answerAsk = useCallback((askId: string, answer: string) => {
     const s = activeStoreRef.current; if (!s) return;
     s.answerAsk(askId, answer);
-    api.answerAsk(s.id, askId, answer).catch(() => {});
-  }, []);
+    void deliverAsk(s, askId, answer);
+  }, [deliverAsk]);
 
   // Tapping a PWA push (e.g. "Claude has a question") posts this from the service worker;
   // open that conversation so the ask card is right there to answer.
