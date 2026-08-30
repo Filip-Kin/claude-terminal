@@ -1775,6 +1775,17 @@ function App() {
       if (err) { setEditing(ed); setEditError(err); setInput(raw); requestAnimationFrame(() => taRef.current?.focus()); }
       return;
     }
+    // An unanswered ask_user card blocks the whole turn: the SDK is parked inside the tool call, so
+    // a normal send only reaches the runner's input queue, which is not drained until the turn ends.
+    // That reads as double grey ticks and no reply, forever. Typing an answer is the obvious thing
+    // to do when the last thing on screen is a question, so route the text to the card instead.
+    const askStore = activeStoreRef.current;
+    const openAsk = attachments.length ? undefined : (askStore?.items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined);
+    if (askStore && openAsk) {
+      askStore.answerAsk(openAsk.askId, raw);
+      api.answerAsk(askStore.id, openAsk.askId, raw).catch(() => {});
+      return;
+    }
     await submitText(text);
   };
 
@@ -2229,7 +2240,7 @@ function App() {
                 ))}
               </div>
             )}
-            <textarea ref={taRef} value={input} onChange={onInput} onKeyDown={onKey} rows={1} placeholder="Reply to Claude..." />
+            <textarea ref={taRef} value={input} onChange={onInput} onKeyDown={onKey} rows={1} placeholder={pendingAsk ? "Answer the question above…" : "Reply to Claude..."} />
             <div className="composer-actions">
               {/* Photo/gallery picker: accept=image/* makes Android/iOS open the photo library (with a
                   camera option), not the file browser. The paperclip stays for any-file attachments. */}
