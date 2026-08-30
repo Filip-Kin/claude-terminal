@@ -7,7 +7,7 @@
 
 import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, getSubscriptionUsage, getSupportedModels, resolveEditPoints, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -290,6 +290,40 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       return new Response(text, { status: up.status, headers: { ...ctx.cors(req), "Content-Type": "application/json", "Cache-Control": "no-store" } });
     } catch (e: any) {
       return jsonRes({ error: "stt upstream: " + (e?.message || e) }, ctx, req, 502);
+    }
+  }
+  // Live dictation: raw PCM16 chunks with a session id, running transcript back. Query string is
+  // forwarded as-is (sid + final) so the STT service owns all the segmenting state.
+  if (req.method === "POST" && path === "/app/api/stt/live") {
+    if (!ctx.sttUrl) return jsonRes({ error: "stt not configured" }, ctx, req, 503);
+    try {
+      const u = new URL(req.url);
+      const body = await req.arrayBuffer();
+      const up = await fetch(ctx.sttUrl.replace(/\/$/, "") + "/live" + u.search, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body,
+      });
+      const text = await up.text();
+      return new Response(text, { status: up.status, headers: { ...ctx.cors(req), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+    } catch (e: any) {
+      return jsonRes({ error: "stt upstream: " + (e?.message || e) }, ctx, req, 502);
+    }
+  }
+  // Tidy a finished dictation: punctuation, filler, spoken commands, project names. Falls back to
+  // the raw transcript on any failure, so the composer always ends up with the user's words.
+  if (req.method === "POST" && path === "/app/api/stt/cleanup") {
+    try {
+      const b: any = await req.json();
+      // Fired when the mic opens, not when it closes: the cleanup process is slow to start and fast
+      // to answer, so it starts while the user is still speaking.
+      if (b?.warm) { warmDictation(); return jsonRes({ ok: true }, ctx, req); }
+      const raw = String(b?.text || "");
+      if (!raw.trim()) return jsonRes({ text: "" }, ctx, req);
+      const text = await cleanDictation(raw);
+      return jsonRes({ text }, ctx, req);
+    } catch (e: any) {
+      return jsonRes({ error: "cleanup: " + (e?.message || e) }, ctx, req, 500);
     }
   }
   if (req.method === "POST" && path === "/app/api/tts") {

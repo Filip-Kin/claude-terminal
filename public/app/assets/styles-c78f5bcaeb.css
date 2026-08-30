@@ -372,6 +372,18 @@ a { color: var(--accent-2); }
 .composer-actions .spacer { flex: 1; }
 .act-btn { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 9px; background: transparent; border: none; color: var(--text-2); }
 .act-btn:hover { background: var(--bg-3); color: var(--text); }
+
+/* Composer dictation mic. Recording is accent-coloured with a ring that breathes with the mic level,
+   so it is obvious at a glance that it is hearing you and not just sitting there. */
+.dictate-btn { position: relative; }
+.dictate-btn.rec { color: var(--accent); background: var(--bg-3); }
+.dictate-btn.rec::after {
+  content: ""; position: absolute; inset: 0; border-radius: 9px;
+  border: 1.5px solid var(--accent); opacity: .5; pointer-events: none;
+  transform: scale(var(--lvl, 1)); transition: transform .1s ease-out;
+}
+.dictate-btn.tidying { color: var(--accent); animation: dictate-tidy 1s ease-in-out infinite; }
+@keyframes dictate-tidy { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
 .send-btn { width: 34px; height: 34px; border-radius: 9px; background: var(--accent); color: #1a1613; border: none; display: inline-flex; align-items: center; justify-content: center; transition: background .15s, opacity .15s; }
 .send-btn:hover { background: var(--accent-2); }
 .send-btn:disabled { opacity: .4; cursor: default; }

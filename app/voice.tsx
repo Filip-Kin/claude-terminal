@@ -34,6 +34,20 @@ export interface VoiceBridge {
 
 type Phase = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "error";
 
+// How long a completed sentence waits to see whether a tool call follows it, in "skip the running
+// commentary" mode. content_block_start for the tool arrives within a few tens of ms of the text
+// ending, so this only has to cover the gap; it is also the extra delay on first audio.
+const HOLD_MS = 350;
+// If the user echo never comes back (a decorated turn, a backend restart), arm anyway rather than
+// sitting silent in "thinking" forever with the answer already on screen.
+const ARM_FALLBACK_MS = 4000;
+
+// The backend appends a hidden <voice-mode> directive to voice turns, so the echoed user event never
+// equals the text we submitted. Strip it before comparing.
+function stripVoiceDirective(t: string): string {
+  return (t || "").replace(/\s*<voice-mode>[\s\S]*?<\/voice-mode>\s*$/, "").trim();
+}
+
 // #region speakable text (strip markdown so we don't read syntax or code aloud)
 // Numbers 0-59 as words, for reading clock times naturally (Kokoro mangles "5:30 PM" into
 // "five ... thirty"). "5:30 PM" -> "five thirty P M", "5:00" -> "five o'clock", "5:05" -> "five oh five".
@@ -382,6 +396,16 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   const armedRef = useRef(false); // only speak after our own user turn echoes back (skip replayed/in-flight text)
   const ttsChainRef = useRef<Promise<void>>(Promise.resolve());
   const activeRef = useRef(false); // voice mode active
+  const submitAtRef = useRef(0);   // when we last handed a turn to the bridge (arming watchdog)
+  const spokeRef = useRef(false);  // did this turn produce any speech at all
+  // "Skip the running commentary" mode: complete sentences wait here briefly. A tool_start inside the
+  // hold window means that text was narration ("I'll check the config...") and gets dropped; nothing
+  // follows it means it is the real answer, so it is spoken. This keeps the mode quiet during tool work
+  // WITHOUT waiting for the whole reply to finish before saying a word.
+  const holdRef = useRef<string[]>([]);
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const turnDoneAtRef = useRef(0);   // when the turn finished (silence watchdog)
+  const ttsPendingRef = useRef(0);   // TTS fetches in flight, so the watchdog waits for real silence
 
   const clearRaf = () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current); rafRef.current = null; };
 
@@ -512,6 +536,8 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     // replayed history or an in-flight previous reply isn't spoken as this turn.
     sentBufRef.current = ""; turnDoneRef.current = false; setCaption("");
     expectedUserRef.current = text; armedRef.current = false;
+    submitAtRef.current = Date.now(); spokeRef.current = false;
+    holdRef.current = []; if (holdTimerRef.current) { clearTimeout(holdTimerRef.current); holdTimerRef.current = null; }
     setPhaseR("thinking");
     try { await bridge.submit(text); } catch { setErr("send failed"); setPhaseR("error"); }
   }, [bridge, startListening]);
@@ -521,9 +547,28 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   const speakSentence = useCallback((sentence: string) => {
     const player = playerRef.current;
     if (!player) return;
+    spokeRef.current = true;
+    ttsPendingRef.current++;
     // serialise TTS fetches so audio enqueues in sentence order — same core as one-shot read-aloud
-    ttsChainRef.current = ttsChainRef.current.then(() => ttsSpeakInto(player, sentence, () => activeRef.current, ttsVoiceRef.current)).then(() => {});
+    ttsChainRef.current = ttsChainRef.current
+      .then(() => ttsSpeakInto(player, sentence, () => activeRef.current, ttsVoiceRef.current))
+      .then(() => { ttsPendingRef.current = Math.max(0, ttsPendingRef.current - 1); });
   }, []);
+
+  // Release everything sitting in the narration hold buffer (nothing followed it -> it was the answer).
+  const flushHold = useCallback(() => {
+    if (holdTimerRef.current) { clearTimeout(holdTimerRef.current); holdTimerRef.current = null; }
+    const held = holdRef.current; holdRef.current = [];
+    for (const s of held) speakSentence(s);
+  }, [speakSentence]);
+
+  // Queue a sentence under the hold window; each new sentence extends it, so a burst of final-answer
+  // sentences is released together the moment the model pauses without calling a tool.
+  const holdSentence = useCallback((sentence: string) => {
+    holdRef.current.push(sentence);
+    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+    holdTimerRef.current = setTimeout(() => { holdTimerRef.current = null; flushHold(); }, HOLD_MS);
+  }, [flushHold]);
   // #endregion
 
   // #region consume the conversation event stream while voice mode is open
@@ -532,42 +577,54 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     const unsub = bridge.subscribe((e) => {
       if (!activeRef.current) return;
       if (e.t === "user") {
-        // arm only when OUR submitted turn echoes back; ignore other/replayed user turns
-        if (!armedRef.current && expectedUserRef.current != null && (e as any).text === expectedUserRef.current) {
+        // Arm only when OUR submitted turn echoes back; ignore other/replayed user turns. The echo is
+        // the DECORATED text in voice mode (the backend appends the hidden <voice-mode> directive), so
+        // compare stripped — a raw === here never matched, which left voice mode disarmed, silent and
+        // stuck on "thinking" for the whole turn while the reply rendered normally in the chat.
+        if (!armedRef.current && expectedUserRef.current != null && stripVoiceDirective((e as any).text) === expectedUserRef.current.trim()) {
           armedRef.current = true; sentBufRef.current = ""; setCaption("");
         }
         return;
       }
+      // Backstops so a missed echo can never mute a turn again: the server flipping to busy after our
+      // submit means our turn was accepted, and past the fallback window anything arriving is ours.
+      if (!armedRef.current && submitAtRef.current) {
+        if (e.t === "busy" && (e as any).busy === true) { armedRef.current = true; sentBufRef.current = ""; setCaption(""); return; }
+        if (Date.now() - submitAtRef.current > ARM_FALLBACK_MS) { armedRef.current = true; sentBufRef.current = ""; setCaption(""); }
+      }
       if (!armedRef.current) return; // pre-arm: skip replayed history / in-flight prior reply
-      if (e.t === "text_delta" || e.t === "text") {
+      if (e.t === "tool_start" || e.t === "tool_use") {
+        // Text that runs straight into a tool call was narration, not the answer. Drop whatever is
+        // still held or half-written so it is neither spoken now nor glued onto the real answer later.
+        if (holdTimerRef.current) { clearTimeout(holdTimerRef.current); holdTimerRef.current = null; }
+        holdRef.current = [];
+        sentBufRef.current = "";
+      } else if (e.t === "text_delta" || e.t === "text") {
         const t = (e as any).text || "";
         if (!t) return;
         setCaption((c) => (c + t).slice(-600));
         sentBufRef.current += t;
-        // "Speak only the final response" mode: buffer the whole reply silently (still shown as a
-        // caption), and speak nothing until the turn completes — no interim/tool-narration chatter.
-        if (speakFinalRef.current) return;
         const [sents, rest] = takeSentences(sentBufRef.current);
         sentBufRef.current = rest;
-        for (const s of sents) speakSentence(s);
+        // Both modes speak as the reply streams. The difference is only that "skip the running
+        // commentary" holds each sentence for HOLD_MS first, so anything a tool call follows is
+        // discarded instead of read out. Waiting for the whole turn is never the answer: the reply is
+        // usually finished writing long before it would have finished being spoken.
+        for (const sent of sents) { if (speakFinalRef.current) holdSentence(sent); else speakSentence(sent); }
       } else if (e.t === "result" || (e.t === "busy" && (e as any).busy === false)) {
-        // turn complete: speak the buffered final reply (final-only mode), else flush the trailing partial
+        // turn complete: release anything held and speak the trailing partial sentence
         if (!turnDoneRef.current) {
-          turnDoneRef.current = true;
+          turnDoneRef.current = true; turnDoneAtRef.current = Date.now();
           const buf = sentBufRef.current.trim(); sentBufRef.current = "";
-          if (!buf) { /* nothing to say */ }
-          else if (speakFinalRef.current) {
-            const [sents, rest] = takeSentences(buf + " "); // chunk the whole reply for ordered playback
-            for (const s of sents) speakSentence(s);
-            const last = rest.trim(); if (last) speakSentence(last);
-          } else speakSentence(buf);
+          flushHold();
+          if (buf) speakSentence(buf);
         }
       } else if (e.t === "error") {
         setErr((e as any).message || "error");
       }
     });
     return unsub;
-  }, [open, bridge, speakSentence]);
+  }, [open, bridge, speakSentence, holdSentence, flushHold]);
   // #endregion
 
   // #region barge-in + hands-free loop (drives phase transitions off playback state)
@@ -583,6 +640,14 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
       // move thinking -> speaking once audio actually starts (works with or without a live mic)
       if (phaseRef.current === "thinking" && player.isActive) setPhaseR("speaking");
       // turn done + audio drained: hands-free listens again; tap-to-talk goes idle (music resumes) to wait for a tap
+      // Silence watchdog: the turn is over, no audio is playing and nothing is being synthesised, yet
+      // we are still showing "thinking". That means this turn produced no speech (TTS down, or an empty
+      // reply). Hand the mic back instead of sitting on a dead screen with the answer already visible.
+      if (phaseRef.current === "thinking" && turnDoneRef.current && !player.isActive && ttsPendingRef.current === 0 && turnDoneAtRef.current && Date.now() - turnDoneAtRef.current > 1500) {
+        if (!spokeRef.current) setErr("nothing was read back for that reply");
+        if (pttRef.current) setPhaseR("idle"); else startListening();
+        return;
+      }
       if (phaseRef.current === "speaking" && turnDoneRef.current && !player.isActive) {
         if (pttRef.current) setPhaseR("idle");
         else startListening();

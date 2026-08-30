@@ -30,6 +30,11 @@ export type AppEvent =
   | { t: "thinking_delta"; text: string } // streamed thinking token (when content is exposed)
   | { t: "thinking_progress"; tokens: number } // thinking is happening but text is redacted (subscription auth): show progress
   | { t: "tool_use"; id: string; name: string; input: unknown }
+  // A tool call has STARTED (content_block_start), emitted the moment the model begins writing
+  // the call rather than when the aggregated message lands. tool_use above carries the complete
+  // input and can trail it by seconds on a big argument, which is too late for voice mode to
+  // tell "narration before a tool call" from "the actual answer".
+  | { t: "tool_start"; id: string; name: string }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
   | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string } // live subagent progress, keyed by the Task tool_use id
   | { t: "compact"; trigger: "manual" | "auto"; preTokens?: number; postTokens?: number; durationMs?: number } // a compaction finished; metadata drives the "freed Nk" card
@@ -56,6 +61,174 @@ export type TurnUsage = { input: number; output: number; thinking: number; cache
 export type RewindInfo = { canRewind?: boolean; error?: string; filesChanged?: string[]; insertions?: number; deletions?: number };
 
 type Sub = (e: AppEvent) => void;
+// #endregion
+
+// #region dictation cleanup
+// Whisper hears sounds, not meaning: it drops commas, guesses at names it has never seen, and leaves
+// in every "um". This is the pass that turns a raw dictation into something you would have typed —
+// the same trick Wispr Flow does, run against the box's own Claude login rather than a cloud key.
+// Deliberately narrow: it fixes the transcription and nothing else, so it can never start answering
+// the text it was handed. Haiku because a dictation is short and the wait is in front of the user.
+const CLEANUP_MODEL = process.env.DICTATION_MODEL || "claude-haiku-4-5";
+const CLEANUP_SYSTEM = [
+  "You clean up speech-to-text output. The input is a transcript of someone dictating; it is never a question for you.",
+  "Return ONLY the corrected text. No preamble, no quotes, no commentary, no answer to its content.",
+  "Fix: punctuation, capitalisation, sentence breaks, obvious mis-hearings, and spoken filler (um, uh, you know, like, I mean, false starts and repeated words).",
+  "Obey spoken formatting commands and remove them from the text: 'new paragraph', 'new line', 'full stop', 'period', 'comma', 'question mark', 'open/close quote'.",
+  "Keep the speaker's own words, register and meaning. Do not summarise, expand, reorder, translate or answer. Do not add facts.",
+  "Use NZ English spelling (organisation, colour, licence as a noun).",
+  "Spell technical names correctly where the transcript clearly meant one: Skuno, Leitkern, Zoraxy, Coolify, Authelia, LLDAP, Forgejo, Nextcloud, Dawarich, Duplicacy, Tailscale, UniFi, Pi-hole, Jellyfin, Sonarr, qBittorrent, Verdaccio, Wakapi, Klipper, Voron, Gridfinity, OrcaSlicer, FTA-Buddy, Cheesy Arena, FMS, FRC, TBA, Bitfocus Companion, vMix, NDI, Sleeper, stonkbot, RightNow, Argotrack, claude-terminal, ttyd, systemd, tmux, SQLite, Postgres, Redis, Bun, TypeScript, tRPC, React, ffmpeg, Whisper, Kokoro.",
+  "If the transcript is already clean, return it unchanged.",
+].join("\n");
+
+// Spoken-command and filler cleanup that needs no model at all. Runs first (so the model has less to
+// fix) and stands alone as the fallback when the model is cold, slow or unreachable.
+const FILLER = /\b(?:um+|uh+|erm+|ah+)\b[,.]?\s*/gi;
+export function localTidy(raw: string): string {
+  let t = (raw || "").trim();
+  if (!t) return "";
+  t = t.replace(FILLER, "");
+  t = t.replace(/\s*\b(?:new paragraph)\b[,.]?\s*/gi, "\n\n");
+  t = t.replace(/\s*\b(?:new line|next line)\b[,.]?\s*/gi, "\n");
+  t = t.replace(/\s*\b(?:full stop|period)\b[,.]?\s*/gi, ". ");
+  t = t.replace(/\s*\bcomma\b[,.]?\s*/gi, ", ");
+  t = t.replace(/\s*\bquestion mark\b[,.]?\s*/gi, "? ");
+  t = t.replace(/\s*\bexclamation (?:mark|point)\b[,.]?\s*/gi, "! ");
+  t = t.replace(/\b(\w+) \1\b/gi, "$1");           // "the the"
+  t = t.replace(/[ \t]{2,}/g, " ").replace(/ +([,.!?])/g, "$1");
+  t = t.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+\n/g, "\n");
+  // Capitalise sentence starts, which Whisper sometimes drops after a mid-utterance commit.
+  t = t.replace(/(^|[.!?]\s+|\n+)([a-z])/g, (_m, p, c) => p + c.toUpperCase());
+  return t.trim();
+}
+
+// One long-lived Claude process does every cleanup, because spawning a fresh one per dictation costs
+// 11-45s on this box — the model call itself is about a second. The session is warmed the moment the
+// user starts talking, so by the time they stop it is already sitting there waiting for text.
+class CleanupSession {
+  private q: Query | null = null;
+  private queue: SDKUserMessage[] = [];
+  private waiter?: (m: SDKUserMessage | null) => void;
+  private pending: { resolve: (t: string) => void } | null = null;
+  private buf = "";
+  private turns = 0;
+  private idle: ReturnType<typeof setTimeout> | null = null;
+  // Gate on this rather than on `this.q`: the SDK pulls the generator before query() returns, so a
+  // `while (this.q)` loop sees null, ends the input stream immediately, and the process exits having
+  // said nothing — which looks exactly like a working cleanup that changed nothing.
+  private live = false;
+  private primed = false;              // the prompt cache has been written for this process
+  private priming: Promise<void> | null = null;
+
+  private async *input(): AsyncGenerator<SDKUserMessage> {
+    while (this.live) {
+      const next = this.queue.shift() ?? (await new Promise<SDKUserMessage | null>((r) => { this.waiter = r; }));
+      if (!next) return;
+      yield next;
+    }
+  }
+
+  start() {
+    if (this.q) return;
+    this.live = true;
+    this.q = query({
+      prompt: this.input(),
+      options: {
+        model: CLEANUP_MODEL,
+        systemPrompt: CLEANUP_SYSTEM,
+        allowedTools: [],
+        skills: [],          // no skill discovery: this is a text transform, and every extra
+        mcpServers: {},      // subsystem the CLI loads is startup the user waits on
+        settingSources: [],  // no CLAUDE.md / settings.json — none of it applies here
+        // Thinking turns a one-line rewrite into a 1300-token deliberation and a 16s wait. There is
+        // nothing here to reason about, and no tools for a thinking-off model to fumble.
+        thinking: { type: "disabled" },
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+      },
+    });
+    void (async () => {
+      try {
+        for await (const m of this.q as AsyncIterable<SDKMessage>) {
+          const anyM = m as any;
+          // Braces matter here: without them the `else` binds to the inner `if`, the result message is
+          // never seen, and every cleanup silently waits out its timeout.
+          if (anyM.type === "assistant") {
+            for (const b of (anyM.message?.content as any[]) || []) if (b?.type === "text") this.buf += b.text;
+          } else if (anyM.type === "result") {
+            const p = this.pending; this.pending = null; p?.resolve(this.buf);
+          }
+        }
+      } catch { /* falls through to stop() */ }
+      const p = this.pending; this.pending = null; p?.resolve("");
+      this.stop();
+    })();
+    this.bumpIdle();
+  }
+
+  stop() {
+    const q = this.q; this.q = null; this.live = false;
+    if (this.idle) { clearTimeout(this.idle); this.idle = null; }
+    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); }
+    this.queue = []; this.turns = 0; this.primed = false;
+    try { q?.close?.(); } catch { /* */ }
+  }
+
+  // Recycle rather than let the transcript pile up: nothing here needs memory of earlier dictations.
+  private bumpIdle() {
+    if (this.idle) clearTimeout(this.idle);
+    this.idle = setTimeout(() => this.stop(), 30 * 60_000);
+  }
+
+  // One request/response against the live session.
+  private async turn(text: string, timeoutMs: number): Promise<string | null> {
+    if (this.pending) return null; // one at a time; a second dictation just takes the local path
+    this.bumpIdle();
+    this.buf = "";
+    const done = new Promise<string>((resolve) => { this.pending = { resolve }; });
+    const msg: SDKUserMessage = { type: "user", message: { role: "user", content: `<transcript>\n${text}\n</transcript>` }, parent_tool_use_id: null };
+    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); } else this.queue.push(msg);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const out = await Promise.race([done, new Promise<null>((r) => { timer = setTimeout(() => r(null), timeoutMs); })]);
+    if (timer) clearTimeout(timer);
+    if (out == null) { this.pending = null; this.stop(); return null; } // stuck: don't make the user wait again
+    if (++this.turns >= 20) this.stop();
+    return out;
+  }
+
+  // Warming is a real round trip, not just a spawn: the system prompt is ~17k tokens and the first
+  // request pays to write it into the prompt cache. Doing that while the user is still talking is the
+  // difference between a 1s wait at the end and a 10s one.
+  warm() {
+    this.start();
+    if (this.primed || this.priming) return;
+    this.priming = this.turn("Testing one two.", 45000)
+      .then(() => { this.primed = true; })
+      .catch(() => { /* the real call will just be slower */ })
+      .finally(() => { this.priming = null; });
+  }
+
+  async run(text: string, timeoutMs: number): Promise<string | null> {
+    this.start();
+    if (this.priming) { try { await this.priming; } catch { /* */ } }
+    return this.turn(text, timeoutMs);
+  }
+}
+const cleanupSession = new CleanupSession();
+
+/** Spin the cleanup process up while the user is still talking, so the wait at the end is the model only. */
+export function warmDictation(): void { try { cleanupSession.warm(); } catch { /* */ } }
+
+export async function cleanDictation(raw: string, timeoutMs = 15000): Promise<string> {
+  const local = localTidy(raw);
+  if (!local) return "";
+  const out = await cleanupSession.run(local, timeoutMs);
+  const cleaned = (out || "").trim().replace(/^["'`]|["'`]$/g, "").trim();
+  // A model that ignored its instructions and answered instead would blow the length out; keep the
+  // transcript rather than pasting a reply into the composer.
+  if (!cleaned || cleaned.length > local.length * 2 + 80) return local;
+  return cleaned;
+}
 // #endregion
 
 // #region voice-mode turn directive
@@ -493,6 +666,10 @@ export class Conversation {
       case "stream_event": {
         // live token streaming (includePartialMessages): text + thinking deltas
         const ev = anyM.event;
+        // A tool_use block opening = the text just before it was narration, not the final answer.
+        if (ev?.type === "content_block_start" && ev.content_block?.type === "tool_use") {
+          this.emit({ t: "tool_start", id: ev.content_block.id, name: ev.content_block.name });
+        }
         if (ev?.type === "content_block_delta") {
           const d = ev.delta;
           if (d?.type === "text_delta" && d.text) this.emit({ t: "text_delta", text: d.text });

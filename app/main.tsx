@@ -5,6 +5,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
 import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
+import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
@@ -924,6 +925,8 @@ function App() {
   const [voices, setVoices] = useState<{ id: string; label: string }[]>([]); // available Kokoro voices
   const [ttsVoice, setTtsVoiceState] = useState<string>(() => { try { return localStorage.getItem("ct-voice-name") || ""; } catch { return ""; } });
   const setTtsVoice = (v: string) => { setTtsVoiceState(v); try { localStorage.setItem("ct-voice-name", v); } catch { /* */ } };
+  const [dictTidy, setDictTidyState] = useState(() => { try { return localStorage.getItem("ct-dictate-tidy") !== "0"; } catch { return true; } });
+  const setDictTidy = (v: boolean) => { setDictTidyState(v); try { localStorage.setItem("ct-dictate-tidy", v ? "1" : "0"); } catch { /* */ } };
   const [voiceOpen, setVoiceOpen] = useState(false);
   // Which message (item index) is being read aloud + whether we're still generating the voice (Kokoro
   // TTS latency) or actually playing it. Drives the per-message "generating voice…" / "playing" pill.
@@ -1562,6 +1565,36 @@ function App() {
     await submitText(text);
   };
 
+  // #region dictation (composer mic)
+  // Text lands where the caret was, so you can dictate into the middle of a half-typed message. The
+  // anchor is captured once at the start: everything the transcript grows by is re-spliced between
+  // the same prefix and suffix, which is what lets grey partial text be replaced in place.
+  const dictAnchorRef = useRef<{ prefix: string; suffix: string } | null>(null);
+  const onDictText = useCallback((text: string, done: boolean) => {
+    const a = dictAnchorRef.current;
+    if (!a) return;
+    const sep = a.prefix && !/\s$/.test(a.prefix) ? " " : "";
+    const caret = (a.prefix + sep + text).length;
+    setInput(a.prefix + sep + text + a.suffix);
+    if (done) dictAnchorRef.current = null;
+    requestAnimationFrame(() => {
+      const ta = taRef.current; if (!ta) return;
+      ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+      // Caret to the end of the dictated span, without focus() — on a phone that would throw the
+      // keyboard up over the message you just spoke.
+      if (done) { try { ta.setSelectionRange(caret, caret); } catch { /* */ } }
+    });
+  }, []);
+  const dictation = useDictation({ onText: onDictText, tidy: dictTidy, enabled: voiceAvail });
+  const toggleDictation = () => {
+    if (dictation.active) { dictation.stop(); return; }
+    const ta = taRef.current;
+    const pos = ta && typeof ta.selectionStart === "number" ? ta.selectionStart : input.length;
+    dictAnchorRef.current = { prefix: input.slice(0, pos), suffix: input.slice(pos) };
+    dictation.start();
+  };
+  // #endregion
+
   // Stable bridge handed to voice mode: submit a turn + subscribe to the live event stream.
   const voiceBridge = useMemo<VoiceBridge>(() => ({
     submit: (text: string) => submitText(text, { voice: true }), // flag the turn so the backend adds the brief/TTS directive
@@ -1775,8 +1808,15 @@ function App() {
               <div className="settings-section">Voice</div>
               <label className="settings-row">
                 <span className="settings-row-main">
-                  <span className="settings-row-title">Speak only the final response</span>
-                  <span className="settings-row-desc">In voice mode, stay quiet while Claude works and read back just the finished answer, not the running commentary.</span>
+                  <span className="settings-row-title">Tidy up dictation</span>
+                  <span className="settings-row-desc">When you finish dictating, pass the transcript through Claude Haiku to fix punctuation, drop the ums, and spell project names properly. Adds a second or so; turn it off for raw Whisper output.</span>
+                </span>
+                <button role="switch" aria-checked={dictTidy} className={"toggle" + (dictTidy ? " on" : "")} onClick={() => setDictTidy(!dictTidy)}><span className="knob" /></button>
+              </label>
+              <label className="settings-row">
+                <span className="settings-row-main">
+                  <span className="settings-row-title">Skip the running commentary</span>
+                  <span className="settings-row-desc">In voice mode, stay quiet while Claude works and read back only the answer. It still reads as the answer streams in, so you hear the first sentence while the rest is still being written.</span>
                 </span>
                 <button role="switch" aria-checked={speakFinalOnly} className={"toggle" + (speakFinalOnly ? " on" : "")} onClick={() => setSpeakFinal(!speakFinalOnly)}><span className="knob" /></button>
               </label>
@@ -1971,9 +2011,21 @@ function App() {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M9 7V4a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v3M15 7V4a1 1 0 0 0-1-1M7 7h10l-.6 9a3 3 0 0 1-3 2.8H10.6a3 3 0 0 1-3-2.8L7 7z" /><path d="M12 18v3" /></svg>
               </button>
               <div className="spacer" />
+              {dictation.available && (
+                <button
+                  className={"act-btn dictate-btn" + (dictation.active ? " rec" : "") + (dictation.tidying ? " tidying" : "")}
+                  onClick={toggleDictation}
+                  style={dictation.active ? ({ "--lvl": String(0.85 + dictation.level * 0.4) } as any) : undefined}
+                  title={dictation.active ? "Stop dictating" : dictation.error || "Dictate into the message box"}
+                  aria-label="Dictate"
+                  aria-pressed={dictation.active}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z" stroke="currentColor" strokeWidth="1.7" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /></svg>
+                </button>
+              )}
               {voiceAvail && (
                 <button className="act-btn voice-open-btn" onClick={() => setVoiceOpen(true)} title="Hands-free voice mode">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z" stroke="currentColor" strokeWidth="1.7" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /></svg>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M4 13v-1a8 8 0 0 1 16 0v1" /><path d="M4 13h2.5a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" /><path d="M20 13h-2.5a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1H19a1 1 0 0 0 1-1z" /><path d="M18 18v1a2 2 0 0 1-2 2h-3" /></svg>
                 </button>
               )}
               {busy && activeStore?.connected && (
