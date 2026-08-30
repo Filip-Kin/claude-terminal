@@ -31,9 +31,56 @@ CREATE TABLE IF NOT EXISTS subscription_samples (
                                           -- LOCAL users; they all share the one subscription limit)
   cum_total        INTEGER,               -- account-wide cumulative total tokens (incl cache)
   active_users     INTEGER,               -- local users active within the recent window
-  per_user_output  TEXT                   -- JSON { user: cumulativeOutput } snapshot, for later
+  per_user_output  TEXT,                  -- JSON { user: cumulativeOutput } snapshot, for later
                                           -- attribution of who was burning during this sample
+  per_model_output TEXT,                  -- JSON { model: cumulativeOutput } account-wide, from
+                                          -- model_usage. The model-mix covariate: a window's
+                                          -- delta per model is what lets the fit weight Opus
+                                          -- against Haiku instead of averaging them away.
+  per_model_total  TEXT,                  -- JSON { model: cumulativeTotal }, same shape
+  five_hour_window INTEGER,               -- reset epoch ms rounded to 5 min = a STABLE window id.
+                                          -- five_hour_reset itself is recomputed per response and
+                                          -- jitters by ~1s, so grouping on it splits one real
+                                          -- window into hundreds of keys (826 keys for 7 windows).
+  seven_day_window INTEGER,               -- same, for the 7-day window
+  available        INTEGER,               -- rate_limits_available: 1 real reading, 0 not offered
+  cum_input        INTEGER,               -- account-wide cumulative input tokens
+  cum_cache_creation INTEGER,             -- account-wide cumulative cache-creation tokens. Fitting
+                                          -- output ALONE leaves 7.25pp RMS error on the 5h window;
+                                          -- output + cache_creation cuts that to 4.95pp, with a
+                                          -- cache-creation token costing ~1/14th of an output one.
+                                          -- Recorded here, not just derived from model_usage, so
+                                          -- the series survives transcripts being rotated away.
+  cum_cache_read   INTEGER                -- account-wide cumulative cache-read tokens
 );`;
+
+// Columns added after the table shipped. SQLite has no ADD COLUMN IF NOT EXISTS, so check
+// first; each is nullable, so old rows simply carry NULL and the fit ignores them.
+const ADDED_COLUMNS: Record<string, string> = {
+  per_model_output: "TEXT",
+  per_model_total: "TEXT",
+  five_hour_window: "INTEGER",
+  seven_day_window: "INTEGER",
+  available: "INTEGER",
+  cum_cache_read: "INTEGER",
+  cum_cache_creation: "INTEGER",
+  cum_input: "INTEGER",
+};
+
+function ensureColumns(db: any): void {
+  const have = new Set((db.query("PRAGMA table_info(subscription_samples)").all() as any[]).map((r) => r.name));
+  for (const [col, type] of Object.entries(ADDED_COLUMNS)) {
+    if (!have.has(col)) db.exec(`ALTER TABLE subscription_samples ADD COLUMN ${col} ${type}`);
+  }
+}
+
+// A window id that survives the per-response jitter in resets_at. 5 min is far wider than the
+// jitter (~1s) and far narrower than the gap between real windows (5h).
+const WINDOW_BUCKET_MS = 5 * 60_000;
+function windowId(resetsAt: string | null | undefined): number | null {
+  const t = resetsAt ? Date.parse(resetsAt) : NaN;
+  return isFinite(t) ? Math.round(t / WINDOW_BUCKET_MS) * WINDOW_BUCKET_MS : null;
+}
 
 type SubWindow = { utilization: number | null; resetsAt: string | null } | null;
 type SubUsage = {
@@ -80,16 +127,38 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
   const db = openDb(cfg.db); // also ensures the base schema; writable root handle
   try {
     db.exec(ENSURE);
+    ensureColumns(db);
 
     // Account-wide cumulative output = sum over LOCAL users only (external peers are a different
     // account/box and are kept in their own tables, so they never enter this sum).
     const totals = db
-      .query("SELECT COALESCE(SUM(output),0) AS output, COALESCE(SUM(total),0) AS total FROM cumulative")
-      .get() as { output: number; total: number };
+      .query(
+        `SELECT COALESCE(SUM(output),0) AS output, COALESCE(SUM(total),0) AS total,
+                COALESCE(SUM(input),0) AS input, COALESCE(SUM(cache_creation),0) AS cacheCreation,
+                COALESCE(SUM(cache_read),0) AS cacheRead FROM cumulative`,
+      )
+      .get() as { output: number; total: number; input: number; cacheCreation: number; cacheRead: number };
 
     const perUser: Record<string, number> = {};
     for (const r of db.query("SELECT user, output FROM cumulative").all() as any[]) {
       perUser[r.user] = r.output;
+    }
+
+    // Account-wide per-model breakdown, from the table model-collector.ts maintains. Its
+    // absolute totals do NOT match cum_output (model_usage is rebuilt from transcripts only,
+    // while cumulative also carries the 2026-08-26 claude.ai estimate merge); the fit uses
+    // per-window DELTAS, which are consistent.
+    const perModelOutput: Record<string, number> = {};
+    const perModelTotal: Record<string, number> = {};
+    try {
+      for (const r of db
+        .query("SELECT model, SUM(output) AS output, SUM(total) AS total FROM model_usage GROUP BY model")
+        .all() as any[]) {
+        perModelOutput[r.model] = r.output;
+        perModelTotal[r.model] = r.total;
+      }
+    } catch {
+      /* model_usage not created yet on the very first tick after deploy */
     }
 
     // Active = local users whose last recorded activity is within the window. meta.last_activity
@@ -104,8 +173,10 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
     db.query(
       `INSERT OR REPLACE INTO subscription_samples
        (ts, fetched_at, subscription, five_hour_util, five_hour_reset,
-        seven_day_util, seven_day_reset, cum_output, cum_total, active_users, per_user_output)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        seven_day_util, seven_day_reset, cum_output, cum_total, active_users, per_user_output,
+        per_model_output, per_model_total, five_hour_window, seven_day_window, available,
+        cum_input, cum_cache_creation, cum_cache_read)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       Date.now(),
       typeof sub.fetchedAt === "number" ? sub.fetchedAt : null,
@@ -118,10 +189,18 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
       totals.total,
       active,
       JSON.stringify(perUser),
+      JSON.stringify(perModelOutput),
+      JSON.stringify(perModelTotal),
+      windowId(five?.resetsAt),
+      windowId(seven?.resetsAt),
+      sub.available === false ? 0 : 1,
+      totals.input,
+      totals.cacheCreation,
+      totals.cacheRead,
     );
     console.log(
       `subscription sample: 5h=${five?.utilization ?? "?"}% 7d=${seven?.utilization ?? "?"}% ` +
-        `output=${totals.output} active=${active}`,
+        `output=${totals.output} active=${active} models=${Object.keys(perModelOutput).length}`,
     );
   } finally {
     db.close();
