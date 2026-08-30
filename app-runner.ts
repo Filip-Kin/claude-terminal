@@ -12,6 +12,15 @@ import { mkdirSync } from "node:fs";
 import { z } from "zod";
 import { armResume, cancelResume } from "./subscription-resume.ts";
 
+// Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
+// done/error/closed is a turn the runner swallowed; a done with the user still seeing nothing points at
+// delivery (SSE) instead. Same one-line key=value shape so both are greppable together.
+function tlog(event: string, fields: Record<string, unknown>): void {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(fields)) if (v !== undefined && v !== null && v !== "") parts.push(`${k}=${v}`);
+  console.log(`[turn] ${event}${parts.length ? " " + parts.join(" ") : ""}`);
+}
+
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string }
@@ -411,12 +420,13 @@ export class Conversation {
     try {
       for await (const m of this.q) this.handle(m);
     } catch (e: any) {
-      if (myGen === this.runGen) this.emit({ t: "error", message: String(e?.message || e) });
+      if (myGen === this.runGen) { tlog("error", { conv: this.id, msg: JSON.stringify(String(e?.message || e).slice(0, 200)) }); this.emit({ t: "error", message: String(e?.message || e) }); }
       this.armRateLimitedResume(); // backstop: the query threw while rate-limited -> still auto-resume
     } finally {
       // Superseded by a refork -> stay silent; the new run owns the stream now.
       if (myGen === this.runGen) {
         this.busy = false;
+        tlog("closed", { conv: this.id, listeners: this.subs.size });
         this.emit({ t: "busy", busy: false });
         this.emit({ t: "closed" });
       }
@@ -528,6 +538,7 @@ export class Conversation {
       }
       case "result": {
         this.busy = false;
+        tlog("done", { conv: this.id, subtype: anyM.subtype, ms: anyM.duration_ms || 0, listeners: this.subs.size });
         this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
         const u = anyM.usage || {};
         const input = u.input_tokens || 0;

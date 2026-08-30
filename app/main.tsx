@@ -299,6 +299,10 @@ export interface StoreHooks {
   onContext: (store: ConvStore) => void;                 // refresh the context gauge
 }
 
+// How long an unacknowledged optimistic user turn keeps the conversation "busy" once the SERVER has
+// reported idle. Past this it's an orphan (dead turn, or a backend restart) and is dropped.
+const ECHO_TTL = 30_000;
+
 class ConvStore {
   id: string;
   items: Item[] = [];
@@ -311,7 +315,10 @@ class ConvStore {
   hydrated = false;     // items loaded from cache or network at least once
   touched = Date.now(); // LRU key for evicting idle in-memory stores
   es: EventSource | null = null;
-  private pendingEcho: string[] = []; // optimistic user turns awaiting their SSE echo
+  // Optimistic user turns awaiting their SSE echo. Timestamped, because an echo that never arrives
+  // (the turn died, or the backend restarted mid-turn) otherwise pins busy=true through every
+  // reconcile below: stuck Stop button, and markRead is gated on !busy so the unread dot sticks too.
+  private pendingEcho: { text: string; at: number }[] = [];
   sendState: "sending" | "delivered" | "read" | "queued" | "failed" | null = null; // delivery of the latest sent turn (Google-Messages-style ticks)
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
   private cachedItems: Item[] = [];   // tail-diff baseline for the cache writer
@@ -361,7 +368,7 @@ class ConvStore {
         this.items = applyEvent(this.items, e); this.touch(); this.mgr.hooks?.onContext(this); return;
       case "user": {
         const clean = sanitizeUserText(e.text);
-        const i = this.pendingEcho.indexOf(clean);
+        const i = this.pendingEcho.findIndex((p) => p.text === clean);
         if (i !== -1) { this.pendingEcho.splice(i, 1); if (this.sendState === "sending") this.setSendState("delivered"); return; } // our own optimistic turn echoed back = server has it
         const last = this.items[this.items.length - 1];
         if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) return;
@@ -378,7 +385,7 @@ class ConvStore {
   }
 
   // ---- mutations from the UI ----
-  addOptimisticUser(text: string) { this.pendingEcho.push(text); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
+  addOptimisticUser(text: string) { this.pendingEcho.push({ text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
   // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
   // below), and restore the pre-edit view if the server rejects the edit.
   truncateFrom(index: number) { this.items = this.items.slice(0, Math.max(0, index)); this.pendingEcho = []; this.touch(); }
@@ -391,6 +398,15 @@ class ConvStore {
   beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
   endCompactFallback() { if (this.compacting) { this.compacting = false; this.compactStart = 0; this.signal(); } }
   showItems(items: Item[]) { this.items = items; this.signal(); } // transient placeholder view (offline note / queued)
+  // The server says idle but our local state still thinks a reply is outstanding, and resyncing has
+  // already failed to clear it. Take the server's word rather than resyncing forever. Terminal state
+  // of the stall watchdog, not a retry: it drops the orphaned echo and lets the Stop button clear.
+  forceIdle() {
+    const had = this.pendingEcho.length > 0 || this.busy;
+    this.pendingEcho = []; this.busy = false;
+    if (this.sendState === "sending" || this.sendState === "delivered") { this.sendState = "read"; this.signal(); return; }
+    if (had) this.signal();
+  }
 
   // ---- hydration + reconcile (the cache-vs-network policy) ----
   hydrate(items: Item[], meta: { busy?: boolean; cwd?: string | null }) {
@@ -403,6 +419,14 @@ class ConvStore {
   // server (live tokens, or a just-sent turn not yet in the transcript) so nothing flickers away.
   reconcile(items: Item[], meta: { busy: boolean; cwd: string | null }) {
     this.cwd = meta.cwd; this.hydrated = true;
+    // Expire orphaned optimistic echoes BEFORE computing localAhead below. The server emits the user
+    // echo within a second of accepting a turn, so one this old is never arriving (dead turn, backend
+    // restart). Left in place it pins localAhead true forever, and the client then discards the server
+    // transcript on every reconcile: the reply is on disk and never rendered until the store is thrown
+    // away. That is the "no response until the server rebooted" bug, and it also pinned busy=true,
+    // which kept the Stop button up and blocked markRead. Not conditional on meta.busy: an orphan from
+    // an earlier turn would otherwise keep discarding the transcript while a later turn runs.
+    { const cut = Date.now() - ECHO_TTL; this.pendingEcho = this.pendingEcho.filter((p) => p.at > cut); }
     const localAhead = this.pendingEcho.length > 0 || (this.busy && this.items.length >= items.length);
     if (!localAhead) { this.items = items; this.cachedItems = items; }
     // Trust the server's busy on a fresh reconcile so a stale cached busy clears (otherwise a finished
@@ -888,6 +912,9 @@ function App() {
   // Editing a past user turn: its item index + original text. Set by the message "Edit" action;
   // on submit the turn is rewound-and-rerun (full rollback) instead of appended as a new turn.
   const [editing, setEditing] = useState<{ i: number; orig: string } | null>(null);
+  // Why an in-flight edit could not be applied. An edit is a server-side rewind, so when it fails the
+  // turn must stay in edit mode with the reason shown, never silently fall through to a normal send.
+  const [editError, setEditError] = useState<string | null>(null);
   const [convMenu, setConvMenu] = useState<{ x: number; y: number; id: string; title: string; fav: boolean } | null>(null);
   const [speakFinalOnly, setSpeakFinalOnly] = useState(() => { try { return localStorage.getItem("ct-voice-final-only") === "1"; } catch { return false; } });
   const setSpeakFinal = (v: boolean) => { setSpeakFinalOnly(v); try { localStorage.setItem("ct-voice-final-only", v ? "1" : "0"); } catch { /* */ } };
@@ -919,6 +946,9 @@ function App() {
   const onArtifactResizeUp = () => { if (artifactDrag.current) { artifactDrag.current = null; try { localStorage.setItem("ct-artifact-w", String(Math.round(artifactW))); } catch { /* */ } } };
 
   const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the active stream last speak
+  // Stall-watchdog attempts for the active conversation, so a resync that can't clear the condition
+  // gives up instead of reopening the stream on a loop. `settled` = we've already forced it idle.
+  const resyncRef = useRef<{ id: string; n: number; settled: boolean }>({ id: "", n: 0, settled: false });
   const compactQueue = useRef<string[]>([]); // messages typed DURING compaction, sent once it finishes
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const newChatRef = useRef<(() => void) | null>(null); // lets earlier callbacks reset to a blank chat
@@ -1319,7 +1349,7 @@ function App() {
   // continuously, so a switch is a pointer change — no reconnect, no re-fetch when it's already in memory.
   const loadConv = useCallback(async (id: string, highlight?: string) => {
     activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
-    setEditing(null); // a stale edit target from another conversation must not carry over
+    setEditing(null); setEditError(null); // a stale edit target from another conversation must not carry over
     const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
     const s = manager.ensure(id);
     setActiveStore(s); activeStoreRef.current = s;
@@ -1329,7 +1359,10 @@ function App() {
     stopReadAloud(); setReading(null); // don't keep reading a message from the conversation you just left
     setDrawer(false);
     history.replaceState(null, "", `/app?c=${id}`);
-    if (highlight) highlightRef.current = highlight; else forceBottom.current = true;
+    // Jump to the end only when actually OPENING a different conversation. A same-conversation reload
+    // (stall-watchdog resync, stream reconnect, offline-queue drain) must not force-scroll, or it yanks
+    // you back to the bottom every few seconds while you're scrolled up reading.
+    if (highlight) highlightRef.current = highlight; else if (switching) forceBottom.current = true;
     // Instant paint: if the store isn't already hydrated in memory, fill it from the offline cache.
     if (!s.hydrated && !s.items.length) {
       const cached = await offline.getConv(id).catch(() => null);
@@ -1354,7 +1387,7 @@ function App() {
     } finally { if (activeStoreRef.current === s) setLoadingConv(false); }
   }, [defaultCwd]);
 
-  const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setEditing(null); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
+  const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setEditing(null); setEditError(null); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
   // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
   // to drain into a real conversation. A pending- store never caches or connects.
@@ -1411,23 +1444,45 @@ function App() {
   // #endregion
 
   // Stall watchdog: on a weak link the SSE can die silently mid-turn, so it LOOKS like Claude stopped
-  // working until you send again (which reopens the stream). While "working", if the stream has gone
-  // quiet, resync from the server: reattaches the stream and picks up the ending or the missed events.
+  // working until you send again (which reopens the stream). While a reply is outstanding, if the
+  // stream has gone quiet, resync from the server: reattaches the stream and picks up the ending or
+  // the missed events.
+  //
+  // Deliberately NOT gated on `busy`. Every queue/timeout path in submitText calls setBusy(false), so a
+  // turn the server accepted can sit with busy=false and no reply forever, which is the "two ticks then
+  // silence" stall. Treat "the server has our turn (ticks) and the last thing on screen is still our own
+  // message" as outstanding too, and resync that as well.
   useEffect(() => {
-    if (!busy) return;
     const t = setInterval(() => {
       const id = activeIdRef.current;
       if (!id || id.startsWith("pending-") || !navigator.onLine) return;
+      const s = activeStoreRef.current;
+      if (!s) return;
+      const last = s.items[s.items.length - 1];
+      const awaitingReply = (s.sendState === "delivered" || s.sendState === "read") && last?.kind === "user";
+      if (!s.busy && !awaitingReply) { resyncRef.current = { id, n: 0, settled: false }; return; } // idle, or the reply landed
+      if (resyncRef.current.id !== id) resyncRef.current = { id, n: 0, settled: false }; // per-conversation attempts
       const quietFor = Date.now() - lastEventAt.current;
       const st = statuses[id];
       const serverDone = st ? !st.busy : false; // server knows this conv and says the turn ended
-      // Missed the ending (server done but we still show busy) -> resync fast. Otherwise resync after a
-      // shorter silence so a weak-signal stall recovers on its own. Drop the (possibly silently-dead)
-      // socket first so loadConv's connect() actually reopens it instead of no-opping on a stale one.
-      if ((serverDone && quietFor > 6000) || quietFor > 15000) { lastEventAt.current = Date.now(); activeStoreRef.current?.disconnect(); void loadConv(id); }
+      // The server says this conversation is idle and resyncing has already failed to clear our local
+      // outstanding state, so another resync would do exactly the same thing. Stop, and take the
+      // server's word. Without this cap a resync that can't clear the condition reopens the SSE every
+      // few seconds forever, which is worse than the stall it was meant to fix.
+      if (serverDone && resyncRef.current.n >= 2) {
+        if (!resyncRef.current.settled) { resyncRef.current.settled = true; s.forceIdle(); }
+        return;
+      }
+      // Missed the ending (server done but we still show busy) -> resync fast. A live turn resyncs after
+      // a shorter silence so a weak-signal stall recovers on its own. A turn with no reply at all waits
+      // longer, since nothing has started streaming yet and a slow first token is normal. Drop the
+      // (possibly silently-dead) socket first so loadConv's connect() actually reopens it instead of
+      // no-opping on a stale one.
+      const threshold = serverDone ? 6000 : s.busy ? 15000 : 25000;
+      if (quietFor > threshold) { resyncRef.current.n++; lastEventAt.current = Date.now(); s.disconnect(); void loadConv(id); }
     }, 4000);
     return () => clearInterval(t);
-  }, [busy, statuses, loadConv]);
+  }, [statuses, loadConv]);
 
   // #region search: debounced content search (title filtering is instant + client-side below)
   useEffect(() => {
@@ -1495,7 +1550,15 @@ function App() {
     setInput(""); setAttachments([]);
     if (taRef.current) taRef.current.style.height = "auto";
     // Editing a past turn -> rewind-and-rerun instead of appending. Attachments don't apply to an edit.
-    if (editing) { const ed = editing; setEditing(null); await doEdit(ed, raw); return; }
+    if (editing) {
+      const ed = editing;
+      setEditing(null); setEditError(null);
+      const err = await doEdit(ed, raw);
+      // Failed edits stay edits: restore the composer and the banner so it can be retried or cancelled.
+      // Falling through to submitText() here is what used to append the edit as a duplicate turn.
+      if (err) { setEditing(ed); setEditError(err); setInput(raw); requestAnimationFrame(() => taRef.current?.focus()); }
+      return;
+    }
     await submitText(text);
   };
 
@@ -1512,19 +1575,21 @@ function App() {
   const copyText = (t: string) => { try { void navigator.clipboard?.writeText(t); } catch { /* */ } };
   // Enter edit mode for a past user turn: prefill the composer and remember which turn, so submit
   // rewinds-and-reruns from there (see doEdit) instead of appending a new turn.
-  const startEdit = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
-  const cancelEdit = () => { setEditing(null); setInput(""); if (taRef.current) taRef.current.style.height = "auto"; };
+  const startEdit = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
+  const cancelEdit = () => { setEditing(null); setEditError(null); setInput(""); if (taRef.current) taRef.current.style.height = "auto"; };
   // Rewind-and-rerun: drop the edited turn + everything after (optimistically), then ask the server to
   // roll files back to that turn's checkpoint, fork the transcript, and re-run the edited text. The
-  // forked session's new id + reply stream back in on the existing socket. Degrades to a normal append
-  // when the conversation has no server id yet or we're offline (no session to fork).
-  const doEdit = async (ed: { i: number; orig: string }, text: string) => {
+  // forked session's new id + reply stream back in on the existing socket. Returns null on success or
+  // a human reason on failure. It must NEVER fall back to submitText(): an edit that degrades into a
+  // plain send leaves the original turn in place and posts the edited text as a second, duplicate turn.
+  const doEdit = async (ed: { i: number; orig: string }, text: string): Promise<string | null> => {
     const s = activeStoreRef.current;
     const realId = !!s && !s.id.startsWith("new-") && !s.id.startsWith("pending-");
-    if (!s || !realId || (typeof navigator !== "undefined" && !navigator.onLine)) { await submitText(text); return; }
+    if (!s || !realId) return "This chat hasn't started on the server yet, so there's no turn to rewind. Cancel the edit to send it as a new message.";
+    if (typeof navigator !== "undefined" && !navigator.onLine) return "You're offline. An edit rewinds the conversation on the server, so unlike a normal message it can't be queued. It will work once you're back online.";
     // 0-based ordinal among user turns up to the edited item — matches the server's user-turn count.
     let uindex = -1; for (let k = 0; k <= ed.i && k < s.items.length; k++) if (s.items[k].kind === "user") uindex++;
-    if (uindex < 0) { await submitText(text); return; }
+    if (uindex < 0) return "Couldn't work out which turn to rewind to. Reload the conversation and try again.";
     stickBottom.current = true; setAtBottom(true);
     const snapshot = s.items;
     s.truncateFrom(ed.i);      // drop the edited bubble + everything after
@@ -1532,9 +1597,10 @@ function App() {
     const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
     try {
       const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: ed.orig, model: modelRef.current || undefined }), 30000);
-      if (r?.error) { s.restore(snapshot); s.showItems([...snapshot, { kind: "notice", noticeKind: "info", text: "Couldn't edit that message: " + r.error }]); }
-      else if (s.sendState === "sending") s.setSendState("delivered");
-    } catch { s.restore(snapshot); s.showItems([...snapshot, { kind: "notice", noticeKind: "info", text: "Couldn't reach the server to edit — try again." }]); }
+      if (r?.error) { s.restore(snapshot); return "Couldn't edit that message: " + r.error; }
+      if (s.sendState === "sending") s.setSendState("delivered");
+      return null;
+    } catch { s.restore(snapshot); return "Couldn't reach the server to edit, so nothing was sent and nothing was duplicated. Try again."; }
   };
   const deleteConv = useCallback(async (id: string) => {
     setConvMenu(null);
@@ -1872,8 +1938,8 @@ function App() {
           )}
           {todos && <TodoChecklist todos={todos} />}
           {editing && (
-            <div className="edit-banner">
-              <span>Editing your message — this rewinds the chat and reruns from here, undoing any file changes since.</span>
+            <div className={"edit-banner" + (editError ? " error" : "")} role={editError ? "alert" : undefined}>
+              <span>{editError || "Editing your message — this rewinds the chat and reruns from here, undoing any file changes since."}</span>
               <button onClick={cancelEdit} aria-label="Cancel edit">×</button>
             </div>
           )}

@@ -188,6 +188,19 @@ function findTranscript(ctx: AppCtx, sessionId: string): { path: string; project
 }
 // #endregion
 
+// #region turn logging
+// One line per turn transition, keyed by the client-generated `cid`, so a stalled turn can be traced
+// end to end in the journal: an "accept" with no matching "done" is a turn the server took and never
+// finished, and an accept+done with the user still seeing nothing is a delivery (SSE) problem instead.
+// Without this a stall left no trace anywhere and could only be guessed at from the client.
+function tlog(event: string, fields: Record<string, unknown>): void {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(fields)) if (v !== undefined && v !== null && v !== "") parts.push(`${k}=${v}`);
+  console.log(`[turn] ${event}${parts.length ? " " + parts.join(" ") : ""}`);
+}
+const shortCid = (c: unknown) => (typeof c === "string" && c ? c.slice(0, 8) : "none");
+// #endregion
+
 // #region SSE
 function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Request, fromNow = false): Response {
   let unsub = () => {};
@@ -200,12 +213,13 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
         try { controller.enqueue(enc2.encode(`data: ${JSON.stringify(e)}\n\n`)); } catch {}
       };
       controller.enqueue(enc2.encode(`retry: 3000\n\n`));
+      tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, busy: conv.busy ? 1 : 0 });
       unsub = conv.subscribe(write, fromNow); // replays this run's buffer (unless fromNow), then live
       // Keepalive ping. If the client is gone the enqueue throws (caught); when it does, tear the whole
       // stream down so neither the interval nor the subscriber outlives the connection (was a leak).
       ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch { cleanup(); } }, 20_000);
     },
-    cancel() { cleanup(); },
+    cancel() { tlog("stream-close", { conv: conv.id, busy: conv.busy ? 1 : 0 }); cleanup(); },
   });
   return new Response(stream, {
     headers: { ...ctx.cors(req), "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
@@ -470,7 +484,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const rawText = String(b.text ?? "").trim();
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
     const dup = dedupSeen(b.cid); // a redelivery of an already-processed turn -> ack, do not send again
-    if (dup) return jsonRes({ id: dup.id, deduped: true }, ctx, req);
+    if (dup) { tlog("dedup", { route: "start", conv: dup.id, cid: shortCid(b.cid) }); return jsonRes({ id: dup.id, deduped: true }, ctx, req); }
     const text = b.voice ? decorateVoiceTurn(rawText) : rawText; // voice mode -> append the brief/TTS directive
     const resume: string | undefined = b.resume && /^[A-Za-z0-9-]{6,}$/.test(b.resume) ? b.resume : undefined;
     let cwd: string = ctx.defaultCwd;
@@ -479,8 +493,9 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const model: string | undefined = typeof b.model === "string" && b.model ? b.model : undefined;
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
-    if (existing) { existing.send(text); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
+    if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.send(text); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
     const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk });
+    tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
     void conv.run(text);
     dedupRecord(b.cid, conv.id);
     return jsonRes({ id: conv.id, cwd, model: model || null }, ctx, req);
@@ -493,7 +508,8 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!conv) return jsonRes({ error: "no live conversation for id (start or resume it first)" }, ctx, req, 409);
     const rawText = String(b.text ?? "").trim();
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
-    if (dedupSeen(b.cid)) return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); // redelivery -> ack, don't re-send
+    if (dedupSeen(b.cid)) { tlog("dedup", { route: "send", conv: conv.id, cid: shortCid(b.cid) }); return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); } // redelivery -> ack, don't re-send
+    tlog("accept", { route: "send", conv: conv.id, cid: shortCid(b.cid), chars: rawText.length });
     conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText); // voice mode -> append the brief/TTS directive
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
@@ -522,6 +538,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     let conv = get(id);
     if (!conv) { conv = getOrCreate(id, { cwd: meta.cwd || ctx.defaultCwd, model: b.model || undefined, resume: id, notifier: ctx.notifyAsk }); await conv.bootForRewind(); }
     const text = b.voice ? decorateVoiceTurn(rawText) : rawText;
+    tlog("accept", { route: "edit", conv: conv.id, cid: shortCid(b.cid), chars: text.length, index });
     const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text);
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id, rewind }, ctx, req);
