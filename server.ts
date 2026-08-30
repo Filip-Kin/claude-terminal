@@ -684,15 +684,27 @@ if (cfg.statusPush !== false) {
     intervalMs: STATUS_PUSH_SECONDS * 1000,
     snapshot: () => liveActivity(),
     push: (p) => {
-      // Suppress the whole stream while a device is actively watching one of the working conversations:
-      // the app is open and streaming over SSE, so it needs neither the tray entry nor the cache warm.
-      if (p.convs.some((id) => isWatched(id))) return;
+      // Suppress only what you are already looking at, not the whole push. A conversation on your screen
+      // is streaming over SSE and writing its own cache, so it needs neither a delta pull nor a tray
+      // line; every OTHER conversation still does. This used to drop the entire push when any single
+      // advanced conversation was being watched, which lost the updates for the ones you could not see.
+      const unwatched = p.convs.filter((id) => !isWatched(id));
+      if (p.convs.length > 0 && unwatched.length === 0) {
+        console.log(`[status] suppressed (all ${p.convs.length} watched) working=${p.working} waiting=${p.waiting}`);
+        return; // everything that moved is on your screen
+      }
+      // Same shape as the [turn] log, so `journalctl -u claude-terminal.service | grep '\[status\]'`
+      // shows exactly what went out and to how many devices. sent=0 means no cadence-capable device is
+      // subscribed, which is a very different problem from the push not firing at all.
       void pushAll({
         title: p.title, body: p.body, url: "/app", tag: "ct-status",
         // renotify stays off: a same-tag replacement with renotify:false updates with no sound or
         // vibration, which is the whole reason this cadence is tolerable.
-        renotify: false, silent: true, status: p,
-      }, { cadenceOnly: true });
+        // Only the unwatched conversations get a delta pull; the watched one is caching itself.
+        renotify: false, silent: true, status: { ...p, convs: unwatched },
+      }, { cadenceOnly: true }).then((r) => {
+        console.log(`[status] ${p.idle ? "idle" : "live"} working=${p.working} waiting=${p.waiting} finished=${p.finished} warm=${unwatched.length}/${p.convs.length} sent=${r.sent} pruned=${r.pruned}`);
+      });
     },
   });
 }
