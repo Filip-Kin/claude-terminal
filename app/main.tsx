@@ -9,7 +9,7 @@ import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
-import { isAgentTool, AgentToolCard } from "./agents";
+import { isAgentTool, AgentToolCard, liveAgents, AgentStatusStrip } from "./agents";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { ConnectionsModal } from "./connections";
 
@@ -318,8 +318,14 @@ function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
     }
     case "text":
     case "text_delta":
+      // Still mid-paragraph: grow the block and leave anything queued pinned below it. Splitting a
+      // sentence to slot a message in is the thing we are avoiding.
       if (last && last.kind === "assistant") { const c = items.slice(); c[end - 1] = { ...last, text: last.text + e.text }; return c; }
-      return addItem(items, { kind: "assistant", text: e.text });
+      // A NEW text block is the clean seam: the previous paragraph is finished and any tool cards are
+      // already rendered, so release whatever was queued and let this paragraph land AFTER it. The
+      // message ends up between the tool uses and the next part of the reply, instead of staying
+      // pinned at the very bottom while the response grew above it.
+      return [...unqueue(items), { kind: "assistant", text: e.text }];
     case "thinking_delta":
       if (last && last.kind === "thinking") { const c = items.slice(); c[end - 1] = { ...last, text: last.text + e.text }; return c; }
       return addItem(items, { kind: "thinking", text: e.text, started: Date.now() });
@@ -964,7 +970,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   }
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
-  if (it.kind === "tool") return isAgentTool(it.name, it.input) ? <AgentToolCard it={it} /> : <ToolCard it={it} />;
+  if (it.kind === "tool") return isAgentTool(it.name, it.input) ? <div data-agent-id={it.id}><AgentToolCard it={it} /></div> : <ToolCard it={it} />;
   if (it.kind === "notice") {
     if (it.noticeKind === "skill") {
       return (
@@ -1063,6 +1069,9 @@ function App() {
   const activeId = activeStore?.id ?? null;
   const busy = activeStore?.busy ?? false;
   const todos = useMemo(() => latestTodos(items), [items]); // current task checklist (latest TodoWrite), pinned above the composer
+  // Running subagents, pinned in the same slot. The inline Task card scrolls away on a long turn, so
+  // without this there was no way to see what the agents were doing without hunting up the thread.
+  const runningAgents = useMemo(() => liveAgents(items), [items]);
   const compacting = activeStore?.compacting ?? false;
   const [model, setModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
@@ -1565,6 +1574,21 @@ function App() {
       });
     }
   }, []);
+  // Scroll to a subagent's card and flash it. Mirrors the search-hit jump: a card can sit above the
+  // mounted window, so mount the rest and retry on the next frame rather than silently doing nothing.
+  const jumpToAgent = useCallback((id: string) => {
+    const find = () => scrollRef.current?.querySelector(`[data-agent-id="${id}"]`) as HTMLElement | null;
+    const go = (el: HTMLElement) => {
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+      el.classList.add("hl-flash");
+      setTimeout(() => el.classList.remove("hl-flash"), 2200);
+    };
+    const el = find();
+    if (el) { go(el); return; }
+    setVisible(items.length);                       // card is above the mounted tail -> mount it all
+    requestAnimationFrame(() => { const e2 = find(); if (e2) go(e2); });
+  }, [items.length]);
+
   const jumpToLatest = useCallback(() => {
     const el = scrollRef.current; if (!el) return;
     stickBottom.current = true; setAtBottom(true); el.scrollTop = el.scrollHeight;
@@ -2425,6 +2449,7 @@ function App() {
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M6 13l6 6 6-6" /></svg>
             </button>
           )}
+          {runningAgents.length > 0 && <AgentStatusStrip agents={runningAgents} onJump={jumpToAgent} />}
           {todos && <TodoChecklist todos={todos} />}
           {editing && (
             <div className={"edit-banner" + (editError ? " error" : "")} role={editError ? "alert" : undefined}>

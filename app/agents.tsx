@@ -310,3 +310,107 @@ function injectAgentCss() {
   document.head.appendChild(el);
 }
 // #endregion
+
+// #region live subagent strip (pinned above the composer, beside the todo checklist)
+// The inline AgentActivityCard scrolls away with the transcript, so on a long turn there was no way
+// to see what the subagents were doing without hunting back up the thread. This is the always-visible
+// version: one row per RUNNING agent, in the same pinned slot as the task checklist.
+
+export interface LiveAgent {
+  id: string;
+  label: string;                 // description, or the subagent type, or a workflow name
+  sub?: string;                  // secondary line (subagent type / phase summary)
+  progress?: AgentProgress;
+}
+
+interface ToolLike { kind: string; id?: string; name?: string; input?: unknown; result?: unknown; progress?: AgentProgress }
+
+// Running = an agent tool_use whose paired tool_result has not arrived. Same test the inline card uses.
+export function liveAgents(items: readonly unknown[]): LiveAgent[] {
+  const out: LiveAgent[] = [];
+  for (const raw of items) {
+    const it = raw as ToolLike;
+    if (!it || it.kind !== "tool" || !it.name || it.result !== undefined) continue;
+    const f = parseAgentTool(it.name, it.input);
+    if (!f) continue;
+    if (f.kind === "task") {
+      out.push({ id: String(it.id), label: f.description || f.subagentType || "Subagent", sub: f.description ? f.subagentType : undefined, progress: it.progress });
+    } else {
+      const done = f.phases.filter((p) => p.status === "done").length;
+      out.push({
+        id: String(it.id),
+        label: f.name || f.description || "Workflow",
+        sub: f.phases.length ? `${done}/${f.phases.length} phases` : undefined,
+        progress: it.progress,
+      });
+    }
+  }
+  return out;
+}
+
+const fmtTok = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
+function agentMeta(p?: AgentProgress): string {
+  if (!p) return "";
+  const bits: string[] = [];
+  if (p.durationMs) bits.push(`${Math.round(p.durationMs / 1000)}s`);
+  if (p.tokens) bits.push(`${fmtTok(p.tokens)} tok`);
+  if (p.toolUses) bits.push(`${p.toolUses} tool${p.toolUses === 1 ? "" : "s"}`);
+  if (p.lastTool) bits.push(p.lastTool);
+  return bits.join(" · ");
+}
+
+export function AgentStatusStrip({ agents, onJump }: { agents: LiveAgent[]; onJump?: (id: string) => void }): JSX.Element | null {
+  injectAgentStripCss();
+  if (!agents.length) return null;
+  return (
+    <div className="as-strip" role="status" aria-live="polite">
+      <div className="as-head">
+        <span className="as-spin" aria-hidden="true" />
+        {agents.length === 1 ? "1 agent running" : `${agents.length} agents running`}
+      </div>
+      {agents.map((a) => {
+        const meta = agentMeta(a.progress);
+        // Subagents have no conversation of their own — the SDK folds their work into the parent
+        // turn's Task card rather than a resumable session (a real transcript has zero sidechain
+        // entries with a distinct id). So "open the subagent" means jump to that card, which is
+        // where its task, live status and output actually live.
+        const body = (
+          <>
+            <span className="as-dot" aria-hidden="true" />
+            <span className="as-label" title={a.label}>{a.label}</span>
+            {a.sub && <span className="as-sub">{a.sub}</span>}
+            {meta && <span className="as-meta">{meta}</span>}
+          </>
+        );
+        return onJump
+          ? <button className="as-row as-tap" key={a.id} onClick={() => onJump(a.id)} title={`Show this agent in the conversation — ${a.label}`}>{body}</button>
+          : <div className="as-row" key={a.id}>{body}</div>;
+      })}
+    </div>
+  );
+}
+
+let stripCssDone = false;
+function injectAgentStripCss() {
+  if (stripCssDone || typeof document === "undefined") return;
+  stripCssDone = true;
+  const css = `
+  .as-strip{max-width:760px;margin:0 auto 8px;padding:9px 12px;background:var(--bg-2,#211c18);border:1px solid var(--line,#3a322c);border-radius:11px;font-size:12.5px}
+  .as-head{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--text-2,#b8afa5);margin-bottom:6px}
+  .as-spin{width:11px;height:11px;border-radius:50%;border:2px solid var(--line,#3a322c);border-top-color:var(--accent,#d97757);animation:as-spin .9s linear infinite;flex:0 0 auto}
+  @keyframes as-spin{to{transform:rotate(360deg)}}
+  .as-row{display:flex;align-items:center;gap:8px;padding:3px 0;min-width:0;width:100%}
+  .as-tap{background:transparent;border:0;color:inherit;font:inherit;text-align:left;cursor:pointer;padding:5px 6px;margin:0 -6px;border-radius:7px;min-height:32px}
+  .as-tap:hover,.as-tap:focus-visible{background:var(--bg-3,#2a2420);outline:none}
+  .as-dot{width:6px;height:6px;border-radius:50%;background:var(--accent,#d97757);flex:0 0 auto}
+  .as-label{color:var(--text,#ece7e1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+  .as-sub{color:var(--text-3,#8a8078);flex:0 0 auto}
+  .as-meta{color:var(--text-3,#8a8078);font-variant-numeric:tabular-nums;flex:0 0 auto}
+  @media (max-width:620px){.as-sub{display:none}}
+  @media (prefers-reduced-motion: reduce){.as-spin{animation-duration:2.4s}}
+  `;
+  const el = document.createElement("style");
+  el.textContent = css;
+  document.head.appendChild(el);
+}
+// #endregion
