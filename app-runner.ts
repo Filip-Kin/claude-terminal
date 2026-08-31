@@ -21,6 +21,21 @@ function tlog(event: string, fields: Record<string, unknown>): void {
   console.log(`[turn] ${event}${parts.length ? " " + parts.join(" ") : ""}`);
 }
 
+// Compaction metadata, from either shape. The live SDK message carries `compact_metadata` with
+// snake_case fields; the .jsonl transcript writes the SAME event as `compactMetadata` with
+// camelCase fields. Reading only one shape is why a replayed/reloaded compaction lost its numbers
+// and fell back to a bare "conversation compacted" line instead of the "freed Nk tokens" card.
+function compactMeta(o: any): { trigger: "manual" | "auto"; preTokens?: number; postTokens?: number; durationMs?: number } {
+  const md = o?.compact_metadata || o?.compactMetadata || {};
+  const num = (...vals: unknown[]): number | undefined => { for (const v of vals) if (typeof v === "number" && isFinite(v)) return v; return undefined; };
+  return {
+    trigger: md.trigger === "manual" ? "manual" : "auto",
+    preTokens: num(md.pre_tokens, md.preTokens),
+    postTokens: num(md.post_tokens, md.postTokens),
+    durationMs: num(md.duration_ms, md.durationMs),
+  };
+}
+
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string }
@@ -391,6 +406,17 @@ export class Conversation {
     return () => this.subs.delete(fn);
   }
 
+  // Resume after a dropped SSE socket: replay everything newer than the last event the client
+  // actually received (its Last-Event-ID), then stay subscribed. Without this, a reconnect asks for
+  // "future only" and every event emitted during the gap is lost for good — which is how a one-shot
+  // event like the compaction card disappears while the streamed text around it looks fine. Safe to
+  // over-deliver: the client drops anything whose _seq it has already seen.
+  subscribeSince(fn: Sub, sinceSeq: number): () => void {
+    this.subs.add(fn);
+    for (const e of this.log) { const s = (e as any)._seq; if (typeof s === "number" && s > sinceSeq) fn(e); }
+    return () => this.subs.delete(fn);
+  }
+
   // Internal lifecycle listener (session-id registration, close bookkeeping). Unlike subscribe(),
   // these do NOT count toward hasSubscribers() — otherwise a permanent internal listener would pin
   // every conversation "watched" forever and the idle reaper would never collect its SDK subprocess.
@@ -654,9 +680,12 @@ export class Conversation {
       case "system":
         if (anyM.subtype === "init") { this.inited = true; this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd }); }
         else if (anyM.subtype === "compact_boundary") {
-          const md = anyM.compact_metadata || {};
+          const md = compactMeta(anyM);
           this.emit({ t: "compacting", active: false });
-          this.emit({ t: "compact", trigger: md.trigger || "auto", preTokens: md.pre_tokens, postTokens: md.post_tokens, durationMs: md.duration_ms });
+          this.emit({ t: "compact", trigger: md.trigger, preTokens: md.preTokens, postTokens: md.postTokens, durationMs: md.durationMs });
+          // The one line that says a compaction actually reached the clients: without it a missing
+          // "Compacted" card can't be told apart from a compaction that never emitted a boundary.
+          tlog("compact", { conv: this.id, trigger: md.trigger, pre: md.preTokens, post: md.postTokens, ms: md.durationMs, listeners: this.subs.size });
         }
         // This SDK build reports compaction progress via a status message (compacting -> null with a
         // compact_result), THEN the compact_boundary above. Drive the banner from it so auto-compaction
@@ -894,8 +923,8 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       }
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       turnOut = 0; turnThink = 0; turnStartTs = 0; // compaction is a fresh turn boundary
-      const md = o.compact_metadata || {};
-      out.push({ t: "compact", trigger: md.trigger || "auto", preTokens: md.pre_tokens, postTokens: md.post_tokens, durationMs: md.duration_ms });
+      const md = compactMeta(o); // transcript spells it compactMetadata/camelCase, the live SDK compact_metadata/snake_case
+      out.push({ t: "compact", trigger: md.trigger, preTokens: md.preTokens, postTokens: md.postTokens, durationMs: md.durationMs });
     }
   }
   return out;

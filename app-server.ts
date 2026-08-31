@@ -206,15 +206,24 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
   let unsub = () => {};
   let ping: ReturnType<typeof setInterval> | null = null;
   const cleanup = () => { if (ping) { clearInterval(ping); ping = null; } unsub(); unsub = () => {}; };
+  // EventSource replays its own last id on an automatic reconnect. The URL can't change between
+  // retries, so a `tail=1` stream used to come back asking for future events only and silently drop
+  // everything emitted while the socket was down. With the id echoed on every event we can hand back
+  // exactly the gap instead. The client already ignores any _seq it has seen, so this can't duplicate.
+  const lastIdRaw = parseInt(req.headers.get("last-event-id") || "", 10);
+  const resumeFrom = Number.isInteger(lastIdRaw) && lastIdRaw >= 0 ? lastIdRaw : null;
   const stream = new ReadableStream({
     start(controller) {
       const enc2 = new TextEncoder();
       const write = (e: AppEvent) => {
-        try { controller.enqueue(enc2.encode(`data: ${JSON.stringify(e)}\n\n`)); } catch {}
+        const seq = (e as { _seq?: number })._seq;
+        const id = typeof seq === "number" ? `id: ${seq}\n` : "";
+        try { controller.enqueue(enc2.encode(`${id}data: ${JSON.stringify(e)}\n\n`)); } catch {}
       };
       controller.enqueue(enc2.encode(`retry: 3000\n\n`));
-      tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, busy: conv.busy ? 1 : 0 });
-      unsub = conv.subscribe(write, fromNow); // replays this run's buffer (unless fromNow), then live
+      tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, busy: conv.busy ? 1 : 0 });
+      // replays the gap (resume), this run's buffer (fromNow=false), or nothing — then live
+      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom) : conv.subscribe(write, fromNow);
       // Keepalive ping. If the client is gone the enqueue throws (caught); when it does, tear the whole
       // stream down so neither the interval nor the subscriber outlives the connection (was a leak).
       ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch { cleanup(); } }, 20_000);
