@@ -9,6 +9,7 @@ import { join } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
+import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
 import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
@@ -329,6 +330,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
 
   // --- Memory management (~/.claude memory files) — all paths guarded to ~/.claude ---
   const msCtx: MemSkillCtx = { dataDir: ctx.dataDir, claudeDir: ctx.claudeDir };
+  const spawnCtx: SpawnedCtx = { dataDir: ctx.dataDir, claudeDir: ctx.claudeDir };
   if (req.method === "GET" && path === "/app/api/memory") {
     return jsonRes({ projects: listMemory(msCtx) }, ctx, req);
   }
@@ -368,6 +370,31 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       const r = await setSkillEnabled(msCtx, String(b.name || ""), !!b.enabled);
       if (b.reloadId) { const live = get(String(b.reloadId)); if (live) await live.reloadSkills(); }
       return jsonRes({ ok: true, ...r }, ctx, req);
+    } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
+  }
+
+  // --- Spawned work (subagents / workflows / spawned tabs started BY a chat) ---
+  // One list per conversation, and a reader that replays any single item into the same
+  // normalized AppEvent array /app/api/conversation returns, so the UI reuses its renderer.
+  // Every path is assembled from validated ids and guarded to ~/.claude/projects inside spawned.ts.
+  if (req.method === "GET" && path === "/app/api/spawned") {
+    const id = new URL(req.url).searchParams.get("id") || "";
+    try {
+      const r = await listSpawned(spawnCtx, id);
+      if ("error" in r) return jsonRes(r, ctx, req, r.error === "not found" ? 404 : 400);
+      return jsonRes(r, ctx, req);
+    } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
+  }
+  if (req.method === "GET" && path === "/app/api/spawned/transcript") {
+    const u = new URL(req.url);
+    const id = u.searchParams.get("id") || "";
+    const key = u.searchParams.get("key") || "";
+    const sinceRaw = u.searchParams.get("since");
+    const since = sinceRaw == null ? null : parseInt(sinceRaw, 10);
+    try {
+      const r = await getSpawnedTranscript(spawnCtx, id, key, Number.isInteger(since as number) ? (since as number) : null);
+      if ("error" in r) return jsonRes({ error: r.error }, ctx, req, r.status || 400);
+      return jsonRes(r, ctx, req);
     } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
   }
 

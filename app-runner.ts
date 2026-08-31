@@ -10,6 +10,7 @@
 import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import { mkdirSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
