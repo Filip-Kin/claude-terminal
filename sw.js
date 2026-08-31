@@ -49,6 +49,7 @@ async function precacheApp() {
 self.addEventListener("message", (event) => {
   const d = event.data || {};
   if (d.type === "ct-precache") event.waitUntil(precacheApp().catch(() => {}));
+  if (d.type === "ct-read") event.waitUntil(clearReadNotifications(d.ids).catch(() => {}));
 });
 
 // Serve the chat-app shell + hashed assets from cache so /app loads offline. We ONLY act on
@@ -207,6 +208,24 @@ async function applyBadge(status) {
 }
 // #endregion
 
+// The page tells us which conversations the user has now read. A status notification names the
+// conversations that advanced, so once every one of them has been read it has nothing left to
+// announce and should clear itself rather than sit there until it is tapped.
+async function clearReadNotifications(readIds) {
+  const read = new Set(Array.isArray(readIds) ? readIds : []);
+  if (!read.size) return;
+  let notes;
+  try { notes = await self.registration.getNotifications(); } catch { return; }
+  for (const n of notes || []) {
+    const d = n.data || {};
+    const refs = Array.isArray(d.convs) && d.convs.length ? d.convs : (d.sessionId ? [d.sessionId] : []);
+    // Not conversation-scoped (a generic /notify from a script, say) — never auto-dismiss those,
+    // the user is the only one who knows whether they have dealt with it.
+    if (!refs.length) continue;
+    if (refs.every((id) => read.has(id))) { try { n.close(); } catch { /* already gone */ } }
+  }
+}
+
 // A push arrived from the server (VAPID). Payload is JSON:
 // { title, body?, url?, tag?, icon?, requireInteraction?, sessionId? }
 self.addEventListener("push", (event) => {
@@ -227,7 +246,13 @@ self.addEventListener("push", (event) => {
     renotify: !!data.renotify,
     silent: !!data.silent,
     requireInteraction: !!data.requireInteraction,
-    data: { url: data.url || "/", sessionId: data.sessionId || null },
+    // `convs` = the conversations this notification is announcing. Kept so it can be cleared
+    // automatically once they have all been read (see clearReadNotifications).
+    data: {
+      url: data.url || "/", sessionId: data.sessionId || null,
+      convs: Array.isArray(data.status && data.status.convs) ? data.status.convs
+           : Array.isArray(data.convs) ? data.convs : null,
+    },
   };
   if (data.icon) opts.icon = data.icon; // only when explicitly provided (avoids the duplicate app icon)
   // Show first, then do the background work. showNotification is what satisfies userVisibleOnly, so it

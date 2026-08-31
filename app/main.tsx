@@ -134,6 +134,15 @@ const cadenceCapable = (): boolean => /Android/i.test(navigator.userAgent);
 // navigator.serviceWorker.ready NEVER settles if no worker ever activates (a failed registration, or
 // the script 404ing). Awaiting it bare would leave the settings toggle stuck mid-flight with no
 // feedback, so it is bounded like every other await in this file.
+// Hand the SW the conversations that are now read. Fire-and-forget: bounded via swReady (a bare
+// navigator.serviceWorker.ready never settles when no worker activates) and harmless if there is none.
+async function notifySwRead(ids: string[]): Promise<void> {
+  try {
+    if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
+    const reg = await swReady(2000);
+    (reg.active || navigator.serviceWorker.controller)?.postMessage({ type: "ct-read", ids });
+  } catch { /* no SW here, or it never activated */ }
+}
 function swReady(ms = 5000): Promise<ServiceWorkerRegistration> {
   return Promise.race([
     navigator.serviceWorker.ready,
@@ -1269,6 +1278,12 @@ function App() {
     const conv = (list ?? convsRef.current).find((c) => c.sessionId === id);
     const mark = conv ? Math.max(conv.mtime, lastReadRef.current[id] || 0) : (lastReadRef.current[id] || Date.now());
     lastReadRef.current[id] = mark; saveLastRead(lastReadRef.current); setReadTick((t) => t + 1);
+    // Tell the service worker what is now read so it can dismiss any tray notification whose
+    // conversations have all been read. A "conversation finished" notification otherwise sat there
+    // until tapped, even though you had already opened and read it.
+    const src = list ?? convsRef.current;
+    const readIds = src.filter((c) => (lastReadRef.current[c.sessionId] || 0) >= c.mtime).map((c) => c.sessionId);
+    if (readIds.length) void notifySwRead(readIds);
   }, []);
   const toggleFav = useCallback((id: string) => {
     setFavorites((s) => {
