@@ -807,7 +807,13 @@ const server = Bun.serve({
     if (req.method === "GET" && path === "/sw.js") {
       // Registered at scope "/", so it must advertise the wider scope. nginx passes
       // this response header through unchanged.
-      return new Response(Bun.file(swPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache" } });
+      // Stamp the current build into the cache name so a deploy always rotates the app-shell cache.
+      // Read fresh each request (like /app/api/version) so a rebuild alone ships it, with no restart.
+      let sw = await Bun.file(swPath).text();
+      let build = "dev";
+      try { build = (await Bun.file(join(PUBLIC_DIR, "app", "version.txt")).text()).trim() || "dev"; } catch { /* no built app */ }
+      sw = sw.replaceAll("%BUILD%", build);
+      return new Response(sw, { headers: { "Content-Type": "application/javascript; charset=utf-8", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache" } });
     }
     if (req.method === "GET" && path.startsWith("/pwa/")) {
       const rel = path.slice("/pwa/".length);

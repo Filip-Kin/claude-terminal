@@ -14,7 +14,12 @@ const BADGE = "/_ct/pwa/badge-96.png?v=6";
 // stale-while-revalidate kept serving that old HTML for "/" — so Chrome evaluated
 // installability against a page with no manifest and would only offer a shortcut. The
 // activate handler drops any cache whose name is not this one, so a rename refetches the shell.
-const APP_CACHE = "ct-app-shell-v2"; // caches the /app shell + its content-hashed assets
+// %BUILD% is substituted per request by server.ts from public/app/version.txt, so the shell
+// cache rotates on every deploy. It used to be a hand-bumped "v1"/"v2", which meant a change to
+// index.html's <head> alone (adding the manifest link) left the old shell cached forever: the
+// asset hashes had not changed, so version.txt was identical, no reload toast fired, and the
+// only cure was clearing site data by hand — not something a guest can be asked to do.
+const APP_CACHE = "ct-app-shell-%BUILD%"; // caches the /app shell + its content-hashed assets
 
 self.addEventListener("install", () => {
   self.skipWaiting();
