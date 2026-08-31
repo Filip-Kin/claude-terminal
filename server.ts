@@ -629,6 +629,8 @@ const appCtx: AppCtx = {
   moreModels: APP_MORE_MODELS,
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
+  mcpFile: join(STATE_DIR, "claude-app-mcp.json"),
+  claudeDir: join(HOME, ".claude"),
   // Rolling 5-hour output tokens for the owner + a link to the usage dashboard, for the app's
   // usage chip (mirrors the terminal-side usage view). Null when there's no usage DB.
   ownerUsage: () => {
