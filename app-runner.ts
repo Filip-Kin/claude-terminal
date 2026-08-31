@@ -877,6 +877,11 @@ function cliSessionStatuses(): Record<string, LiveStatus> {
       try { o = JSON.parse(readFileSync(join(SESSIONS_DIR, f), "utf8")); } catch { continue }
       const sid = typeof o?.sessionId === "string" ? o.sessionId : null;
       if (!sid || !o.pid) continue;
+      // ONLY genuine terminal sessions. This registry also holds an entry per SDK conversation
+      // (entrypoint "sdk-ts") — including this app's own — so without the filter every conversation
+      // was flagged terminal and every status dot would have turned violet. A real terminal tab is
+      // entrypoint "cli" and carries a tmux pane reference.
+      if (o.entrypoint !== "cli") continue;
       // A crashed session leaves its last state on disk forever, so only trust a live pid.
       if (!existsSync(`/proc/${o.pid}`)) continue;
       const busy = o.status === "busy" || o.status === "thinking";
