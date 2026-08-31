@@ -10,7 +10,11 @@
 const BADGE = "/_ct/pwa/badge-96.png?v=6";
 
 // #region chat-app offline support (scoped to /app only; the terminal + ttyd WS are untouched)
-const APP_CACHE = "ct-app-shell-v1"; // caches the /app shell + its content-hashed assets
+// v2: the v1 shell was cached BEFORE the manifest link was added to index.html, and
+// stale-while-revalidate kept serving that old HTML for "/" — so Chrome evaluated
+// installability against a page with no manifest and would only offer a shortcut. The
+// activate handler drops any cache whose name is not this one, so a rename refetches the shell.
+const APP_CACHE = "ct-app-shell-v2"; // caches the /app shell + its content-hashed assets
 
 self.addEventListener("install", () => {
   self.skipWaiting();
