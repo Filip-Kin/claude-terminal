@@ -228,7 +228,7 @@ type SearchHit = { sessionId: string; title: string; snippet: string; count: num
 // for dedup, regardless of whether the server build already strips them.
 function sanitizeUserText(t: string): string {
   return (t || "")
-    .replace(/\s*<voice-mode>[\s\S]*?<\/voice-mode>\s*/g, "")
+    .replace(/\s*<(voice-mode|turn-context)>[\s\S]*?<\/\1>\s*/g, "")
     .replace(/\s*\[Image[^\]]*\]\s*/g, " ")
     .trim();
 }

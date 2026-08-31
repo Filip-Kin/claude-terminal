@@ -315,7 +315,9 @@ const APP_UI_SYSTEM_APPEND = [
   "  of those fenced blocks rather than only describing it.",
   "Keep normal prose in plain markdown; only reach for an artifact when a live preview genuinely helps.",
 ].join("\n");
-const VOICE_STRIP = /\s*<voice-mode>[\s\S]*?<\/voice-mode>\s*$/;
+// Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
+// or replayed, so the user only ever sees what they actually typed.
+const HIDDEN_STRIP = /\s*<(voice-mode|turn-context)>[\s\S]*?<\/\1>\s*/g;
 // #endregion
 
 // When Claude loads a skill, its whole body is injected as a user message that starts with
@@ -328,6 +330,19 @@ function skillLoadName(txt: string): string | null {
   if (!m) return null;
   const p = m[1].trim().replace(/[/\\]+$/, "");
   return p.split(/[/\\]/).pop() || p;
+}
+
+// "3 minutes", "2 hours 10 minutes", "4 days". Coarse on purpose: the point is to stop the model
+// inventing a figure, not to give it a stopwatch.
+function humanGap(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s} second${s === 1 ? "" : "s"}`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m} minute${m === 1 ? "" : "s"}`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  if (h < 36) return rm ? `${h} hour${h === 1 ? "" : "s"} ${rm} minute${rm === 1 ? "" : "s"}` : `${h} hour${h === 1 ? "" : "s"}`;
+  const d = Math.round(h / 24);
+  return `${d} day${d === 1 ? "" : "s"}`;
 }
 
 function textOfContent(content: unknown): string {
@@ -373,6 +388,7 @@ export class Conversation {
   private q?: Query;
   private queue: SDKUserMessage[] = [];
   private waiter?: (v: SDKUserMessage | null) => void;
+  private lastTurnAt = 0; // wall clock of the previous turn, for the turn-context stamp below
   // Turns submitted but not yet finished, INCLUDING ones still queued behind the running turn. A
   // queued turn is not in the transcript yet (the SDK writes it when it starts it), so reporting
   // idle between the running turn's result and the queued one's first token tells every client the
@@ -468,6 +484,21 @@ export class Conversation {
   // Live status for the conversation-list indicators: generating vs waiting on a tappable question.
   statusInfo(): { busy: boolean; waiting: boolean } { return { busy: this.busy && !this.closed, waiting: this.pendingAsks.size > 0 }; }
 
+  // The model is given today's DATE in its system prompt but no clock and no history of when turns
+  // happened, so it fills the gap by inventing one: "in the hour since we started talking" after
+  // fifteen minutes. Stamp the real local time and the real gap onto every turn. Hidden from the UI
+  // by HIDDEN_STRIP, the same way the voice directive is.
+  private turnContext(): string {
+    const now = Date.now();
+    const stamp = new Date(now).toLocaleString(undefined, {
+      weekday: "short", day: "numeric", month: "short", year: "numeric",
+      hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+    });
+    const gap = this.lastTurnAt ? `My previous message was ${humanGap(now - this.lastTurnAt)} ago.` : "This is the first message of the conversation.";
+    this.lastTurnAt = now;
+    return `<turn-context>Local time is now ${stamp}. ${gap} Use these figures for anything time-related; do not estimate elapsed time any other way.</turn-context>`;
+  }
+
   send(text: string) {
     if (this.closed) return;
     this.lastActivity = Date.now();
@@ -480,7 +511,7 @@ export class Conversation {
     this.pendingTurns++;
     this.emit({ t: "user", text });
     this.emit({ t: "busy", busy: true });
-    const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
+    const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); }
     else this.queue.push(msg);
   }
@@ -641,7 +672,7 @@ export class Conversation {
       this.pendingTurns++;
       this.emit({ t: "user", text: first });
       this.emit({ t: "busy", busy: true });
-      yield { type: "user", message: { role: "user", content: first }, parent_tool_use_id: null };
+      yield { type: "user", message: { role: "user", content: first + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     }
     while (!this.closed) {
       const next = this.queue.shift() ?? (await new Promise<SDKUserMessage | null>((res) => { this.waiter = res; }));
@@ -989,7 +1020,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
           continue;
         }
       }
-      const txt = textOfContent(c).replace(VOICE_STRIP, ""); // hide the appended voice-mode directive
+      const txt = textOfContent(c).replace(HIDDEN_STRIP, ""); // hide the appended voice-mode directive
       const sk = skillLoadName(txt);
       if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
       else if (txt.trim() && !txt.startsWith("<")) {
@@ -1053,7 +1084,7 @@ export async function resolveEditPoints(path: string, userIndex: number): Promis
       const c = o.message.content;
       const hasToolResult = Array.isArray(c) && c.some((b: any) => b?.type === "tool_result");
       if (!hasToolResult) {
-        const t = textOfContent(c).replace(VOICE_STRIP, "");
+        const t = textOfContent(c).replace(HIDDEN_STRIP, "");
         if (t.trim() && !t.startsWith("<") && !skillLoadName(t)) { isPrompt = true; ptext = t; }
       }
     }
