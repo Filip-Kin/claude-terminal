@@ -494,7 +494,11 @@ export class Conversation {
       weekday: "short", day: "numeric", month: "short", year: "numeric",
       hour: "2-digit", minute: "2-digit", timeZoneName: "short",
     });
-    const gap = this.lastTurnAt ? `My previous message was ${humanGap(now - this.lastTurnAt)} ago.` : "This is the first message of the conversation.";
+    // After a service restart a resumed conversation has no in-memory history, so "first message"
+    // would be a plain lie about a chat with hours of history above it. Say unknown instead.
+    const gap = this.lastTurnAt ? `My previous message was ${humanGap(now - this.lastTurnAt)} ago.`
+      : this.resume ? "This conversation was resumed, so how long ago the previous message was is unknown. Do not guess it."
+      : "This is the first message of the conversation.";
     this.lastTurnAt = now;
     return `<turn-context>Local time is now ${stamp}. ${gap} Use these figures for anything time-related; do not estimate elapsed time any other way.</turn-context>`;
   }

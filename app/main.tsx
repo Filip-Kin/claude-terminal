@@ -328,7 +328,7 @@ function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
       return [...unqueue(items), { kind: "assistant", text: e.text }];
     case "thinking_delta":
       if (last && last.kind === "thinking") { const c = items.slice(); c[end - 1] = { ...last, text: last.text + e.text }; return c; }
-      return addItem(items, { kind: "thinking", text: e.text, started: Date.now() });
+      return [...unqueue(items), { kind: "thinking", text: e.text, started: Date.now() }];
     case "thinking_progress": {
       // estimated_tokens resets across thinking sub-segments (goes up, then drops back on a new
       // segment). Track the running peak per segment and carry a base of prior peaks so the
@@ -343,10 +343,14 @@ function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
         c[end - 1] = { ...last, _base: nextBase, _peak: nextPeak, tokens: nextBase + nextPeak };
         return c;
       }
-      return addItem(items, { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now() });
+      return [...unqueue(items), { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now() }];
     }
-    case "thinking": return addItem(items, { kind: "thinking", text: e.text });
-    case "tool_use": return addItem(items, { kind: "tool", id: e.id, name: e.name, input: e.input });
+    case "thinking": return [...unqueue(items), { kind: "thinking", text: e.text }];
+    // A new tool call is the same clean seam as a new paragraph: whatever the agent was part way
+    // through is finished, and the SDK hands a mid-turn message to the agent at a tool boundary, so
+    // by the time the NEXT call is issued it has already read it. Release the queue first, or the
+    // card for the work the message asked for renders ABOVE the message that asked for it.
+    case "tool_use": return [...unqueue(items), { kind: "tool", id: e.id, name: e.name, input: e.input }];
     case "agent_progress": {
       // Attach live subagent progress to its Task tool card (matched by tool_use id).
       for (let i = items.length - 1; i >= 0; i--) {
