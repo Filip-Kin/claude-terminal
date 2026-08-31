@@ -1503,7 +1503,20 @@ function App() {
   // Record that the app is the surface to reopen on next PWA launch (see the overlay's launch
   // routing). Deliberately "/app" with no ?c= so a relaunch lands on the default view, not a
   // specific conversation.
-  useEffect(() => { try { localStorage.setItem("ct-last-surface", "/app"); } catch { /* */ } }, []);
+  // Root serves the app as of 2026-08-31, so the app makes the reopen-last-surface call the terminal
+  // overlay used to make. Only a genuine cold PWA launch honours it: an in-app hop carries a referrer
+  // and a manual reload reports type "reload", so neither bounces you away mid-use.
+  useEffect(() => {
+    try {
+      const sp = new URLSearchParams(location.search);
+      const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || (navigator as any).standalone === true;
+      const navType = (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.type || "";
+      const cold = sp.get("home") === "1" || (standalone && !document.referrer && navType !== "reload");
+      if (cold && localStorage.getItem("ct-last-surface") === "/terminal") { location.replace("/terminal"); return; }
+      if (sp.get("home") === "1") history.replaceState(null, "", location.pathname);
+      localStorage.setItem("ct-last-surface", "/app");
+    } catch { /* */ }
+  }, []);
 
   // Force the freshest assets. We do NOT unregister the service worker (it's the shared
   // push worker for the whole PWA); clearing Cache Storage + reloading the no-store shell
@@ -2389,7 +2402,7 @@ function App() {
           )}
         </div>
         <div className="sb-foot">
-          <a className="term-link" href="/">
+          <a className="term-link" href="/terminal">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.6" /><path d="M8 10l2.5 2L8 14M12.5 14H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
             Terminal
           </a>
