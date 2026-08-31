@@ -351,6 +351,7 @@ export class Conversation {
   private waiter?: (v: SDKUserMessage | null) => void;
   private closed = false;
   private subs = new Set<Sub>();
+  private hooks = new Set<Sub>(); // internal lifecycle listeners (init/closed bookkeeping); do NOT count as client subscribers, or the idle reaper never fires
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
   private pendingAsks = new Map<string, (answer: string) => void>(); // ask_user awaiting a tap
   private pendingAskMeta = new Map<string, PendingAsk>(); // question/options for each open ask, so a reconnect can re-render it
@@ -390,15 +391,28 @@ export class Conversation {
     return () => this.subs.delete(fn);
   }
 
+  // Internal lifecycle listener (session-id registration, close bookkeeping). Unlike subscribe(),
+  // these do NOT count toward hasSubscribers() — otherwise a permanent internal listener would pin
+  // every conversation "watched" forever and the idle reaper would never collect its SDK subprocess.
+  onEvent(fn: Sub): () => void {
+    this.hooks.add(fn);
+    return () => this.hooks.delete(fn);
+  }
+
   // Open asks awaiting an answer — lets a reconnecting client re-render them with the correct
   // (server-assigned) askId so its answer actually unblocks the tool.
   listPendingAsks(): PendingAsk[] { return [...this.pendingAskMeta.values()]; }
 
   private emit(e: AppEvent) {
     (e as any)._seq = this.seqCounter++;
+    this.lastActivity = Date.now(); // any output counts as activity: a long turn with no attached
+    // client must not look idle to the sweeper (it only used to be bumped on send()).
     this.log.push(e);
     if (this.log.length > 5000) { const drop = this.log.length - 5000; this.log.splice(0, drop); this.runStart = Math.max(0, this.runStart - drop); }
     for (const s of this.subs) {
+      try { s(e); } catch {}
+    }
+    for (const s of this.hooks) {
       try { s(e); } catch {}
     }
   }
@@ -762,7 +776,7 @@ export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
   const c = new Conversation(id, opts);
   conversations.set(id, c);
   // once the SDK assigns a real session id, register the conversation under it too
-  const unsub = c.subscribe((e) => {
+  const unsub = c.onEvent((e) => {
     if (e.t === "init" && e.sessionId && !conversations.has(e.sessionId)) conversations.set(e.sessionId, c);
     if (e.t === "closed") setTimeout(() => reapIfIdle(c), 60_000);
   });
@@ -799,6 +813,11 @@ function reapIfIdle(c: Conversation) {
 setInterval(() => {
   const now = Date.now();
   for (const c of new Set(conversations.values())) {
+    // Never collect a conversation that is still working, or one parked on an unanswered question:
+    // close() kills the SDK query and answers pending asks with "(the user did not answer)", which
+    // would throw away a real turn just because the phone dropped its stream.
+    const s = c.statusInfo();
+    if (s.busy || s.waiting) continue;
     if (!c.hasSubscribers() && now - c.lastActivity > 30 * 60_000) c.close();
   }
 }, 5 * 60_000);
