@@ -11,6 +11,7 @@ import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard } from "./agents";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
+import { ConnectionsButton } from "./connections";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -87,7 +88,7 @@ type SubscriptionWin = { utilization: number | null; resetsAt: string | null };
 type Subscription = { available: boolean; subscription: string | null; fiveHour: SubscriptionWin | null; sevenDay: SubscriptionWin | null } | null;
 
 type Item =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; queued?: boolean }
   | { kind: "assistant"; text: string; usage?: TurnUsage }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string } }
@@ -258,32 +259,61 @@ function ctxMaxSet(id: string, max: number): void {
 // conversation id in scope) shows a sensible percentage. Updated whenever the active gauge refreshes.
 let activeCtxMax = DEFAULT_CTX;
 
-function applyEvent(items: Item[], e: AppEvent): Item[] {
+// A message sent while a turn is still streaming is QUEUED behind it: the agent cannot see it until
+// the current turn ends. It is appended straight away (so you can see it went in) but tagged, and
+// everything the live turn produces after that is inserted ABOVE it. Without that, the next
+// text_delta finds a user item as the last item, opens a SECOND assistant bubble, and the reply is
+// chopped in half at whatever word had arrived. The tag is dropped when the turn ends (`result`),
+// after which every item is a plain user turn again and nothing downstream can tell the difference.
+const isQueuedUser = (it: Item | undefined): boolean => !!it && it.kind === "user" && !!it.queued;
+// Where the LIVE turn ends: the end of the list, minus any messages queued behind it. Equal to
+// items.length whenever nothing is queued, which is the overwhelmingly common case.
+function liveEnd(items: Item[]): number { let n = items.length; while (n > 0 && isQueuedUser(items[n - 1])) n--; return n; }
+// Append at the live end. Identical to [...items, it] when nothing is queued.
+function addItem(items: Item[], it: Item): Item[] {
+  const n = liveEnd(items);
+  return n === items.length ? [...items, it] : [...items.slice(0, n), it, ...items.slice(n)];
+}
+// The turn is over, so whatever was queued behind it is now the current turn: drop the tags, or the
+// next reply's text_delta would skip back over them and grow the PREVIOUS turn's bubble.
+function unqueue(items: Item[]): Item[] {
+  if (!items.some((it) => it.kind === "user" && it.queued)) return items; // keep the same reference
+  return items.map((it) => (it.kind === "user" && it.queued ? { kind: "user", text: it.text } as Item : it));
+}
+
+// `queued` = this event arrived while a turn was already streaming (see isQueuedUser). Only the two
+// call sites that know the conversation is mid-turn pass it; every replay/fold path leaves it false
+// and therefore behaves exactly as it did before.
+function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
+  const end = liveEnd(items); // = items.length unless a message is queued behind the live turn
   // Freeze a live "thinking" block's duration the instant the first non-thinking event lands, so
   // "Thought for Ns" is fixed once the model stops reasoning (and survives reconnects in state).
   if (e.t !== "thinking" && e.t !== "thinking_delta" && e.t !== "thinking_progress") {
-    const l = items[items.length - 1];
+    const l = items[end - 1];
     if (l && l.kind === "thinking" && l.started && l.elapsed == null) {
-      items = items.slice(); items[items.length - 1] = { ...l, elapsed: Date.now() - l.started };
+      items = items.slice(); items[end - 1] = { ...l, elapsed: Date.now() - l.started };
     }
   }
-  const last = items[items.length - 1];
+  const last = items[end - 1];
   switch (e.t) {
     case "user": {
       // A loaded skill arrives as a user message that dumps the whole skill file ("Base directory
       // for this skill: <path>/<name>"). Render a compact card instead. (Also done server-side; this
       // covers transcripts replayed before that backend build ships, so no restart is needed.)
       const sk = skillLoadName(e.text);
-      if (sk) return [...items, { kind: "notice", noticeKind: "skill", text: sk }];
-      return [...items, { kind: "user", text: sanitizeUserText(e.text) }];
+      if (sk) return addItem(items, { kind: "notice", noticeKind: "skill", text: sk });
+      // Queued turns stack at the very end, in send order. A turn that is NOT queued starts a new
+      // turn, so any leftover tag is stale by definition.
+      if (queued) return [...items, { kind: "user", text: sanitizeUserText(e.text), queued: true }];
+      return [...unqueue(items), { kind: "user", text: sanitizeUserText(e.text) }];
     }
     case "text":
     case "text_delta":
-      if (last && last.kind === "assistant") { const c = items.slice(); c[c.length - 1] = { kind: "assistant", text: last.text + e.text }; return c; }
-      return [...items, { kind: "assistant", text: e.text }];
+      if (last && last.kind === "assistant") { const c = items.slice(); c[end - 1] = { ...last, text: last.text + e.text }; return c; }
+      return addItem(items, { kind: "assistant", text: e.text });
     case "thinking_delta":
-      if (last && last.kind === "thinking") { const c = items.slice(); c[c.length - 1] = { ...last, text: last.text + e.text }; return c; }
-      return [...items, { kind: "thinking", text: e.text, started: Date.now() }];
+      if (last && last.kind === "thinking") { const c = items.slice(); c[end - 1] = { ...last, text: last.text + e.text }; return c; }
+      return addItem(items, { kind: "thinking", text: e.text, started: Date.now() });
     case "thinking_progress": {
       // estimated_tokens resets across thinking sub-segments (goes up, then drops back on a new
       // segment). Track the running peak per segment and carry a base of prior peaks so the
@@ -295,13 +325,13 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
         const nextBase = v < peak ? base + peak : base; // reset detected -> bank the last peak
         const nextPeak = v < peak ? v : v;
         const c = items.slice();
-        c[c.length - 1] = { ...last, _base: nextBase, _peak: nextPeak, tokens: nextBase + nextPeak };
+        c[end - 1] = { ...last, _base: nextBase, _peak: nextPeak, tokens: nextBase + nextPeak };
         return c;
       }
-      return [...items, { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now() }];
+      return addItem(items, { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now() });
     }
-    case "thinking": return [...items, { kind: "thinking", text: e.text }];
-    case "tool_use": return [...items, { kind: "tool", id: e.id, name: e.name, input: e.input }];
+    case "thinking": return addItem(items, { kind: "thinking", text: e.text });
+    case "tool_use": return addItem(items, { kind: "tool", id: e.id, name: e.name, input: e.input });
     case "agent_progress": {
       // Attach live subagent progress to its Task tool card (matched by tool_use id).
       for (let i = items.length - 1; i >= 0; i--) {
@@ -326,19 +356,21 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       const max = activeCtxMax;
       const pctBefore = max && e.preTokens != null ? (e.preTokens / max) * 100 : undefined;
       const pctAfter = max && e.postTokens != null ? (e.postTokens / max) * 100 : undefined;
-      return [...items, { kind: "compact", savedTokens: saved || undefined, durationMs: e.durationMs, pctBefore, pctAfter }];
+      return addItem(items, { kind: "compact", savedTokens: saved || undefined, durationMs: e.durationMs, pctBefore, pctAfter });
     }
-    case "notice": return [...items, { kind: "notice", noticeKind: e.kind, text: e.text, from: e.from, status: e.status }];
+    case "notice": return addItem(items, { kind: "notice", noticeKind: e.kind, text: e.text, from: e.from, status: e.status });
     case "result": {
+      // The turn is over: release anything queued behind it (see unqueue) BEFORE stamping usage.
+      const rel = unqueue(items);
       // Stamp the turn's real token usage onto the most recent assistant block so the summary can
       // show it (output = tokens Claude actually generated, incl. thinking + tool-call args).
-      if (!e.usage) return items;
-      for (let i = items.length - 1; i >= 0; i--) { if (items[i].kind === "assistant") { const c = items.slice(); c[i] = { ...(c[i] as Extract<Item, { kind: "assistant" }>), usage: e.usage }; return c; } }
-      return items;
+      if (!e.usage) return rel;
+      for (let i = rel.length - 1; i >= 0; i--) { if (rel[i].kind === "assistant") { const c = rel.slice(); c[i] = { ...(c[i] as Extract<Item, { kind: "assistant" }>), usage: e.usage }; return c; } }
+      return rel;
     }
     case "ask": {
       if (items.some((it) => it.kind === "ask" && it.askId === e.askId)) return items; // de-dupe (transcript + live)
-      return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText }];
+      return addItem(items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText });
     }
     case "ask_done": {
       const idx = items.findIndex((it) => it.kind === "ask" && it.askId === e.askId);
@@ -449,20 +481,26 @@ class ConvStore {
         if (i !== -1) { this.pendingEcho.splice(i, 1); if (this.sendState === "sending") this.setSendState("delivered"); return; } // our own optimistic turn echoed back = server has it
         const last = this.items[this.items.length - 1];
         if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) return;
-        this.items = applyEvent(this.items, e); this.touch(); return;
+        // Someone else's turn (another device, the terminal, a peer agent) landing mid-stream is
+        // queued behind the running one exactly like ours, so tag it the same way.
+        this.items = applyEvent(this.items, e, this.busy); this.touch(); return;
       }
       case "result":
         this.busy = false; this.items = applyEvent(this.items, e); this.touch();
         this.mgr.hooks?.onResult(this); this.mgr.hooks?.onContext(this); return;
       case "error":
-        this.busy = false; this.items = [...this.items, { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]; this.touch(); return;
+        this.busy = false; this.items = unqueue(addItem(this.items, { kind: "assistant", text: "\n\n_error: " + e.message + "_" })); this.touch(); return;
       case "closed": this.disconnect(); return;
       default: this.items = applyEvent(this.items, e); this.touch(); return;
     }
   }
 
   // ---- mutations from the UI ----
-  addOptimisticUser(text: string) { this.pendingEcho.push({ text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
+  // `queued` defaults to "a turn is already running", which is the whole point: the bubble is added
+  // now (so the send is visibly acknowledged) but pinned BELOW the reply that is still streaming
+  // instead of splitting it. doEdit passes false, because a rewind cancels the running turn and its rerun
+  // must appear under the edited bubble, not above it.
+  addOptimisticUser(text: string, queued = this.busy) { this.pendingEcho.push({ text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text }, queued); this.busy = true; this.setSendState("sending"); this.touch(); }
   // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
   // below), and restore the pre-edit view if the server rejects the edit.
   truncateFrom(index: number) { this.items = this.items.slice(0, Math.max(0, index)); this.pendingEcho = []; this.touch(); }
@@ -893,7 +931,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
     const { images, files, body } = parseUserText(it.text);
     return (
       <div className="msg">
-        <div className="bubble-user" {...menuBind(body || it.text, "user")}>
+        <div className={"bubble-user" + (it.queued ? " queued" : "")} {...menuBind(body || it.text, "user")}>
           {images.map((p, k) => <img key={k} className="msg-img" loading="lazy" src={`/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`} alt="attachment" />)}
           {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
           {body && <div className="bubble-user-text">{body}</div>}
@@ -941,7 +979,9 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   // Turn-final assistant block? Show a Claude-Code-style footer: thinking time + the turn's REAL
   // token usage (output = what Claude generated this turn, from the SDK result message).
   const next = items[i + 1];
-  const turnFinal = !next || next.kind === "user" || next.kind === "compact";
+  // A message QUEUED behind this turn sits below the live reply, so it does not end it. Without that
+  // guard, the turn summary would pop in mid-stream the moment you typed a follow-up.
+  const turnFinal = isQueuedUser(next) ? false : (!next || next.kind === "user" || next.kind === "compact");
   const think = turnFinal ? turnThinkingTotals(items, i) : null;
   const usage = it.usage;
   const parts: string[] = [];
@@ -1202,7 +1242,11 @@ function App() {
     s.beginCompact(); // optimistic banner; the backend "compacting"/"compact" events keep it honest
     try { await api.compact(s.id); } catch { /* */ }
     // Safety net: if the compact events never arrive (e.g. dropped stream), clear the banner anyway.
-    setTimeout(() => { s.endCompactFallback(); refreshContext(s.id); flushCompactRef.current(); }, 45000);
+    // A real compaction of a full context takes minutes, not seconds (measured: 122s on a 477k-token
+    // conversation). At 45s this fired MID-compaction: the banner vanished, the ring refreshed against
+    // pre-compaction numbers, and the messages held for the divider were released above it — which is
+    // what made the "Compacted" card look like it only turned up after the next message.
+    setTimeout(() => { s.endCompactFallback(); refreshContext(s.id); flushCompactRef.current(); }, 300000);
   }, [refreshContext]);
   // Which conversations have an offline message queued (resume target) — drives the queued indicator
   // on EXISTING conversations, not just brand-new offline chats.
@@ -1826,6 +1870,12 @@ function App() {
     saveDraft(activeIdRef.current, "");
     setInput(""); setAttachments([]);
     if (taRef.current) taRef.current.style.height = "auto";
+    // The composer being emptied is authoritative. Without this, dictation's next poll returns the
+    // same server-side transcript and splices the words you just sent back into the empty box, and
+    // a tidy pass still running would paste them back a second later. Resetting keeps the mic open,
+    // so you can send mid-thought and carry straight on into a clean composer.
+    if (dictation.active) { dictation.reset(); dictAnchorRef.current = { prefix: "", suffix: "" }; }
+    else dictAnchorRef.current = null;
     // Editing a past turn -> rewind-and-rerun instead of appending. Attachments don't apply to an edit.
     if (editing) {
       const ed = editing;
@@ -1910,8 +1960,8 @@ function App() {
     if (uindex < 0) return "Couldn't work out which turn to rewind to. Reload the conversation and try again.";
     stickBottom.current = true; setAtBottom(true);
     const snapshot = s.items;
-    s.truncateFrom(ed.i);      // drop the edited bubble + everything after
-    s.addOptimisticUser(text); // re-render the edited text below; arms the echo dedup
+    s.truncateFrom(ed.i);             // drop the edited bubble + everything after
+    s.addOptimisticUser(text, false); // re-render the edited text below; arms the echo dedup
     const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
     try {
       const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: ed.orig, model: modelRef.current || undefined }), 30000);
@@ -2243,6 +2293,7 @@ function App() {
           <button className="sb-gear" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
           </button>
+          <ConnectionsButton />
         </div>
         <button className="new-chat" onClick={newChat}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
@@ -2339,7 +2390,7 @@ function App() {
             <div className="thread">
               {threadNodes}
               {compacting && <CompactionBanner start={activeStore?.compactStart ?? 0} />}
-              {busy && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
+              {busy && !compacting && items[liveEnd(items) - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}
         </div>
@@ -2381,7 +2432,7 @@ function App() {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 12.5l-8.5 8.5a5 5 0 01-7-7L14 5.5a3.3 3.3 0 014.7 4.7l-9.2 9.2a1.6 1.6 0 01-2.3-2.3l8.5-8.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
                 <input type="file" multiple style={{ display: "none" }} onChange={onFile} />
               </label>
-              <button className="act-btn" onClick={() => setSettingsOpen(true)} title="Connections & tools (MCP servers, memory, skills)">
+              <button className="act-btn" onClick={() => setSettingsOpen(true)} title="Tools & context (MCP servers, memory, skills)">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M9 7V4a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v3M15 7V4a1 1 0 0 0-1-1M7 7h10l-.6 9a3 3 0 0 1-3 2.8H10.6a3 3 0 0 1-3-2.8L7 7z" /><path d="M12 18v3" /></svg>
               </button>
               <div className="spacer" />
@@ -2390,7 +2441,7 @@ function App() {
                   className={"act-btn dictate-btn" + (dictation.active ? " rec" : "") + (dictation.tidying ? " tidying" : "")}
                   onClick={toggleDictation}
                   style={dictation.active ? ({ "--lvl": String(0.85 + dictation.level * 0.4) } as any) : undefined}
-                  title={dictation.active ? "Stop dictating" : dictation.error || "Dictate into the message box"}
+                  title={dictation.active ? "Stop dictating" : dictation.error || "Dictate — speak to type into the message box (does not send)"}
                   aria-label="Dictate"
                   aria-pressed={dictation.active}
                 >
@@ -2398,7 +2449,7 @@ function App() {
                 </button>
               )}
               {voiceAvail && (
-                <button className="act-btn voice-open-btn" onClick={() => setVoiceOpen(true)} title="Hands-free voice mode">
+                <button className="act-btn voice-open-btn" onClick={() => setVoiceOpen(true)} title="Voice mode — hands-free spoken conversation, Claude talks back">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M4 13v-1a8 8 0 0 1 16 0v1" /><path d="M4 13h2.5a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" /><path d="M20 13h-2.5a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1H19a1 1 0 0 0 1-1z" /><path d="M18 18v1a2 2 0 0 1-2 2h-3" /></svg>
                 </button>
               )}
