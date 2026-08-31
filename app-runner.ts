@@ -8,7 +8,8 @@
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
 import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { z } from "zod";
 import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
@@ -854,10 +855,50 @@ export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
 
 export function get(key: string): Conversation | undefined { return conversations.get(key); }
 
-// Live status for every in-memory conversation, keyed by session id (for the list indicators).
+// A conversation can also be driven from a TERMINAL tab by the CLI, which this process knows nothing
+// about — it only tracks its own /app conversations. Those CLI sessions publish their own state to
+// ~/.claude/sessions/<pid>.json ({sessionId, status:"busy"|"idle", entrypoint}), and without reading it
+// the sidebar had no idea they were working: a tmux session churning through tool calls advanced its
+// transcript mtime, fell through to the unread test, and showed an unread dot instead of "thinking".
+// (Measured: three busy worktree tabs reported status "busy" here while /app reported nothing at all
+// for two of them and busy=false for the third.)
+const SESSIONS_DIR = join(homedir(), ".claude", "sessions");
+let sessCache: { at: number; map: Record<string, { busy: boolean; waiting: boolean }> } = { at: 0, map: {} };
+function cliSessionStatuses(): Record<string, { busy: boolean; waiting: boolean }> {
+  // The client polls every 4s; a 2s cache keeps that to one directory scan per poll at most.
+  if (Date.now() - sessCache.at < 2000) return sessCache.map;
+  const map: Record<string, { busy: boolean; waiting: boolean }> = {};
+  try {
+    for (const f of readdirSync(SESSIONS_DIR)) {
+      if (!f.endsWith(".json")) continue;
+      let o: any;
+      try { o = JSON.parse(readFileSync(join(SESSIONS_DIR, f), "utf8")); } catch { continue }
+      const sid = typeof o?.sessionId === "string" ? o.sessionId : null;
+      if (!sid || !o.pid) continue;
+      // A crashed session leaves its last state on disk forever, so only trust a live pid.
+      if (!existsSync(`/proc/${o.pid}`)) continue;
+      const busy = o.status === "busy" || o.status === "thinking";
+      const waiting = o.status === "waiting";
+      const prev = map[sid];
+      // Same session id can have several entries (a CLI tab and an SDK attach). Busy anywhere wins.
+      map[sid] = { busy: busy || !!prev?.busy, waiting: waiting || !!prev?.waiting };
+    }
+  } catch { /* no registry on this box */ }
+  sessCache = { at: Date.now(), map };
+  return map;
+}
+
+// Live status for every in-memory conversation, keyed by session id (for the list indicators),
+// merged with the CLI session registry so terminal-driven conversations are not reported idle.
 export function liveStatuses(): Record<string, { busy: boolean; waiting: boolean }> {
-  const out: Record<string, { busy: boolean; waiting: boolean }> = {};
-  for (const c of new Set(conversations.values())) out[c.id] = c.statusInfo();
+  const out: Record<string, { busy: boolean; waiting: boolean }> = { ...cliSessionStatuses() };
+  for (const c of new Set(conversations.values())) {
+    const mine = c.statusInfo();
+    const cli = out[c.id];
+    // OR them: this process is authoritative for its own turn, but a CLI tab on the same session id
+    // can be mid-tool while we have nothing running.
+    out[c.id] = { busy: mine.busy || !!cli?.busy, waiting: mine.waiting || !!cli?.waiting };
+  }
   return out;
 }
 
