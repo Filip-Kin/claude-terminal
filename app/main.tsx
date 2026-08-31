@@ -2178,6 +2178,9 @@ function App() {
   }, [convs, favorites]);
 
   // Per-conversation status for the sidebar dot: queued > thinking > waiting-for-input > unread.
+  // True when this conversation's activity is coming from a TERMINAL tab rather than the app, so the
+  // dot can be shown in the terminal's own violet instead of the app's coral.
+  const convIsTerminal = (c: Conv): boolean => !!(statuses[c.sessionId] as { terminal?: boolean } | undefined)?.terminal;
   const convStatus = (c: Conv): "queued" | "thinking" | "waiting" | "unread" | null => {
     if (c.pending || queuedIds.has(c.sessionId)) return "queued";
     const st = statuses[c.sessionId];
@@ -2205,7 +2208,7 @@ function App() {
     return (
       <div key={c.sessionId} className={"conv-item" + (c.sessionId === activeId ? " active" : "")} title={c.title} onClick={() => loadConv(c.sessionId, search.trim() || undefined)} {...longPressBind((x, y) => setConvMenu({ x, y, id: c.sessionId, title: c.title, fav }))}>
         {status
-          ? <span className={"conv-status " + status} title={STATUS_LABEL[status]} aria-label={STATUS_LABEL[status]} />
+          ? <span className={"conv-status " + status + (convIsTerminal(c) ? " terminal" : "")} title={STATUS_LABEL[status]} aria-label={STATUS_LABEL[status]} />
           : <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>}
         <span className={"conv-title" + (status === "unread" ? " unread" : "")}>{c.title}</span>
         <button className={"conv-star" + (fav ? " on" : "")} onClick={(e) => { e.stopPropagation(); toggleFav(c.sessionId); }} aria-label={fav ? "Unfavorite" : "Favorite"} title={fav ? "Unfavorite" : "Favorite"}>

@@ -89,9 +89,14 @@ a { color: var(--accent-2); }
    (Messages are deliberately left selectable so you can copy part of one.) */
 .conv-item, .conv-group-label { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 /* Conversation status dot (occupies the icon slot): thinking pulses, waiting/unread solid, queued a ring. */
-.conv-status { flex: 0 0 15px; width: 15px; align-self: stretch; display: inline-flex; align-items: center; justify-content: center; }
+/* Fixed 15px box, matching the .conv-ic svg it replaces. `align-self: stretch` made this span
+   the whole row height, so the dot centred against the row instead of the title line and read
+   as vertically off inside the button. */
+.conv-status { flex: 0 0 15px; width: 15px; height: 15px; align-self: center; display: inline-flex; align-items: center; justify-content: center; line-height: 0; }
 .conv-status::after { content: ""; width: 8px; height: 8px; border-radius: 50%; }
 .conv-status.thinking::after { background: var(--accent); animation: ctdot 1.4s ease-in-out infinite; }
+/* Driven from a terminal tab, not the app: the terminal's violet (#7C3AED). */
+.conv-status.thinking.terminal::after, .conv-status.terminal::after { background: #7C3AED; }
 @keyframes ctdot { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 .conv-status.waiting::after { background: var(--warning, #F59E0B); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning, #F59E0B) 25%, transparent); }
 .conv-status.unread::after { background: var(--accent); }

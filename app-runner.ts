@@ -863,12 +863,13 @@ export function get(key: string): Conversation | undefined { return conversation
 // transcript mtime, fell through to the unread test, and showed an unread dot instead of "thinking".
 // (Measured: three busy worktree tabs reported status "busy" here while /app reported nothing at all
 // for two of them and busy=false for the third.)
+export type LiveStatus = { busy: boolean; waiting: boolean; terminal?: boolean };
 const SESSIONS_DIR = join(homedir(), ".claude", "sessions");
-let sessCache: { at: number; map: Record<string, { busy: boolean; waiting: boolean }> } = { at: 0, map: {} };
-function cliSessionStatuses(): Record<string, { busy: boolean; waiting: boolean }> {
+let sessCache: { at: number; map: Record<string, LiveStatus> } = { at: 0, map: {} };
+function cliSessionStatuses(): Record<string, LiveStatus> {
   // The client polls every 4s; a 2s cache keeps that to one directory scan per poll at most.
   if (Date.now() - sessCache.at < 2000) return sessCache.map;
-  const map: Record<string, { busy: boolean; waiting: boolean }> = {};
+  const map: Record<string, LiveStatus> = {};
   try {
     for (const f of readdirSync(SESSIONS_DIR)) {
       if (!f.endsWith(".json")) continue;
@@ -879,10 +880,13 @@ function cliSessionStatuses(): Record<string, { busy: boolean; waiting: boolean 
       // A crashed session leaves its last state on disk forever, so only trust a live pid.
       if (!existsSync(`/proc/${o.pid}`)) continue;
       const busy = o.status === "busy" || o.status === "thinking";
-      const waiting = o.status === "waiting";
+      // `waiting` from this registry is DELIBERATELY IGNORED. The hook writes it on a notification
+      // and nothing reliably clears it, so it goes stale: a tab was reported waiting for 34 minutes
+      // with nothing actually waiting, which is a worse signal than none — it sends you to a
+      // terminal to answer a question that is not there. Only `busy` is trusted, and `terminal`
+      // marks the row as terminal-driven so the UI can colour it as such.
       const prev = map[sid];
-      // Same session id can have several entries (a CLI tab and an SDK attach). Busy anywhere wins.
-      map[sid] = { busy: busy || !!prev?.busy, waiting: waiting || !!prev?.waiting };
+      map[sid] = { busy: busy || !!prev?.busy, waiting: false, terminal: true };
     }
   } catch { /* no registry on this box */ }
   sessCache = { at: Date.now(), map };
@@ -891,14 +895,14 @@ function cliSessionStatuses(): Record<string, { busy: boolean; waiting: boolean 
 
 // Live status for every in-memory conversation, keyed by session id (for the list indicators),
 // merged with the CLI session registry so terminal-driven conversations are not reported idle.
-export function liveStatuses(): Record<string, { busy: boolean; waiting: boolean }> {
-  const out: Record<string, { busy: boolean; waiting: boolean }> = { ...cliSessionStatuses() };
+export function liveStatuses(): Record<string, LiveStatus> {
+  const out: Record<string, LiveStatus> = { ...cliSessionStatuses() };
   for (const c of new Set(conversations.values())) {
     const mine = c.statusInfo();
     const cli = out[c.id];
     // OR them: this process is authoritative for its own turn, but a CLI tab on the same session id
     // can be mid-tool while we have nothing running.
-    out[c.id] = { busy: mine.busy || !!cli?.busy, waiting: mine.waiting || !!cli?.waiting };
+    out[c.id] = { busy: mine.busy || !!cli?.busy, waiting: mine.waiting, terminal: !!cli?.terminal };
   }
   return out;
 }

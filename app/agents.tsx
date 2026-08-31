@@ -537,31 +537,28 @@ function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[];
       : <div className="as-row" key={e.key}>{body}</div>;
   };
 
-  // Nothing in flight: one line, so a conversation that used agents earlier does not carry a panel
-  // around forever, but the history is still one tap away.
-  if (!running.length) {
-    const label = `${entries.length} spawned · review`;
-    return onOpenIndex
-      ? <button className="as-strip as-idle" onClick={onOpenIndex} title="Open spawned work">
-          <span className="as-ic" aria-hidden="true"><KindIcon kind={entries[0].kind} /></span>
-          <span className="as-label">{label}</span>
-          <span className="as-chev" aria-hidden="true">›</span>
-        </button>
-      : <div className="as-strip as-idle"><span className="as-label">{label}</span></div>;
-  }
+  // Nothing in flight: render NOTHING. The idle "N spawned · review" line sat above the composer
+  // permanently for any conversation that had ever used an agent, which is clutter in the one place
+  // that has to stay small on a phone. Finished work is still reachable: the strip appears while
+  // agents run and its header button opens the full-screen view, which lists finished items too.
+  if (!running.length) return null;
 
   return (
     <div className="as-strip" role="status" aria-live="polite">
-      <div className="as-head">
-        <span className="as-spin" aria-hidden="true" />
-        {runningLabel(running)}
-      </div>
-      {running.map(row)}
-      {rest > 0 && onOpenIndex && (
-        <button className="as-more as-tap" onClick={onOpenIndex}>
-          {rest === 1 ? "1 finished · review" : `${rest} finished · review`}
+      {onOpenIndex ? (
+        <button className="as-head as-head-tap" onClick={onOpenIndex} title="Open the full spawned-work view">
+          <span className="as-spin" aria-hidden="true" />
+          <span className="as-head-label">{runningLabel(running)}</span>
+          {rest > 0 && <span className="as-sub">{rest} finished</span>}
+          <span className="as-chev" aria-hidden="true">›</span>
         </button>
+      ) : (
+        <div className="as-head">
+          <span className="as-spin" aria-hidden="true" />
+          {runningLabel(running)}
+        </div>
       )}
+      {running.map(row)}
     </div>
   );
 }
@@ -631,6 +628,9 @@ function injectAgentStripCss() {
   const css = `
   .as-strip{max-width:760px;margin:0 auto 8px;padding:9px 12px;background:var(--bg-2,#211c18);border:1px solid var(--line,#3a322c);border-radius:11px;font-size:12.5px}
   .as-head{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--text-2,#b8afa5);margin-bottom:6px}
+  .as-head-tap{width:100%;background:transparent;border:0;font:inherit;font-weight:600;color:var(--text-2,#b8afa5);text-align:left;cursor:pointer;padding:2px 6px;margin:0 -6px 4px;border-radius:7px;min-height:32px}
+  .as-head-tap:hover,.as-head-tap:focus-visible{background:var(--bg-3,#2a2420);outline:none}
+  .as-head-label{flex:1;min-width:0}
   .as-spin{width:11px;height:11px;border-radius:50%;border:2px solid var(--line,#3a322c);border-top-color:var(--accent,#d97757);animation:as-spin .9s linear infinite;flex:0 0 auto}
   @keyframes as-spin{to{transform:rotate(360deg)}}
   .as-row{display:flex;align-items:center;gap:8px;padding:3px 0;min-width:0;width:100%}
