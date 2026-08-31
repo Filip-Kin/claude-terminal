@@ -851,7 +851,7 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
   );
 }
 
-function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
+function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
   // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
   // audio actually plays (Kokoro TTS can take a moment), then a subtle "playing" state until it ends.
@@ -964,6 +964,21 @@ function MessageBlock({ items, i, onAnswer, convId, onMenu, onOpenArtifact, send
     </div>
   );
 }
+
+// A long conversation is thousands of blocks. Without this, ANY App re-render (every keystroke in
+// the composer, every streamed token) reconciles all of them — that was the "typing appears a word
+// at a time" lag. A block only depends on its own item plus its immediate neighbours (role label,
+// turn-final footer), so compare exactly those: during streaming only the tail item changes
+// identity, so only the tail re-renders.
+const MessageBlock = React.memo(MessageBlockInner, (a, b) => {
+  if (a.i !== b.i || a.convId !== b.convId || a.sendStatus !== b.sendStatus || a.reading !== b.reading) return false;
+  if (a.onAnswer !== b.onAnswer || a.onMenu !== b.onMenu || a.onOpenArtifact !== b.onOpenArtifact) return false;
+  if (a.items === b.items) return true;
+  // isLast (ThinkingCard) and turnFinal both read off the end of the list.
+  if (a.items.length !== b.items.length) return false;
+  const i = a.i;
+  return a.items[i] === b.items[i] && a.items[i - 1] === b.items[i - 1] && a.items[i + 1] === b.items[i + 1];
+});
 // #endregion
 
 function groupLabel(mtime: number): string {
@@ -976,6 +991,9 @@ function groupLabel(mtime: number): string {
   if (diff <= 30) return "Previous 30 days";
   return "Older";
 }
+
+// How many trailing blocks the thread mounts at first, and how many more each scroll-up adds.
+const VIS_STEP = 60;
 
 function App() {
   const [models, setModels] = useState<Model[]>([]);
@@ -1075,6 +1093,11 @@ function App() {
   const forceBottom = useRef(false); // scroll to the end after opening a conversation
   const stickBottom = useRef(true); // follow new content only while the user is parked at the bottom
   const [atBottom, setAtBottom] = useState(true); // drives the "jump to latest" button while streaming
+  // Rendered-history window. A long conversation holds thousands of blocks; mounting them all is what
+  // made opening and typing slow. Render the tail, then grow the window as the user scrolls up —
+  // straight from the items already in memory, so it is instant (no fetch) while staying cheap.
+  const [visible, setVisible] = useState(VIS_STEP);
+  const growAnchor = useRef<{ height: number; top: number } | null>(null); // scroll anchor across a grow
   const highlightRef = useRef<string>(""); // when set, scroll to + flash the first message containing it
   const activeIdRef = useRef<string | null>(null); // latest activeId for stable callbacks (voice)
   const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
@@ -1442,9 +1465,13 @@ function App() {
   useLayoutEffect(() => {
     const el = scrollRef.current; if (!el) return;
     if (highlightRef.current) {
-      const q = highlightRef.current.toLowerCase(); highlightRef.current = "";
+      const q = highlightRef.current.toLowerCase();
       let found: Element | null = null;
       for (const n of Array.from(el.querySelectorAll(".thread > *"))) { if ((n.textContent || "").toLowerCase().includes(q)) { found = n; break; } }
+      // A search hit can live above the mounted window. Mount the rest and let this effect run again
+      // (keeping the pending highlight) rather than silently falling through to the bottom.
+      if (!found && visible < items.length) { setVisible(items.length); return; }
+      highlightRef.current = "";
       if (found) { (found as HTMLElement).scrollIntoView({ block: "center" }); found.classList.add("hl-flash"); const f = found; setTimeout(() => f.classList.remove("hl-flash"), 2200); }
       else el.scrollTop = el.scrollHeight;
       return;
@@ -1453,7 +1480,7 @@ function App() {
     // Follow new content ONLY while the user is parked at the bottom. The moment they scroll up to
     // read, stickBottom goes false (see onThreadScroll) and we stop yanking them back down.
     if (stickBottom.current) el.scrollTop = el.scrollHeight;
-  }, [items, busy, compacting]);
+  }, [items, busy, compacting, visible]);
 
   // Track whether the user is at the bottom. Programmatic scroll-to-bottom lands here too and
   // (correctly) re-sticks; scrolling up to read un-sticks and shows the jump-to-latest button.
@@ -1462,11 +1489,41 @@ function App() {
     const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     stickBottom.current = near;
     setAtBottom((v) => (v === near ? v : near));
+    // Approaching the top of the mounted window: pull in the previous chunk. The data is already
+    // here, so this only mounts more blocks. Record the scroll geometry first — the new blocks are
+    // prepended, and without re-anchoring below the viewport would jump backwards.
+    if (el.scrollTop < 400) {
+      setVisible((v) => {
+        if (v >= (activeStoreRef.current?.items.length ?? 0)) return v;
+        if (!growAnchor.current) growAnchor.current = { height: el.scrollHeight, top: el.scrollTop };
+        return v + VIS_STEP;
+      });
+    }
   }, []);
   const jumpToLatest = useCallback(() => {
     const el = scrollRef.current; if (!el) return;
     stickBottom.current = true; setAtBottom(true); el.scrollTop = el.scrollHeight;
   }, []);
+
+  // Keep the reading position fixed across a window grow: the blocks mounted above added height, so
+  // shift scrollTop by exactly that much. Runs before paint, so the user never sees the jump.
+  useLayoutEffect(() => {
+    const el = scrollRef.current; if (!el) return;
+    const a = growAnchor.current;
+    if (a) {
+      growAnchor.current = null;
+      const delta = el.scrollHeight - a.height;
+      if (delta > 0) el.scrollTop = a.top + delta;
+      return;
+    }
+    // The window can be shorter than the viewport (short blocks), and then no scroll event can ever
+    // fire to grow it — the user would be stranded with no way to reach the earlier history. Top it
+    // up until it overflows. Bounded: each pass adds a step and stops at the full list.
+    if (visible < items.length && el.scrollHeight <= el.clientHeight) setVisible((v) => v + VIS_STEP);
+  }, [visible, items]);
+
+  // A different conversation starts from the tail again (and drops the old one's mounted blocks).
+  useEffect(() => { setVisible(VIS_STEP); growAnchor.current = null; }, [activeId]);
 
   // App-level hooks the stores call: URL + list refresh when a new chat gets its real id, sidebar
   // reorder when a turn finishes, the voice tap + stall clock on every ACTIVE-store event, and the
@@ -1945,14 +2002,45 @@ function App() {
     setTimeout(refreshConvs, 300);
   };
 
-  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []); e.target.value = ""; if (!files.length) return;
+  const addFiles = async (files: File[]) => {
     for (const f of files) {
       const isImage = f.type.startsWith("image/");
       const preview = isImage ? URL.createObjectURL(f) : undefined; // local thumbnail, no server round-trip
       try { const r = await api.upload(activeId, f); if (r?.path) setAttachments((a) => [...a, { name: f.name, path: r.path, isImage, preview }]); }
       catch { if (preview) URL.revokeObjectURL(preview); }
     }
+  };
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []); e.target.value = ""; if (!files.length) return;
+    await addFiles(files);
+  };
+  // Paste a screenshot straight into the box. Clipboard images arrive as nameless "image.png" blobs,
+  // so give each a readable, unique name. Non-image pastes fall through to the normal text paste.
+  const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imgs = Array.from(e.clipboardData?.items || []).filter((it) => it.kind === "file" && it.type.startsWith("image/"));
+    if (!imgs.length) return;
+    e.preventDefault();
+    const stamp = Date.now();
+    const files = imgs.map((it, i) => {
+      const f = it.getAsFile(); if (!f) return null;
+      const named = f.name && f.name !== "image.png";
+      const ext = (f.type.split("/")[1] || "png").replace("jpeg", "jpg");
+      return named ? f : new File([f], `pasted-${stamp}${imgs.length > 1 ? "-" + (i + 1) : ""}.${ext}`, { type: f.type });
+    }).filter((f): f is File => !!f);
+    if (files.length) void addFiles(files);
+  };
+  // Drag a file (or several) onto the composer to attach it.
+  const [dragOver, setDragOver] = useState(false);
+  const onDrop = (e: React.DragEvent) => {
+    const files = Array.from(e.dataTransfer?.files || []);
+    setDragOver(false);
+    if (!files.length) return;
+    e.preventDefault();
+    void addFiles(files);
+  };
+  const onDragOver = (e: React.DragEvent) => {
+    if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+    e.preventDefault(); setDragOver(true);
   };
 
   // Desktop: Enter sends, Shift+Enter is a newline. Touch devices (phone/tablet): Enter is always a
@@ -2019,6 +2107,36 @@ function App() {
   const titleMatches = q ? convs.filter((c) => (c.title || "").toLowerCase().includes(q.toLowerCase())) : [];
   const titleIds = new Set(titleMatches.map((c) => c.sessionId));
   const contentMatches = searchHits.filter((h) => !titleIds.has(h.sessionId));
+
+  // The thread is built here, memoised, so that typing in the composer (which re-renders App on every
+  // keystroke) does not rebuild or reconcile it: React skips a subtree whose element is referentially
+  // unchanged. Only a real thread input — new/edited items, the window growing, turn state — rebuilds
+  // it. Blocks before the window are not mounted at all; scrolling up grows it from memory.
+  const sendState = activeStore?.sendState ?? null;
+  const threadNodes = useMemo(() => {
+    const nodes: React.ReactNode[] = [];
+    // Plain tools collapse into an accordion; subagent/workflow (Task) tools stay standalone
+    // (rich activity card); TodoWrite is hidden here (the pinned checklist replaces it).
+    const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name);
+    let lastUserIdx = -1; for (let k = items.length - 1; k >= 0; k--) if (items[k].kind === "user") { lastUserIdx = k; break; }
+    // Only the tail is mounted. Blocks still read their neighbours out of the FULL items array, so
+    // the role label and turn-final footer stay correct at the window edge.
+    const start = Math.max(0, items.length - visible);
+    for (let i = start; i < items.length; i++) {
+      const cur = items[i];
+      if (cur.kind === "tool" && isTodoTool((cur as Extract<Item, { kind: "tool" }>).name)) continue; // pinned checklist replaces the inline card
+      if (isPlainTool(items[i])) {
+        let j = i; const run: Extract<Item, { kind: "tool" }>[] = [];
+        while (j < items.length && isPlainTool(items[j])) { run.push(items[j] as Extract<Item, { kind: "tool" }>); j++; }
+        if (run.length >= 2) { // collapse a run of tools into one accordion
+          nodes.push(<ToolGroup key={"tg" + i} tools={run} live={busy && j === items.length} />);
+          i = j - 1; continue;
+        }
+      }
+      nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
+    }
+    return nodes;
+  }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, setArtifact]);
 
   return (
     <div className={"app" + (drawer ? " drawer-open" : "")} onTouchStart={onAppTouchStart} onTouchMove={onAppTouchMove} onTouchEnd={onAppTouchEnd}>
@@ -2219,27 +2337,7 @@ function App() {
             </div>
           ) : (
             <div className="thread">
-              {(() => {
-                const nodes: React.ReactNode[] = [];
-                // Plain tools collapse into an accordion; subagent/workflow (Task) tools stay standalone
-                // (rich activity card); TodoWrite is hidden here (the pinned checklist replaces it).
-                const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name);
-                let lastUserIdx = -1; for (let k = items.length - 1; k >= 0; k--) if (items[k].kind === "user") { lastUserIdx = k; break; }
-                for (let i = 0; i < items.length; i++) {
-                  const cur = items[i];
-                  if (cur.kind === "tool" && isTodoTool((cur as Extract<Item, { kind: "tool" }>).name)) continue; // pinned checklist replaces the inline card
-                  if (isPlainTool(items[i])) {
-                    let j = i; const run: Extract<Item, { kind: "tool" }>[] = [];
-                    while (j < items.length && isPlainTool(items[j])) { run.push(items[j] as Extract<Item, { kind: "tool" }>); j++; }
-                    if (run.length >= 2) { // collapse a run of tools into one accordion
-                      nodes.push(<ToolGroup key={"tg" + i} tools={run} live={busy && j === items.length} />);
-                      i = j - 1; continue;
-                    }
-                  }
-                  nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? (activeStore?.sendState ?? null) : null} reading={reading?.i === i ? reading.phase : undefined} />);
-                }
-                return nodes;
-              })()}
+              {threadNodes}
               {compacting && <CompactionBanner start={activeStore?.compactStart ?? 0} />}
               {busy && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
@@ -2259,7 +2357,7 @@ function App() {
               <button onClick={cancelEdit} aria-label="Cancel edit">×</button>
             </div>
           )}
-          <div className="composer">
+          <div className={"composer" + (dragOver ? " drag-over" : "")} onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragOver(false)}>
             {attachments.length > 0 && (
               <div className="attach-row">
                 {attachments.map((a, i) => (
@@ -2271,7 +2369,7 @@ function App() {
                 ))}
               </div>
             )}
-            <textarea ref={taRef} value={input} onChange={onInput} onKeyDown={onKey} rows={1} placeholder={pendingAsk ? "Answer the question above…" : "Reply to Claude..."} />
+            <textarea ref={taRef} value={input} onChange={onInput} onKeyDown={onKey} onPaste={onPaste} rows={1} placeholder={pendingAsk ? "Answer the question above…" : "Reply to Claude..."} />
             <div className="composer-actions">
               {/* Photo/gallery picker: accept=image/* makes Android/iOS open the photo library (with a
                   camera option), not the file browser. The paperclip stays for any-file attachments. */}
