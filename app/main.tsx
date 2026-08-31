@@ -656,6 +656,17 @@ class ConvManager {
     this.stores.delete(store.id);
     this.stores.set(newId, store); store.id = newId; store.hydrated = true; store.signal();
   }
+  // The local store holding a chat that was STARTED offline. It has no server id yet (new-/pending-),
+  // so a drained queue item can only be matched back to it by the text of the turn it is waiting on.
+  findQueuedNewChat(text: string): ConvStore | undefined {
+    const clean = sanitizeUserText(text);
+    for (const s of this.stores.values()) {
+      if (!s.id.startsWith("new-") && !s.id.startsWith("pending-")) continue;
+      if (s.sendState !== "queued") continue;
+      if (s.items.some((it) => it.kind === "user" && sanitizeUserText(it.text) === clean)) return s;
+    }
+    return undefined;
+  }
   // Background pool: keep busy, non-active conversations streaming into cache, capped by bandwidth.
   reconcileBackground(statuses: Record<string, { busy: boolean }>, activeId: string | null, budget: number) {
     const busyIds = Object.keys(statuses).filter((id) => statuses[id]?.busy && id !== activeId && !id.startsWith("pending-"));
@@ -1808,6 +1819,22 @@ function App() {
   }, []);
 
   // #region offline: online/offline detection + queued-message drain
+  // A turn held offline shows the waiting-to-send clock. Sending it is only half the job: without
+  // this the store stays on sendState "queued" and the clock never becomes ticks, so a message that
+  // went through still reads as stranded. Hand the turn back to the normal delivery path instead.
+  const settleQueued = (body: { text: string; resume?: string }, serverId: string) => {
+    const s = (body.resume ? manager.get(body.resume) : null) || manager.findQueuedNewChat(body.text);
+    if (!s) return;
+    const oldId = s.id;                         // rebind mutates s.id, so read it first
+    if (oldId !== serverId) {                   // a chat started offline only gets its id now
+      manager.rebind(s, serverId);
+      if (activeIdRef.current === oldId || activeStoreRef.current === s) activeIdRef.current = serverId;
+    }
+    s.setBusy(true);                            // the server has taken the turn, so a reply is coming
+    s.setSendState("delivered");
+    s.connect(false);                           // stream the reply in rather than waiting for a poll
+  };
+
   const drainQueueUI = useCallback(async () => {
     const q = await offline.getQueue();
     if (!q.length) return;
@@ -1816,7 +1843,7 @@ function App() {
       try {
         const r = await api.start(it.body);
         if (it.qid != null) await offline.removeQueued(it.qid);
-        if (r?.id) lastId = r.id;
+        if (r?.id) { lastId = r.id; settleQueued(it.body, r.id); }
       } catch { break; } // dropped offline again — leave the rest queued
     }
     await refreshQueue();
