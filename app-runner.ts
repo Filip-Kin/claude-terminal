@@ -389,12 +389,6 @@ export class Conversation {
   private queue: SDKUserMessage[] = [];
   private waiter?: (v: SDKUserMessage | null) => void;
   private lastTurnAt = 0; // wall clock of the previous turn, for the turn-context stamp below
-  // Turns submitted but not yet finished, INCLUDING ones still queued behind the running turn. A
-  // queued turn is not in the transcript yet (the SDK writes it when it starts it), so reporting
-  // idle between the running turn's result and the queued one's first token tells every client the
-  // conversation is done — and a client that then re-reads the transcript loses the queued message
-  // entirely. See the busy accounting in case "result".
-  private pendingTurns = 0;
   private closed = false;
   private subs = new Set<Sub>();
   private hooks = new Set<Sub>(); // internal lifecycle listeners (init/closed bookkeeping); do NOT count as client subscribers, or the idle reaper never fires
@@ -512,7 +506,6 @@ export class Conversation {
     // no longer wanted (this counts as the "easy cancel" for the default-on behaviour).
     try { cancelResume(this.id); } catch { /* */ }
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
-    this.pendingTurns++;
     this.emit({ t: "user", text });
     this.emit({ t: "busy", busy: true });
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
@@ -586,7 +579,7 @@ export class Conversation {
       } catch (e: any) { rewind = { canRewind: false, error: String(e?.message || e) }; }
     }
     const oldQ = this.q;
-    this.queue = []; this.pendingTurns = 0; // run(text) below re-arms it for the edited turn
+    this.queue = [];
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); } // release the old input generator
     if (forkAtUuid) { this.resume = this.id; this.forkAt = forkAtUuid; this.forkNext = true; }
     else { this.resume = undefined; this.forkAt = undefined; this.forkNext = false; } // editing the first turn -> fresh session
@@ -659,7 +652,7 @@ export class Conversation {
   close() {
     if (this.closed) return;
     this.closed = true;
-    this.queue = []; this.pendingTurns = 0;
+    this.queue = [];
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); }
     for (const [, resolve] of this.pendingAsks) resolve("(the user did not answer)"); // unblock any pending ask
     this.pendingAsks.clear();
@@ -673,7 +666,6 @@ export class Conversation {
       this.busy = true;
       this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
       this.runStart = this.log.length; // first turn's replay boundary
-      this.pendingTurns++;
       this.emit({ t: "user", text: first });
       this.emit({ t: "busy", busy: true });
       yield { type: "user", message: { role: "user", content: first + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
@@ -727,7 +719,7 @@ export class Conversation {
     } finally {
       // Superseded by a refork -> stay silent; the new run owns the stream now.
       if (myGen === this.runGen) {
-        this.busy = false; this.pendingTurns = 0; // backstop: a turn that died without a result must not pin busy
+        this.busy = false;
         tlog("closed", { conv: this.id, listeners: this.subs.size });
         this.emit({ t: "busy", busy: false });
         this.emit({ t: "closed" });
@@ -846,11 +838,13 @@ export class Conversation {
         break;
       }
       case "result": {
-        // One result per submitted turn, so this is exact bookkeeping. Anything still outstanding is
-        // a turn the user sent mid-stream that the SDK has not started yet: stay busy for it rather
-        // than announcing idle and then going busy again a moment later.
-        this.pendingTurns = Math.max(0, this.pendingTurns - 1);
-        this.busy = this.pendingTurns > 0;
+        // A result ends the turn, full stop. Do NOT try to count submitted turns and stay busy for
+        // the outstanding ones: a message sent mid-turn is folded by the SDK into the RUNNING turn
+        // rather than starting a new one, so two sends come back as one result and any such counter
+        // never drains. It pinned two conversations "in progress" for over an hour. A mid-turn
+        // message surviving the idle announcement is the CLIENT's job (see trailingUnsent), because
+        // only the client knows what it has not seen echoed back yet.
+        this.busy = false;
         tlog("done", { conv: this.id, subtype: anyM.subtype, ms: anyM.duration_ms || 0, listeners: this.subs.size });
         this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
         const u = anyM.usage || {};
