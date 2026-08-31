@@ -11,7 +11,7 @@ import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard } from "./agents";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
-import { ConnectionsButton } from "./connections";
+import { ConnectionsModal } from "./connections";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -1064,6 +1064,7 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [connOpen, setConnOpen] = useState(false); // Connections: MCP servers, skills, memory, network
   // null = still checking, so the row shows a neutral state instead of flashing "off" then "on".
   const [pushOn, setPushOn] = useState<boolean | null>(null);
   const [pushBusy, setPushBusy] = useState(false);
@@ -1258,9 +1259,14 @@ function App() {
   // Mark a conversation read. Store the conversation's OWN mtime (the NAS file clock, same source the
   // unread check compares against) — NOT Date.now(), whose phone clock can lag the NAS and leave the
   // dot stuck "unread" forever. max() so a stale local mtime never lowers the marker.
-  const markRead = useCallback((id: string | null) => {
+  // `list` lets a caller pass the CURRENT convs. Without it this read convsRef, which is synced by
+  // an effect declared BELOW the read-marking effect — so on a convs update markRead ran first and
+  // always saw the PREVIOUS list. After a turn finished, refreshConvs brought the new mtime, this
+  // marked read against the old one, and the conversation you were sat in looked unread the moment
+  // you navigated away, clearing only when you came back.
+  const markRead = useCallback((id: string | null, list?: Conv[]) => {
     if (!id || id.startsWith("pending-")) return;
-    const conv = convsRef.current.find((c) => c.sessionId === id);
+    const conv = (list ?? convsRef.current).find((c) => c.sessionId === id);
     const mark = conv ? Math.max(conv.mtime, lastReadRef.current[id] || 0) : (lastReadRef.current[id] || Date.now());
     lastReadRef.current[id] = mark; saveLastRead(lastReadRef.current); setReadTick((t) => t + 1);
   }, []);
@@ -1402,7 +1408,7 @@ function App() {
   // Mark the open conversation read on open and whenever its turn finishes (busy flips off).
   // Re-mark on convs updates too: after a turn finishes, refreshConvs bumps the active conversation's
   // mtime a beat later — without this, switching away right then would show it falsely unread.
-  useEffect(() => { if (activeId && !busy) markRead(activeId); }, [activeId, busy, convs, markRead]);
+  useEffect(() => { if (activeId && !busy) markRead(activeId, convs); }, [activeId, busy, convs, markRead]);
   useEffect(() => { itemsRef.current = items; }, [items]); // for the context estimate
   // Persist the composer draft under the current conversation as it changes (so a switch or reload keeps
   // it). activeIdRef holds the live conversation id; a new chat saves under the "__new__" key.
@@ -2287,13 +2293,16 @@ function App() {
         </div>
       )}
       <div className="scrim" onClick={() => setDrawer(false)} />
+      <ConnectionsModal open={connOpen} onClose={() => setConnOpen(false)} activeId={activeId} />
       <aside className="sidebar">
         <div className="sb-head">
           <span className="brand">Claude</span>
           <button className="sb-gear" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
           </button>
-          <ConnectionsButton activeId={activeId} />
+          <button className="sb-gear" onClick={() => setConnOpen(true)} aria-label="Connections" title="Connections (MCP servers, skills, memory, network)">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="2.6" /><circle cx="5" cy="5" r="2" /><circle cx="19" cy="5" r="2" /><circle cx="12" cy="20" r="2" /><path d="M10.2 10.2 6.4 6.4M13.8 10.2l3.8-3.8M12 14.6V18" /></svg>
+          </button>
         </div>
         <button className="new-chat" onClick={newChat}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
@@ -2432,7 +2441,7 @@ function App() {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 12.5l-8.5 8.5a5 5 0 01-7-7L14 5.5a3.3 3.3 0 014.7 4.7l-9.2 9.2a1.6 1.6 0 01-2.3-2.3l8.5-8.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
                 <input type="file" multiple style={{ display: "none" }} onChange={onFile} />
               </label>
-              <button className="act-btn" onClick={() => setSettingsOpen(true)} title="Tools & context (MCP servers, memory, skills)">
+              <button className="act-btn" onClick={() => setConnOpen(true)} title="Connections — MCP servers, skills, memory, network">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M9 7V4a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v3M15 7V4a1 1 0 0 0-1-1M7 7h10l-.6 9a3 3 0 0 1-3 2.8H10.6a3 3 0 0 1-3-2.8L7 7z" /><path d="M12 18v3" /></svg>
               </button>
               <div className="spacer" />
