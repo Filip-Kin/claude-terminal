@@ -9,7 +9,7 @@ import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
-import { isAgentTool, AgentToolCard, liveAgents, AgentStatusStrip } from "./agents";
+import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { ConnectionsModal } from "./connections";
 
@@ -1050,6 +1050,14 @@ function groupLabel(mtime: number): string {
 // How many trailing blocks the thread mounts at first, and how many more each scroll-up adds.
 const VIS_STEP = 60;
 
+// The spawned-work viewer renders a subagent's transcript with the same applyEvent fold and
+// MessageBlock the main thread uses. Registered rather than imported because both live in this file;
+// a second copy of applyEvent would drift the moment either changed.
+registerTranscriptRenderer({
+  fold: (events) => (events as AppEvent[]).reduce((a, e) => applyEvent(a, e), [] as Item[]),
+  Block: ({ items, i, convId }) => <MessageBlock items={items as Item[]} i={i} convId={convId} onAnswer={() => {}} />,
+});
+
 function App() {
   const [models, setModels] = useState<Model[]>([]);
   const [moreModels, setMoreModels] = useState<Model[]>([]);
@@ -1069,9 +1077,6 @@ function App() {
   const activeId = activeStore?.id ?? null;
   const busy = activeStore?.busy ?? false;
   const todos = useMemo(() => latestTodos(items), [items]); // current task checklist (latest TodoWrite), pinned above the composer
-  // Running subagents, pinned in the same slot. The inline Task card scrolls away on a long turn, so
-  // without this there was no way to see what the agents were doing without hunting up the thread.
-  const runningAgents = useMemo(() => liveAgents(items), [items]);
   const compacting = activeStore?.compacting ?? false;
   const [model, setModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
@@ -2462,7 +2467,7 @@ function App() {
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M6 13l6 6 6-6" /></svg>
             </button>
           )}
-          {runningAgents.length > 0 && <AgentStatusStrip agents={runningAgents} onJump={jumpToAgent} />}
+          <SpawnedWork items={items} sessionId={activeId} onJump={jumpToAgent} onOpenConversation={loadConv} />
           {todos && <TodoChecklist todos={todos} />}
           {editing && (
             <div className={"edit-banner" + (editError ? " error" : "")} role={editError ? "alert" : undefined}>
