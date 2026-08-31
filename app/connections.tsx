@@ -529,18 +529,18 @@ function injectConnCss() {
   const css = `
   .cx-scrim{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
   .cx-panel{position:relative;width:100%;max-width:620px;max-height:86vh;display:flex;flex-direction:column;background:var(--bg-2,#211c18);color:var(--text,#ece7e1);border:1px solid var(--line,#3a322c);border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.55);overflow:hidden}
-  .cx-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;font-size:15px;font-weight:600;border-bottom:1px solid var(--line-2,#2c2621)}
+  .cx-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;font-size:15px;font-weight:600;border-bottom:1px solid var(--line-2,#2c2621)}
   .cx-x{background:transparent;border:none;color:var(--text-3,#8a8078);font-size:22px;line-height:1;padding:0 4px}
   .cx-x:hover{color:var(--text,#ece7e1)}
   .cx-x:disabled{opacity:.35;cursor:default}
 
-  .cx-tabs{display:flex;gap:2px;padding:8px 10px;border-bottom:1px solid var(--line-2,#2c2621);overflow-x:auto;scrollbar-width:none}
+  .cx-tabs{flex:0 0 auto;display:flex;gap:2px;padding:8px 10px;border-bottom:1px solid var(--line-2,#2c2621);overflow-x:auto;scrollbar-width:none}
   .cx-tabs::-webkit-scrollbar{display:none}
   .cx-tab{flex:1 1 0;min-width:76px;min-height:42px;padding:10px 8px;border:none;border-radius:9px;background:transparent;color:var(--text-3,#8a8078);font-size:13.5px;font-weight:500;white-space:nowrap}
   .cx-tab:hover{color:var(--text,#ece7e1);background:var(--bg-3,#2a2420)}
   .cx-tab.cx-on{color:var(--text,#ece7e1);background:var(--bg-3,#2a2420);font-weight:600}
 
-  .cx-body{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:18px 18px 24px}
+  .cx-body{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:18px 18px 24px}
   .cx-note{margin:0 0 14px;font-size:12.5px;line-height:1.55;color:var(--text-3,#8a8078)}
 
   .cx-tun{border:1px solid var(--line-2,#2c2621);border-radius:11px;padding:12px 14px;margin:0 0 10px;background:var(--bg,#1a1613)}
