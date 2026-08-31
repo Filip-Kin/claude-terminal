@@ -590,11 +590,36 @@ class ConvStore {
     // an earlier turn would otherwise keep discarding the transcript while a later turn runs.
     { const cut = Date.now() - ECHO_TTL; this.pendingEcho = this.pendingEcho.filter((p) => p.at > cut); }
     const localAhead = this.pendingEcho.length > 0 || (this.busy && this.items.length >= items.length);
-    if (!localAhead) { this.items = items; this.cachedItems = items; }
+    if (!localAhead) {
+      // Carry over any turn of ours the transcript hasn't got yet (see trailingUnsent) instead of
+      // replacing it away. Empty in the normal case, so this is the same wholesale replace it was.
+      const unsent = this.trailingUnsent(items);
+      const merged = unsent.length ? [...items, ...unsent] : items;
+      this.items = merged; this.cachedItems = merged;
+    }
     // Trust the server's busy on a fresh reconcile so a stale cached busy clears (otherwise a finished
     // turn keeps the Stop button up). Stay busy only while we hold an unacknowledged optimistic send.
     this.busy = this.pendingEcho.length > 0 ? true : meta.busy;
     this.signal();
+  }
+
+  // Turns at the END of our list that the server transcript doesn't have. A message sent while a turn
+  // is already streaming sits in the runner's input queue, and only reaches the transcript when the
+  // SDK actually starts it — which can be minutes later. In that window the transcript is genuinely
+  // missing a turn we know about, so a full replace deletes the bubble while the agent is about to
+  // answer it: the message vanishes and the reply appears with nothing above it. Text comparison uses
+  // sanitizeUserText, so voice decoration and image tags don't cause a false miss (= a duplicate).
+  private trailingUnsent(server: Item[]): Item[] {
+    const seen = new Set<string>();
+    for (const it of server) if (it.kind === "user") seen.add(sanitizeUserText(it.text));
+    const out: Item[] = [];
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const it = this.items[i];
+      if (it.kind !== "user") break;                    // only a contiguous tail of user turns
+      if (seen.has(sanitizeUserText(it.text))) break;   // committed, and so is everything before it
+      out.unshift(it);
+    }
+    return out;
   }
 
   // ---- cache (tail-diff, ≤1/s, event-driven) ----
