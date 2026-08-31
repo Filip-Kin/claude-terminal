@@ -210,7 +210,7 @@ const reduceMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matche
 
 function countUp(el, to){
   const from = Number(el.dataset.v || 0); el.dataset.v = to;
-  if(reduceMotion()){ el.textContent = fmt(to); return; }
+  if(from === to || reduceMotion()){ el.textContent = fmt(to); return; }
   const dur = 900, t0 = performance.now();
   function step(t){ const p=Math.min(1,(t-t0)/dur); const e=1-Math.pow(1-p,3);
     el.textContent = fmt(from + (to-from)*e); if(p<1) requestAnimationFrame(step); }
@@ -377,15 +377,18 @@ function build(d){
 }
 
 function refresh(d){
+  // Periodic refresh: update data in place with animation OFF. Re-tweening every chart on each 30s
+  // poll / live tick is pure CPU/GPU churn that piles up when the board is left open. The one-time
+  // entrance animation still runs in build().
   d.users.forEach(u => {
-    if(sparks[u.user]) sparks[u.user].updateSeries([{name:"output", data:sparkData(d,u)}]);
+    if(sparks[u.user]) sparks[u.user].updateSeries([{name:"output", data:sparkData(d,u)}], false);
     const vals = { mo:u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total };
     for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
   });
   populateMonths(d);
   renderSplit(d, document.getElementById("monthSel").value);
-  if(monthlyChart) monthlyChart.updateSeries(monthlySeries(d));
-  if(mainChart) mainChart.updateSeries(mainSeries(d));
+  if(monthlyChart) monthlyChart.updateSeries(monthlySeries(d), false);
+  if(mainChart) mainChart.updateSeries(mainSeries(d), false);
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
 }
 
@@ -443,13 +446,32 @@ async function load(first){
   }
 }
 
+// #region live-update lifecycle — shared by the token board and the cost section below.
+// A left-open dashboard used to hold two EventSources + two 30s polls open forever and re-animate
+// every chart on each tick, which pins CPU/GPU and makes the browser flag the tab. Now each feed is
+// torn down while the tab is hidden and reconnected (with one immediate refresh) when it returns.
+const feeds = [];
+function registerFeed(loadFn){
+  const feed = { es:null, timer:null, load:loadFn };
+  feed.connect = () => {
+    if(document.hidden) return;
+    if(!feed.timer) feed.timer = setInterval(()=>{ if(!document.hidden) loadFn(false); }, 30000);
+    if(!feed.es){ try { const es = new EventSource("stream"); es.onmessage = () => { if(!document.hidden) loadFn(false); }; feed.es = es; } catch(e){} }
+  };
+  feed.disconnect = () => {
+    if(feed.timer){ clearInterval(feed.timer); feed.timer = null; }
+    if(feed.es){ try { feed.es.close(); } catch(e){} feed.es = null; }
+  };
+  feeds.push(feed); feed.connect(); return feed;
+}
+document.addEventListener("visibilitychange", () => {
+  if(document.hidden) feeds.forEach(f => f.disconnect());
+  else feeds.forEach(f => { f.connect(); f.load(false); });   // catch up on what we missed while hidden
+});
+// #endregion
+
 load(true);
-setInterval(()=>load(false), 30000);        // fallback poll
-// Live push: the server emits an SSE tick whenever the collector updates usage.db.
-try {
-  const es = new EventSource("stream");
-  es.onmessage = () => load(false);
-} catch (e) { /* SSE unsupported -> the poll above still keeps it fresh */ }
+registerFeed(load);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", ()=>load(true));
 </script>
 
@@ -541,8 +563,7 @@ async function loadCost(){
 }
 
 loadCost();
-setInterval(loadCost, 30000);
-try { const esc = new EventSource("stream"); esc.onmessage = () => loadCost(); } catch(e){}
+registerFeed(loadCost);   // shares the hidden-tab pause + reconnect logic defined above
 // #endregion
 </script>
 </body>

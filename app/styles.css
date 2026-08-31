@@ -339,6 +339,7 @@ a { color: var(--accent-2); }
   transition: border-color .15s;
 }
 .composer:focus-within { border-color: #55493f; }
+.composer.drag-over { border-color: var(--accent, #7C3AED); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #7C3AED) 22%, transparent); }
 .attach-row { display: flex; flex-wrap: wrap; gap: 6px; }
 /* Edit-and-rerun banner above the composer: signals the next send rewinds instead of appending. */
 .edit-banner {
