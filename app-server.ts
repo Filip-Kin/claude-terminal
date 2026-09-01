@@ -211,10 +211,25 @@ const shortCid = (c: unknown) => (typeof c === "string" && c ? c.slice(0, 8) : "
 // #endregion
 
 // #region SSE
+// Bound every stream's lifetime. A browser that goes away without closing cleanly leaves a
+// subscriber that never gets cancel(), and the keepalive enqueue does NOT throw on a dead socket, so
+// nothing detects it. Bun's 10s default idleTimeout used to reap those by accident; raising it to
+// stop the reconnect churn removed the only reaper, and one night produced 409 stream opens against
+// 275 closes, one conversation up to 116 listeners (every event written 116 times) and conversations
+// that were never reaped because hasSubscribers() never went false. Closing on a timer bounds a leak
+// to one cycle: EventSource reconnects by itself after `retry`, and subscribeSince() hands back the
+// gap, which is exactly the resume path any dropped connection already uses.
+const MAX_STREAM_MS = 10 * 60_000;
+
 function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Request, fromNow = false): Response {
   let unsub = () => {};
   let ping: ReturnType<typeof setInterval> | null = null;
-  const cleanup = () => { if (ping) { clearInterval(ping); ping = null; } unsub(); unsub = () => {}; };
+  let life: ReturnType<typeof setTimeout> | null = null;
+  const cleanup = () => {
+    if (ping) { clearInterval(ping); ping = null; }
+    if (life) { clearTimeout(life); life = null; }
+    unsub(); unsub = () => {};
+  };
   // EventSource replays its own last id on an automatic reconnect. The URL can't change between
   // retries, so a `tail=1` stream used to come back asking for future events only and silently drop
   // everything emitted while the socket was down. With the id echoed on every event we can hand back
@@ -236,6 +251,11 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
       // Keepalive ping. If the client is gone the enqueue throws (caught); when it does, tear the whole
       // stream down so neither the interval nor the subscriber outlives the connection (was a leak).
       ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch { cleanup(); } }, 20_000);
+      // Bun aborts the request signal when it does notice the client is gone. cancel() covers the
+      // clean case; this covers the ones it misses, and costs nothing when both fire.
+      try { req.signal.addEventListener("abort", () => { cleanup(); try { controller.close(); } catch {} }, { once: true }); } catch { /* no signal on this runtime */ }
+      // Retire the stream on schedule so a socket we cannot prove is dead cannot leak forever.
+      life = setTimeout(() => { cleanup(); try { controller.close(); } catch {} }, MAX_STREAM_MS);
     },
     cancel() { tlog("stream-close", { conv: conv.id, busy: conv.busy ? 1 : 0 }); cleanup(); },
   });

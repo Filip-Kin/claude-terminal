@@ -379,6 +379,17 @@ export type PendingAsk = { askId: string; question: string; options: { label: st
 // and the turn was silently abandoned: no notice, no auto-resume. Recognise it and treat it as the
 // rejection it is.
 const SESSION_LIMIT_RE = /hit your (?:session|usage) limit/i;
+// The CLI's own terminal failure text for a turn the API refused ("API Error: 529 Overloaded",
+// "API Error: Connection lost mid-response"). Also delivered as a synthetic assistant message, so
+// without this it read as something Claude chose to say.
+const API_ERROR_RE = /^API Error:/i;
+// One line for a retried API failure. The SDK reports every attempt as a system/api_error message
+// with a `formatted` summary; `attempt` lets a long outage say so without repeating itself.
+function apiErrorNotice(err: any, attempt: number): string {
+  const raw = String(err?.formatted || err?.message || "").replace(/\s+/g, " ").slice(0, 160).trim();
+  const what = raw || "an error";
+  return attempt <= 1 ? `Anthropic's API returned ${what}. Retrying.` : `Still retrying: ${attempt} API errors so far (${what}).`;
+}
 // The clock time out of that sentence, as a fallback for when no structured resetsAt arrived. The
 // message states its own zone, which on this box is the server's zone, so a local-time reading is
 // correct here; a wrong guess only shifts the displayed time, since armResume re-checks at wake-up.
@@ -413,6 +424,7 @@ export class Conversation {
   private queue: SDKUserMessage[] = [];
   private waiter?: (v: SDKUserMessage | null) => void;
   private lastTurnAt = 0; // wall clock of the previous turn, for the turn-context stamp below
+  private apiErrors = 0; // retried API failures in the CURRENT turn (reset at each result)
   private closed = false;
   private subs = new Set<Sub>();
   private hooks = new Set<Sub>(); // internal lifecycle listeners (init/closed bookkeeping); do NOT count as client subscribers, or the idle reaper never fires
@@ -779,6 +791,14 @@ export class Conversation {
     switch (m.type) {
       case "system":
         if (anyM.subtype === "init") { this.inited = true; this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd }); }
+        // The SDK retries an overloaded or erroring API with widening backoff and reports each
+        // attempt here. Nothing surfaced them, so a three-minute retry storm looked like a chat that
+        // had simply stopped: ten 529s on one turn, three minutes of a bare typing indicator, then a
+        // terminal "API Error: 529 Overloaded". Report the first, then every fifth.
+        else if (anyM.subtype === "api_error") {
+          this.apiErrors++;
+          if (this.apiErrors === 1 || this.apiErrors % 5 === 0) this.emit({ t: "notice", kind: "info", text: apiErrorNotice(anyM.error, this.apiErrors) });
+        }
         else if (anyM.subtype === "compact_boundary") {
           const md = compactMeta(anyM);
           this.emit({ t: "compacting", active: false });
@@ -842,6 +862,14 @@ export class Conversation {
             }
             break; // armRateLimitedResume() emits the notice when the turn ends
           }
+          // Any other synthetic text is a report ABOUT the turn, not part of the reply. It never
+          // streams as deltas, so the live path dropped it and the chat showed nothing at all until
+          // a reload replayed the transcript. Surface it now: failures as a notice, the rest as text.
+          if (t.trim()) {
+            if (API_ERROR_RE.test(t.trim())) this.emit({ t: "notice", kind: "info", text: t.trim() });
+            else this.emit({ t: "text", text: t });
+            break;
+          }
         }
         // text + thinking are streamed above via stream_event; from the aggregated
         // message we only need tool_use (its input is complete here).
@@ -881,6 +909,7 @@ export class Conversation {
         // message surviving the idle announcement is the CLIENT's job (see trailingUnsent), because
         // only the client knows what it has not seen echoed back yet.
         this.busy = false;
+        this.apiErrors = 0; // per-turn counter
         tlog("done", { conv: this.id, subtype: anyM.subtype, ms: anyM.duration_ms || 0, listeners: this.subs.size });
         this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
         const u = anyM.usage || {};
@@ -1030,7 +1059,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
   // reports the run-total (modelUsage delta); on replay we sum output/thinking across the turn and
   // take context from the last response. Reset at each user/compact boundary. turnStartTs powers a
   // real "Worked for" from transcript timestamps (live has duration_ms; replay doesn't).
-  let turnOut = 0, turnThink = 0, turnStartTs = 0;
+  let turnOut = 0, turnThink = 0, turnStartTs = 0, apiErrors = 0;
   let text: string;
   try { text = await Bun.file(path).text(); } catch { return out; }
   for (const line of text.split("\n")) {
@@ -1059,7 +1088,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
       else if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
-        turnOut = 0; turnThink = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
+        turnOut = 0; turnThink = 0; apiErrors = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
         out.push({ t: "user", text: txt });
       }
     } else if (o.type === "assistant" && msg) {
@@ -1073,6 +1102,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
           out.push({ t: "notice", kind: "info", text: limitNoticeText(at) });
           continue;
         }
+        if (API_ERROR_RE.test(t.trim())) { out.push({ t: "notice", kind: "info", text: t.trim() }); continue; }
       }
       const blocks = (msg.content as any[]) || [];
       for (const b of blocks) {
@@ -1100,6 +1130,9 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         // output/thinking = cumulative turn totals so the footer matches what was shown live.
         out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output: turnOut, thinking: turnThink, cacheCreate, cacheRead, context, total: context + turnOut, costUsd: 0, durationMs } });
       }
+    } else if (o.type === "system" && o.subtype === "api_error") {
+      apiErrors++;
+      if (apiErrors === 1 || apiErrors % 5 === 0) out.push({ t: "notice", kind: "info", text: apiErrorNotice(o.error, apiErrors) });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       turnOut = 0; turnThink = 0; turnStartTs = 0; // compaction is a fresh turn boundary
       const md = compactMeta(o); // transcript spells it compactMetadata/camelCase, the live SDK compact_metadata/snake_case
