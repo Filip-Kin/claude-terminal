@@ -1219,7 +1219,10 @@ function App() {
   // Stall-watchdog attempts for the active conversation, so a resync that can't clear the condition
   // gives up instead of reopening the stream on a loop. `settled` = we've already forced it idle.
   const resyncRef = useRef<{ id: string; n: number; settled: boolean }>({ id: "", n: 0, settled: false });
-  const compactQueue = useRef<string[]>([]); // messages typed DURING compaction, sent once it finishes
+  // Messages typed DURING a compaction, each bound to the conversation it was typed in. It used to
+  // hold bare strings and the flush sent them to whatever conversation happened to be ON SCREEN, so
+  // switching tabs while a compaction finished delivered your message to the wrong chat, silently.
+  const compactQueue = useRef<{ store: ConvStore; text: string }[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const newChatRef = useRef<(() => void) | null>(null); // lets earlier callbacks reset to a blank chat
   const taRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1340,7 +1343,7 @@ function App() {
     // conversation). At 45s this fired MID-compaction: the banner vanished, the ring refreshed against
     // pre-compaction numbers, and the messages held for the divider were released above it — which is
     // what made the "Compacted" card look like it only turned up after the next message.
-    setTimeout(() => { s.endCompactFallback(); refreshContext(s.id); flushCompactRef.current(); }, 300000);
+    setTimeout(() => { s.endCompactFallback(); refreshContext(s.id); flushCompactRef.current(s); }, 300000);
   }, [refreshContext]);
   // Which conversations have an offline message queued (resume target) — drives the queued indicator
   // on EXISTING conversations, not just brand-new offline chats.
@@ -1533,7 +1536,7 @@ function App() {
     window.addEventListener("pagehide", flushNow);
     return () => { document.removeEventListener("visibilitychange", flush); window.removeEventListener("pagehide", flushNow); };
   }, []);
-  const flushCompactRef = useRef<() => void>(() => {}); // assigned once the stores/hooks are wired
+  const flushCompactRef = useRef<(target?: ConvStore) => void>(() => {}); // assigned once the stores/hooks are wired
 
   // PWA update check: poll the server build id; if it changed since load, offer a reload.
   // Content-hashed assets + no-store index mean the reload gets everything fresh.
@@ -1713,12 +1716,14 @@ function App() {
       },
       onResult: () => setTimeout(refreshConvs, 500),
       onEvent: (store, e) => {
+        // Release messages typed during THIS store's compaction, before the active-store guard below:
+        // a conversation you have switched away from still has to deliver its own held messages.
+        // Deferred a microtask because onEvent runs BEFORE ingest applies the compact card, so the
+        // released turns render after the divider rather than above it.
+        if (e.t === "compact") queueMicrotask(() => flushCompactRef.current(store));
         if (store !== activeStoreRef.current) return;
         lastEventAt.current = Date.now(); // stall watchdog: the active stream is alive
         for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode
-        // Release messages typed during compaction. Deferred a microtask because onEvent runs BEFORE
-        // ingest applies the compact card — this way the queued turns render AFTER the divider.
-        if (e.t === "compact") queueMicrotask(() => flushCompactRef.current());
       },
       onContext: (store) => { if (store === activeStoreRef.current) refreshContext(store.id); },
     };
@@ -1759,14 +1764,16 @@ function App() {
   }, []);
   useEffect(() => () => manager.closeAll(), []); // close every socket on unmount
 
-  // Messages typed DURING a compaction are held (text only, no optimistic render), then rendered +
-  // sent once compaction finishes — the compact event fires onEvent -> here (deferred a microtask so
-  // the compact card is already in items, landing these turns BELOW the divider instead of above it).
-  flushCompactRef.current = () => {
-    const q = compactQueue.current; compactQueue.current = [];
-    const s = activeStoreRef.current; if (!q.length || !s) return;
+  // Messages typed DURING a compaction are held (no optimistic render), then rendered + sent once
+  // that conversation's compaction finishes, so they land BELOW the divider instead of above it.
+  // `target` scopes the flush to one conversation: each message goes back to the store it was typed
+  // in, never to whichever chat is on screen when the compaction happens to end.
+  flushCompactRef.current = (target?: ConvStore) => {
+    const take = compactQueue.current.filter((it) => !target || it.store === target);
+    if (!take.length) return;
+    compactQueue.current = compactQueue.current.filter((it) => !take.includes(it));
     void (async () => {
-      for (const text of q) {
+      for (const { store: s, text } of take) {
         s.addOptimisticUser(text); // now renders below the compaction divider (card already applied)
         const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
         const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
@@ -1980,7 +1987,7 @@ function App() {
     if (isNewChat) { s = manager.ensure("new-" + Date.now().toString(36) + Math.floor(performance.now())); setActiveStore(s); activeStoreRef.current = s; }
     // During compaction, hold the message ENTIRELY (no optimistic render yet). flushCompact renders +
     // sends it once the compact card is in place, so it lands BELOW the compaction divider, not above.
-    if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push(text); return s!.id; }
+    if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push({ store: s!, text }); return s!.id; }
     s!.addOptimisticUser(text); // renders the turn, flips busy, sets sendState "sending"
     // Stable client id so a redelivery (offline queue OR a timeout requeue) is deduped server-side
     // instead of posting the same turn twice.
