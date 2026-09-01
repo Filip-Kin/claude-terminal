@@ -253,9 +253,13 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
       ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch { cleanup(); } }, 20_000);
       // Bun aborts the request signal when it does notice the client is gone. cancel() covers the
       // clean case; this covers the ones it misses, and costs nothing when both fire.
-      try { req.signal.addEventListener("abort", () => { cleanup(); try { controller.close(); } catch {} }, { once: true }); } catch { /* no signal on this runtime */ }
+      // Both of these close the controller themselves, so cancel() never runs and would not log the
+      // close. Log it here or the open/close counter goes blind, which is the metric this whole
+      // problem was found with.
+      const shut = (why: string) => { tlog("stream-close", { conv: conv.id, why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
+      try { req.signal.addEventListener("abort", () => shut("abort"), { once: true }); } catch { /* no signal on this runtime */ }
       // Retire the stream on schedule so a socket we cannot prove is dead cannot leak forever.
-      life = setTimeout(() => { cleanup(); try { controller.close(); } catch {} }, MAX_STREAM_MS);
+      life = setTimeout(() => shut("expired"), MAX_STREAM_MS);
     },
     cancel() { tlog("stream-close", { conv: conv.id, busy: conv.busy ? 1 : 0 }); cleanup(); },
   });

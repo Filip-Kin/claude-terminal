@@ -1062,10 +1062,40 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
   let turnOut = 0, turnThink = 0, turnStartTs = 0, apiErrors = 0;
   let text: string;
   try { text = await Bun.file(path).text(); } catch { return out; }
+  // The CLI does not append in time order. A batch of retried api_error records is written AFTER the
+  // assistant message reporting the eventual failure, so file order replayed "API Error: 529
+  // Overloaded" ABOVE the retries that led to it. Pull only those rows out and merge them back by
+  // timestamp. A general sort is NOT safe here: measured over the real transcripts, seven rendered
+  // records sit more than five seconds out of place and all of them are `user` rows, two by 26 and
+  // 14 hours, so sorting would relocate whole turns to the top of the thread. Nothing else moves.
+  const rows: any[] = [];
+  const retries: { o: any; ts: number }[] = [];
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     let o: any;
     try { o = JSON.parse(line); } catch { continue; }
+    if (o.type === "system" && o.subtype === "api_error") {
+      const t = o.timestamp ? Date.parse(o.timestamp) : NaN;
+      retries.push({ o, ts: isFinite(t) ? t : -Infinity });
+      continue;
+    }
+    rows.push(o);
+  }
+  retries.sort((a, b) => a.ts - b.ts);
+  let ri = 0, seenTs = -Infinity;
+  const flushRetries = (until: number) => {
+    while (ri < retries.length && retries[ri].ts <= until) {
+      apiErrors++;
+      if (apiErrors === 1 || apiErrors % 5 === 0) out.push({ t: "notice", kind: "info", text: apiErrorNotice(retries[ri].o.error, apiErrors) });
+      ri++;
+    }
+  };
+  for (const o of rows) {
+    // Carry the last known time forward: plenty of rows (attachments, snapshots, latches) have no
+    // timestamp at all, and treating those as "now" flushed every later turn's retries into this one.
+    const rowTs = o.timestamp ? Date.parse(o.timestamp) : NaN;
+    if (isFinite(rowTs)) seenTs = rowTs;
+    flushRetries(seenTs); // everything that failed before this record
     const msg = o.message;
     if (o.type === "user" && msg) {
       // The compaction summary is a synthesized user message (isCompactSummary) carrying the whole
@@ -1130,15 +1160,13 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         // output/thinking = cumulative turn totals so the footer matches what was shown live.
         out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output: turnOut, thinking: turnThink, cacheCreate, cacheRead, context, total: context + turnOut, costUsd: 0, durationMs } });
       }
-    } else if (o.type === "system" && o.subtype === "api_error") {
-      apiErrors++;
-      if (apiErrors === 1 || apiErrors % 5 === 0) out.push({ t: "notice", kind: "info", text: apiErrorNotice(o.error, apiErrors) });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       turnOut = 0; turnThink = 0; turnStartTs = 0; // compaction is a fresh turn boundary
       const md = compactMeta(o); // transcript spells it compactMetadata/camelCase, the live SDK compact_metadata/snake_case
       out.push({ t: "compact", trigger: md.trigger, preTokens: md.preTokens, postTokens: md.postTokens, durationMs: md.durationMs });
     }
   }
+  flushRetries(Infinity); // a turn still retrying when the transcript ends has no later record to sit before
   return out;
 }
 
