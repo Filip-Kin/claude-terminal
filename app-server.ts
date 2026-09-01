@@ -234,8 +234,21 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
   // retries, so a `tail=1` stream used to come back asking for future events only and silently drop
   // everything emitted while the socket was down. With the id echoed on every event we can hand back
   // exactly the gap instead. The client already ignores any _seq it has seen, so this can't duplicate.
+  // Where to resume from, in order of trust: the browser's own Last-Event-ID (an automatic retry of
+  // the same socket), then the client's `since` cursor IF it belongs to this log's epoch. A fresh
+  // EventSource sends no Last-Event-ID, which is why a deliberate reconnect used to lose every event
+  // emitted while the socket was down: the client knew its cursor and never sent it. A cursor from a
+  // different epoch means the runner restarted; the client is told to reload rather than fold a tail
+  // onto history that this log never saw.
+  const url = new URL(req.url);
   const lastIdRaw = parseInt(req.headers.get("last-event-id") || "", 10);
-  const resumeFrom = Number.isInteger(lastIdRaw) && lastIdRaw >= 0 ? lastIdRaw : null;
+  const sinceRaw = parseInt(url.searchParams.get("since") || "", 10);
+  const epochParam = url.searchParams.get("epoch") || "";
+  const sameEpoch = epochParam === conv.epoch;
+  const resync = !!epochParam && !sameEpoch;
+  const resumeFrom = Number.isInteger(lastIdRaw) && lastIdRaw >= 0 ? lastIdRaw
+    : sameEpoch && Number.isInteger(sinceRaw) && sinceRaw >= -1 ? sinceRaw
+    : null;
   const stream = new ReadableStream({
     start(controller) {
       const enc2 = new TextEncoder();
@@ -245,12 +258,18 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
         try { controller.enqueue(enc2.encode(`${id}data: ${JSON.stringify(e)}\n\n`)); } catch {}
       };
       controller.enqueue(enc2.encode(`retry: 3000\n\n`));
-      tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, busy: conv.busy ? 1 : 0 });
-      // replays the gap (resume), this run's buffer (fromNow=false), or nothing — then live
-      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom) : conv.subscribe(write, fromNow);
-      // Keepalive ping. If the client is gone the enqueue throws (caught); when it does, tear the whole
-      // stream down so neither the interval nor the subscriber outlives the connection (was a leak).
-      ping = setInterval(() => { try { controller.enqueue(enc2.encode(`: ping\n\n`)); } catch { cleanup(); } }, 20_000);
+      // First frame: which log this is and its current cursor, so the client can resume exactly next
+      // time, and whether its cursor was stale. Not logged, no _seq.
+      write({ t: "hello", epoch: conv.epoch, seq: conv.seq, resync });
+      write(conv.statusEvent()); // current phase straight away, not whenever it next changes
+      tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, epoch: epochParam ? (sameEpoch ? "same" : "stale") : undefined, busy: conv.busy ? 1 : 0 });
+      // replays the gap (resume), this run's buffer (fromNow=false), or nothing — then live. A stale
+      // epoch streams future-only: the client is about to reload the whole thing anyway.
+      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom) : conv.subscribe(write, fromNow || resync);
+      // Heartbeat as a DATA frame. It used to be an SSE comment, which EventSource never surfaces to
+      // JavaScript, so the client could not tell a quiet stream from a dead one and guessed with a
+      // timer. If the client is gone the enqueue throws (caught) and the stream is torn down.
+      ping = setInterval(() => { try { controller.enqueue(enc2.encode(`data: {"t":"hb"}\n\n`)); } catch { cleanup(); } }, 15_000);
       // Bun aborts the request signal when it does notice the client is gone. cancel() covers the
       // clean case; this covers the ones it misses, and costs nothing when both fire.
       // Both of these close the controller themselves, so cancel() never runs and would not log the
@@ -671,7 +690,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // the whole transcript would cost hundreds of KB on exactly the link we are trying to protect.
     // This costs about 20 bytes instead.
     if (new URL(req.url).searchParams.get("meta") === "1") {
-      return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.title, evTotal: events.length, live: !!live, busy: !!live?.busy }, ctx, req);
+      return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.title, evTotal: events.length, live: !!live, busy: !!live?.busy, epoch: live?.epoch ?? null, seq: live?.seq ?? -1 }, ctx, req);
     }
     const sinceRaw = new URL(req.url).searchParams.get("since");
     const since = sinceRaw == null ? -1 : parseInt(sinceRaw, 10);
@@ -681,6 +700,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       events: delta ? events.slice(since) : events,
       delta, evTotal: events.length,
       live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [],
+      epoch: live?.epoch ?? null, seq: live?.seq ?? -1, phase: live?.phase ?? "idle", model: live?.model ?? null,
     }, ctx, req);
   }
 
@@ -699,12 +719,12 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const model: string | undefined = typeof b.model === "string" && b.model ? b.model : undefined;
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
-    if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.send(text); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
+    if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.send(text, typeof b.cid === "string" ? b.cid : undefined); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
     const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile });
     tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
-    void conv.run(text);
+    void conv.run(text, typeof b.cid === "string" ? b.cid : undefined);
     dedupRecord(b.cid, conv.id);
-    return jsonRes({ id: conv.id, cwd, model: model || null }, ctx, req);
+    return jsonRes({ id: conv.id, cwd, model: model || null, epoch: conv.epoch }, ctx, req);
   }
 
   // Follow-up turn into an already-open conversation.
@@ -716,7 +736,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
     if (dedupSeen(b.cid)) { tlog("dedup", { route: "send", conv: conv.id, cid: shortCid(b.cid) }); return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); } // redelivery -> ack, don't re-send
     tlog("accept", { route: "send", conv: conv.id, cid: shortCid(b.cid), chars: rawText.length });
-    conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText); // voice mode -> append the brief/TTS directive
+    conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText, typeof b.cid === "string" ? b.cid : undefined); // voice mode -> append the brief/TTS directive
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
   }

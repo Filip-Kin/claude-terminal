@@ -42,11 +42,11 @@ function compactMeta(o: any): { trigger: "manual" | "auto"; preTokens?: number; 
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string }
-  | { t: "text"; text: string }
-  | { t: "text_delta"; text: string } // streamed token (includePartialMessages)
-  | { t: "thinking"; text: string }
-  | { t: "thinking_delta"; text: string } // streamed thinking token (when content is exposed)
-  | { t: "thinking_progress"; tokens: number } // thinking is happening but text is redacted (subscription auth): show progress
+  | { t: "text"; text: string; bid?: string }
+  | { t: "text_delta"; text: string; bid?: string } // streamed token (includePartialMessages)
+  | { t: "thinking"; text: string; bid?: string }
+  | { t: "thinking_delta"; text: string; bid?: string } // streamed thinking token (when content is exposed)
+  | { t: "thinking_progress"; tokens: number; bid?: string } // thinking is happening but text is redacted (subscription auth): show progress
   | { t: "tool_use"; id: string; name: string; input: unknown }
   // A tool call has STARTED (content_block_start), emitted the moment the model begins writing
   // the call rather than when the aggregated message lands. tool_use above carries the complete
@@ -59,7 +59,7 @@ export type AppEvent =
   | { t: "compacting"; active: boolean } // compaction started/stopped (drives the progress banner, incl. auto-compaction)
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
-  | { t: "user"; text: string } // an echoed user turn (used by history replay)
+  | { t: "user"; text: string; cid?: string } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly
   // Real token accounting for the turn (from the SDK result message): output = tokens Claude
   // actually generated this turn (thinking + text + tool-call args); in/cacheRead = context read.
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage }
@@ -68,7 +68,27 @@ export type AppEvent =
   | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
   | { t: "busy"; busy: boolean }
   | { t: "error"; message: string }
-  | { t: "closed" };
+  | { t: "closed" }
+  // First frame on every SSE: which live log this is and how far it has got. A client that carries a
+  // cursor from a different epoch (the runner restarted) is told to reload rather than fold a stale
+  // tail. Never logged, no _seq.
+  | { t: "hello"; epoch: string; seq: number; resync: boolean }
+  // Liveness. The old keepalive was an SSE comment, and comments never reach JavaScript, so the client
+  // had no way to know a stream had died and guessed with a timer instead. A data frame it can see.
+  | { t: "hb" }
+  // What the runner is doing right now, from the SDK's own events: starting the subprocess, waiting on
+  // the API, thinking, writing, in a tool, retrying an API error, rate-limited, compacting, idle.
+  // One bit of `busy` could not answer "is it still thinking", this can.
+  | { t: "status"; phase: Phase; since: number; detail?: string }
+  // A content block finished streaming. Exact end of a thinking block, instead of "whenever the next
+  // unrelated event happens to land".
+  | { t: "block_end"; bid: string }
+  // Context window occupancy, from the usage the API reports on every assistant message. One source.
+  | { t: "context"; used: number; max?: number }
+  // The model this conversation runs on: at init, and whenever it is switched.
+  | { t: "model"; model: string };
+
+export type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
 // Per-run token usage (since the last idle). output = tokens generated across ALL models this run
 // (main loop + Task subagents, from modelUsage), so it isn't undercounted by tool/subagent work;
@@ -373,6 +393,20 @@ export interface ConvOpts {
 // Metadata for a still-open ask_user prompt, so a reconnecting client can re-render it.
 export type PendingAsk = { askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean };
 
+// What Claude Code injects as the user turn when it resumes a session whose last turn was cut off.
+// Its default is the bare "Continue from where you left off.", which after a service restart got the
+// model answering "No response requested." because nothing told it a turn had actually been
+// interrupted. CLAUDE_CODE_RESUME_PROMPT replaces it; this text says what happened and what to do.
+export const RESUME_PROMPT = [
+  "The service hosting this conversation restarted while you were in the middle of a turn.",
+  "Your previous turn was interrupted: any tool call that had not returned did not complete, and any background agents or workflows you had running were killed with it.",
+  "Read your last few messages to see what you were doing, then continue that work from where it stopped.",
+  "Do not reply \"No response requested\", do not ask whether to continue, and do not summarise what happened unless the work itself needs it.",
+].join(" ");
+// The injected turn is marked isMeta in the transcript. Render it as a notice, not as a message the
+// user never typed. Matches both our prompt and the CLI's default, for transcripts written before this.
+const RESUME_PROMPT_RE = /^(The service hosting this conversation restarted|Continue from where you left off)/;
+
 // An exhausted subscription does NOT always arrive as a rate_limit_event. The CLI also injects a
 // SYNTHETIC assistant message whose entire text is "You've hit your session limit · resets 2:30pm
 // (America/New_York)". Nothing recognised it, so that sentence was rendered as if Claude had said it
@@ -412,7 +446,17 @@ export class Conversation {
   id: string; // session id once known; a temp key beforehand
   cwd: string;
   model?: string;
-  busy = false;
+  // Identity of THIS in-memory log. A client resuming with `since` from a different epoch (this
+  // process restarted, or the conversation was reaped and recreated) gets told to reload instead of
+  // folding a tail that belongs to a different history.
+  readonly epoch = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  phase: Phase = "idle";
+  private phaseSince = 0;
+  private phaseDetail?: string;
+  get busy(): boolean { return this.phase !== "idle"; }
+  get seq(): number { return this.seqCounter - 1; } // highest _seq handed out so far (-1 = none)
+  private curMsgId = ""; // id of the assistant message being streamed: block ids are <msg>:<index>
+  private ctxMax = 0;    // context window for this model, fetched once after init
   lastActivity = Date.now();
   private resume?: string;
   private notifier?: AskNotifier;
@@ -506,6 +550,17 @@ export class Conversation {
     }
   }
 
+  // The one place busy/idle is decided. Emits only on change; `busy` still goes out alongside so
+  // nothing that reads the old boolean has to change on the same day.
+  setPhase(phase: Phase, detail?: string) {
+    if (phase === this.phase && detail === this.phaseDetail) return;
+    const wasBusy = this.busy;
+    this.phase = phase; this.phaseDetail = detail; this.phaseSince = Date.now();
+    this.emit({ t: "status", phase, since: this.phaseSince, ...(detail ? { detail } : {}) });
+    if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy });
+  }
+  statusEvent(): AppEvent { return { t: "status", phase: this.phase, since: this.phaseSince, ...(this.phaseDetail ? { detail: this.phaseDetail } : {}) }; }
+
   hasSubscribers(): boolean { return this.subs.size > 0; }
   // Monotonic "has anything happened" counter. The status coalescer polls it to decide whether a
   // conversation actually advanced since the last push, so a long-running turn that is quiet does not
@@ -533,17 +588,16 @@ export class Conversation {
     return `<turn-context>Local time is now ${stamp}. ${gap} Use these figures for anything time-related; do not estimate elapsed time any other way.</turn-context>`;
   }
 
-  send(text: string) {
+  send(text: string, cid?: string) {
     if (this.closed) return;
     this.lastActivity = Date.now();
-    this.busy = true;
     this.currentTurnText = text; // remember it so a subscription-limit rejection can re-run this turn
     // The user is actively driving this conversation, so any auto-resume we had queued for it is
     // no longer wanted (this counts as the "easy cancel" for the default-on behaviour).
     try { cancelResume(this.id); } catch { /* */ }
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
-    this.emit({ t: "user", text });
-    this.emit({ t: "busy", busy: true });
+    this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
+    this.setPhase(this.inited ? "waiting" : "starting");
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); }
     else this.queue.push(msg);
@@ -551,7 +605,8 @@ export class Conversation {
 
   async setModel(model: string) {
     this.model = model;
-    if (this.q) { try { await this.q.setModel(model); } catch (e: any) { this.emit({ t: "error", message: "setModel: " + (e?.message || e) }); } }
+    if (this.q) { try { await this.q.setModel(model); } catch (e: any) { this.emit({ t: "error", message: "setModel: " + (e?.message || e) }); return; } }
+    this.emit({ t: "model", model }); // every device watching this chat shows the switch, not just the one that made it
   }
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
@@ -697,13 +752,12 @@ export class Conversation {
     this.emit({ t: "closed" });
   }
 
-  private async *inputGen(first?: string): AsyncGenerator<SDKUserMessage> {
+  private async *inputGen(first?: string, cid?: string): AsyncGenerator<SDKUserMessage> {
     if (first !== undefined) {
-      this.busy = true;
       this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
       this.runStart = this.log.length; // first turn's replay boundary
-      this.emit({ t: "user", text: first });
-      this.emit({ t: "busy", busy: true });
+      this.emit({ t: "user", text: first, ...(cid ? { cid } : {}) });
+      this.setPhase("starting");
       yield { type: "user", message: { role: "user", content: first + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     }
     while (!this.closed) {
@@ -715,7 +769,7 @@ export class Conversation {
 
   // Start the SDK query. `first` is the opening user turn for a brand-new chat;
   // omit it when resuming (the client sends the next turn via send()).
-  async run(first?: string) {
+  async run(first?: string, cid?: string) {
     // A refork tears down the current query and starts a fresh one; each run() gets a generation
     // token so the OLD run's finally (fired when its query ends) knows it was superseded and stays
     // quiet — otherwise it would emit a spurious closed/busy:false that drops the client's stream.
@@ -730,9 +784,12 @@ export class Conversation {
     let stored: Record<string, McpServerConfig> = {};
     if (this.mcpFile) { try { stored = await mcpServersForQuery(this.mcpFile); } catch {} }
     this.q = query({
-      prompt: this.inputGen(first),
+      prompt: this.inputGen(first, cid),
       options: {
         cwd: this.cwd,
+        // Replace Claude Code's bare "Continue from where you left off." with a prompt that says a
+        // restart interrupted the turn and to pick the work back up (see RESUME_PROMPT).
+        env: { ...(process.env as Record<string, string>), CLAUDE_CODE_RESUME_PROMPT: RESUME_PROMPT },
         ...(this.model ? { model: this.model } : {}),
         ...(this.resume ? { resume: this.resume } : {}),
         ...forkOpts,
@@ -747,6 +804,7 @@ export class Conversation {
         mcpServers: { ...stored, "app-ui": this.askServer }, // ask_user + any managed MCP servers
       },
     });
+    if (first === undefined && !this.inited) this.setPhase("starting"); // a resume: the subprocess is coming up before any turn is queued
     try {
       for await (const m of this.q) this.handle(m);
     } catch (e: any) {
@@ -755,9 +813,8 @@ export class Conversation {
     } finally {
       // Superseded by a refork -> stay silent; the new run owns the stream now.
       if (myGen === this.runGen) {
-        this.busy = false;
+        this.setPhase("idle"); // emits busy:false itself if it was busy
         tlog("closed", { conv: this.id, listeners: this.subs.size });
-        this.emit({ t: "busy", busy: false });
         this.emit({ t: "closed" });
       }
     }
@@ -790,7 +847,16 @@ export class Conversation {
     if (anyM.session_id && anyM.session_id !== this.id) this.id = anyM.session_id;
     switch (m.type) {
       case "system":
-        if (anyM.subtype === "init") { this.inited = true; this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd }); }
+        if (anyM.subtype === "init") {
+          this.inited = true;
+          this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
+          if (anyM.model) { this.model = anyM.model; this.emit({ t: "model", model: anyM.model }); }
+          if (this.phase === "starting") this.setPhase("waiting");
+          // An MCP server that failed to connect is the classic silent pre-model stall. Say so.
+          for (const m of (anyM.mcp_servers as { name: string; status: string }[] | undefined) || []) if (m.status && m.status !== "connected") this.emit({ t: "notice", kind: "info", text: `MCP server "${m.name}" ${m.status}.` });
+          // The context window for this model, once. Every later context event carries it.
+          void this.contextUsage().then((cu) => { if (cu?.raw_max_tokens) { this.ctxMax = cu.raw_max_tokens; this.emit({ t: "context", used: cu.total_tokens || 0, max: this.ctxMax }); } });
+        }
         // The SDK retries an overloaded or erroring API with widening backoff and reports each
         // attempt here. Nothing surfaced them, so a three-minute retry storm looked like a chat that
         // had simply stopped: ten 529s on one turn, three minutes of a bare typing indicator, then a
@@ -798,11 +864,14 @@ export class Conversation {
         else if (anyM.subtype === "api_error") {
           this.apiErrors++;
           if (this.apiErrors === 1 || this.apiErrors % 5 === 0) this.emit({ t: "notice", kind: "info", text: apiErrorNotice(anyM.error, this.apiErrors) });
+          this.setPhase("retrying", `${this.apiErrors} \u00d7 ${String(anyM.error?.formatted || anyM.error?.message || "API error").slice(0, 60)}`);
         }
         else if (anyM.subtype === "compact_boundary") {
           const md = compactMeta(anyM);
           this.emit({ t: "compacting", active: false });
           this.emit({ t: "compact", trigger: md.trigger, preTokens: md.preTokens, postTokens: md.postTokens, durationMs: md.durationMs });
+          if (this.phase === "compacting") this.setPhase("waiting");
+          if (md.postTokens) this.emit({ t: "context", used: md.postTokens, ...(this.ctxMax ? { max: this.ctxMax } : {}) });
           // The one line that says a compaction actually reached the clients: without it a missing
           // "Compacted" card can't be told apart from a compaction that never emitted a boundary.
           tlog("compact", { conv: this.id, trigger: md.trigger, pre: md.preTokens, post: md.postTokens, ms: md.durationMs, listeners: this.subs.size });
@@ -811,7 +880,7 @@ export class Conversation {
         // compact_result), THEN the compact_boundary above. Drive the banner from it so auto-compaction
         // shows progress too, and surface a failed compaction instead of a silently stuck banner.
         else if (anyM.subtype === "status" && (anyM.status === "compacting" || anyM.compact_result)) {
-          if (anyM.status === "compacting") this.emit({ t: "compacting", active: true });
+          if (anyM.status === "compacting") { this.emit({ t: "compacting", active: true }); this.setPhase("compacting"); }
           else if (anyM.compact_result === "failed") { this.emit({ t: "compacting", active: false }); this.emit({ t: "notice", kind: "info", text: "Compaction failed: " + (anyM.compact_error || "unknown") }); }
         }
         // Background subagent activity + cross-session messages, surfaced inline so the thread
@@ -832,21 +901,32 @@ export class Conversation {
         break;
       case "stream_event": {
         // live token streaming (includePartialMessages): text + thinking deltas
+        if (anyM.parent_tool_use_id) break; // a subagent's stream belongs to its Task card, not the reply
         const ev = anyM.event;
-        // A tool_use block opening = the text just before it was narration, not the final answer.
-        if (ev?.type === "content_block_start" && ev.content_block?.type === "tool_use") {
-          this.emit({ t: "tool_start", id: ev.content_block.id, name: ev.content_block.name });
+        if (ev?.type === "message_start") this.curMsgId = ev.message?.id || anyM.uuid || String(Date.now());
+        // Every block is addressed as <message id>:<block index>, straight from the API stream. The
+        // client appends a delta to ITS block, never to "the last item", so nothing that lands
+        // between two deltas (a tool card, a task notice, a message from another device) can split a
+        // paragraph any more.
+        const bid = `${this.curMsgId}:${ev?.index ?? 0}`;
+        if (ev?.type === "content_block_start") {
+          const cb = ev.content_block;
+          // A tool_use block opening = the text just before it was narration, not the final answer.
+          if (cb?.type === "tool_use") { this.emit({ t: "tool_start", id: cb.id, name: cb.name }); this.setPhase("tool", cb.name); }
+          else if (cb?.type === "thinking") this.setPhase("thinking");
+          else if (cb?.type === "text") this.setPhase("writing");
         }
         if (ev?.type === "content_block_delta") {
           const d = ev.delta;
-          if (d?.type === "text_delta" && d.text) this.emit({ t: "text_delta", text: d.text });
+          if (d?.type === "text_delta" && d.text) this.emit({ t: "text_delta", text: d.text, bid });
           else if (d?.type === "thinking_delta") {
             // subscription auth redacts the thinking text (d.thinking === ""); we still get
             // estimated_tokens progress, so surface a live "thinking" indicator either way.
-            if (d.thinking) this.emit({ t: "thinking_delta", text: d.thinking });
-            else this.emit({ t: "thinking_progress", tokens: d.estimated_tokens || 0 });
+            if (d.thinking) this.emit({ t: "thinking_delta", text: d.thinking, bid });
+            else this.emit({ t: "thinking_progress", tokens: d.estimated_tokens || 0, bid });
           }
         }
+        if (ev?.type === "content_block_stop") this.emit({ t: "block_end", bid });
         break;
       }
       case "assistant": {
@@ -871,6 +951,13 @@ export class Conversation {
             break;
           }
         }
+        // Context occupancy is what the API just read to produce this message: input + cache. It is
+        // on every assistant message, so the ring follows the turn instead of a poll after it.
+        if (!anyM.parent_tool_use_id) {
+          const u = anyM.message?.usage;
+          const used = u ? (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0) : 0;
+          if (used > 0) this.emit({ t: "context", used, ...(this.ctxMax ? { max: this.ctxMax } : {}) });
+        }
         // text + thinking are streamed above via stream_event; from the aggregated
         // message we only need tool_use (its input is complete here).
         const blocks = (anyM.message?.content as any[]) || [];
@@ -885,6 +972,7 @@ export class Conversation {
         // tool_result blocks come back as a user message
         const c = anyM.message?.content;
         if (Array.isArray(c)) for (const b of c) if (b?.type === "tool_result") { if (this.askToolUseIds.has(b.tool_use_id)) continue; this.emit({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error }); }
+        if (!anyM.parent_tool_use_id && Array.isArray(c) && c.some((b: any) => b?.type === "tool_result") && this.phase === "tool") this.setPhase("waiting"); // results are in; the model is being called again
         // A loaded skill is injected as a user text message ("Base directory for this skill: ...");
         // surface it as a compact card instead of dumping the whole skill file into the thread.
         const sk = skillLoadName(textOfContent(c));
@@ -898,6 +986,7 @@ export class Conversation {
         if (info.status === "rejected") {
           const resumeAt = this.resetAtFrom(info);
           if (resumeAt) this.pendingRateLimit = { resumeAt, type: info.rateLimitType };
+          this.setPhase("limited");
         }
         break;
       }
@@ -908,7 +997,7 @@ export class Conversation {
         // never drains. It pinned two conversations "in progress" for over an hour. A mid-turn
         // message surviving the idle announcement is the CLIENT's job (see trailingUnsent), because
         // only the client knows what it has not seen echoed back yet.
-        this.busy = false;
+        this.setPhase("idle");
         this.apiErrors = 0; // per-turn counter
         tlog("done", { conv: this.id, subtype: anyM.subtype, ms: anyM.duration_ms || 0, listeners: this.subs.size });
         this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
@@ -928,7 +1017,7 @@ export class Conversation {
         const usage: TurnUsage = { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: anyM.total_cost_usd || 0, durationMs: anyM.duration_ms || 0 };
         this.lastUsage = usage;
         this.emit({ t: "result", subtype: anyM.subtype, sessionId: anyM.session_id || this.id, costUsd: usage.costUsd, usage });
-        this.emit({ t: "busy", busy: this.busy });
+        if (context > 0) this.emit({ t: "context", used: context, ...(this.ctxMax ? { max: this.ctxMax } : {}) });
         break;
       }
     }
@@ -1060,6 +1149,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
   // take context from the last response. Reset at each user/compact boundary. turnStartTs powers a
   // real "Worked for" from transcript timestamps (live has duration_ms; replay doesn't).
   let turnOut = 0, turnThink = 0, turnStartTs = 0, apiErrors = 0;
+  let lastModel = ""; // the model of the last real assistant message: what the selector should show for a cold conversation
   let text: string;
   try { text = await Bun.file(path).text(); } catch { return out; }
   // The CLI does not append in time order. A batch of retried api_error records is written AFTER the
@@ -1116,6 +1206,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       const txt = textOfContent(c).replace(HIDDEN_STRIP, ""); // hide the appended voice-mode directive
       const sk = skillLoadName(txt);
       if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
+      else if (o.isMeta && RESUME_PROMPT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: "Resumed after a service restart. The interrupted turn was picked up automatically." });
       else if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; apiErrors = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
@@ -1134,10 +1225,13 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         }
         if (API_ERROR_RE.test(t.trim())) { out.push({ t: "notice", kind: "info", text: t.trim() }); continue; }
       }
+      if (msg.model && msg.model !== "<synthetic>") lastModel = String(msg.model);
       const blocks = (msg.content as any[]) || [];
-      for (const b of blocks) {
-        if (b?.type === "text") out.push({ t: "text", text: b.text });
-        else if (b?.type === "thinking") out.push({ t: "thinking", text: b.thinking || "" });
+      for (let bi = 0; bi < blocks.length; bi++) {
+        const b = blocks[bi];
+        const bid = `${o.uuid || msg.id || "r"}:${bi}`; // same shape as the live <message id>:<index>
+        if (b?.type === "text") out.push({ t: "text", text: b.text, bid });
+        else if (b?.type === "thinking") out.push({ t: "thinking", text: b.thinking || "", bid });
         else if (b?.type === "tool_use" && b.name === "mcp__app-ui__ask_user") {
           // reconstruct the ask card from the tool input (askId = tool_use id); a matching
           // tool_result later becomes its ask_done. Avoids a raw, resultless tool card.
@@ -1167,6 +1261,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
     }
   }
   flushRetries(Infinity); // a turn still retrying when the transcript ends has no later record to sit before
+  if (lastModel) out.push({ t: "model", model: lastModel });
   return out;
 }
 

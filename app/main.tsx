@@ -62,11 +62,11 @@ type Model = { id: string; label: string; description?: string };
 type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean; queuedText?: string };
 type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
-  | { t: "text"; text: string; _seq?: number }
-  | { t: "text_delta"; text: string; _seq?: number }
-  | { t: "thinking"; text: string; _seq?: number }
-  | { t: "thinking_delta"; text: string; _seq?: number }
-  | { t: "thinking_progress"; tokens: number; _seq?: number }
+  | { t: "text"; text: string; bid?: string; _seq?: number }
+  | { t: "text_delta"; text: string; bid?: string; _seq?: number }
+  | { t: "thinking"; text: string; bid?: string; _seq?: number }
+  | { t: "thinking_delta"; text: string; bid?: string; _seq?: number }
+  | { t: "thinking_progress"; tokens: number; bid?: string; _seq?: number }
   | { t: "tool_use"; id: string; name: string; input: unknown; _seq?: number }
   | { t: "tool_result"; id: string; content: unknown; isError: boolean; _seq?: number }
   | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string; _seq?: number }
@@ -74,12 +74,19 @@ type AppEvent =
   | { t: "compacting"; active: boolean; _seq?: number }
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
-  | { t: "user"; text: string; _seq?: number }
+  | { t: "user"; text: string; cid?: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
   | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string; _seq?: number }
   | { t: "busy"; busy: boolean; _seq?: number }
   | { t: "error"; message: string; _seq?: number }
-  | { t: "closed"; _seq?: number };
+  | { t: "closed"; _seq?: number }
+  | { t: "hello"; epoch: string; seq: number; resync: boolean }        // first frame of every stream: the log's identity + cursor
+  | { t: "hb" }                                                        // liveness, every 15s while the socket is up
+  | { t: "status"; phase: Phase; since: number; detail?: string; _seq?: number } // what the runner is doing, from the SDK's own events
+  | { t: "block_end"; bid: string; _seq?: number }                     // a streamed block finished (exact end of a thinking timer)
+  | { t: "context"; used: number; max?: number; _seq?: number }        // context occupancy, from the usage on each assistant message
+  | { t: "model"; model: string; _seq?: number };                      // the model this conversation runs on
+type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
 type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
 
@@ -88,9 +95,9 @@ type SubscriptionWin = { utilization: number | null; resetsAt: string | null };
 type Subscription = { available: boolean; subscription: string | null; fiveHour: SubscriptionWin | null; sevenDay: SubscriptionWin | null } | null;
 
 type Item =
-  | { kind: "user"; text: string; queued?: boolean }
-  | { kind: "assistant"; text: string; usage?: TurnUsage }
-  | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number }
+  | { kind: "user"; text: string }
+  | { kind: "assistant"; text: string; usage?: TurnUsage; bid?: string }
+  | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string } }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "notice"; noticeKind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
@@ -268,119 +275,74 @@ function ctxMaxSet(id: string, max: number): void {
 // conversation id in scope) shows a sensible percentage. Updated whenever the active gauge refreshes.
 let activeCtxMax = DEFAULT_CTX;
 
-// A message sent while a turn is still streaming is QUEUED behind it: the agent cannot see it until
-// the current turn ends. It is appended straight away (so you can see it went in) but tagged, and
-// everything the live turn produces after that is inserted ABOVE it. Without that, the next
-// text_delta finds a user item as the last item, opens a SECOND assistant bubble, and the reply is
-// chopped in half at whatever word had arrived. The tag is dropped when the turn ends (`result`),
-// after which every item is a plain user turn again and nothing downstream can tell the difference.
-const isQueuedUser = (it: Item | undefined): boolean => !!it && it.kind === "user" && !!it.queued;
-// Where the LIVE turn ends: the end of the list, minus any messages queued behind it. Equal to
-// items.length whenever nothing is queued, which is the overwhelmingly common case.
-function liveEnd(items: Item[]): number { let n = items.length; while (n > 0 && isQueuedUser(items[n - 1])) n--; return n; }
-// Append at the live end. Identical to [...items, it] when nothing is queued.
-function addItem(items: Item[], it: Item): Item[] {
-  const n = liveEnd(items);
-  return n === items.length ? [...items, it] : [...items.slice(0, n), it, ...items.slice(n)];
-}
-// The turn is over, so whatever was queued behind it is now the current turn: drop the tags, or the
-// next reply's text_delta would skip back over them and grow the PREVIOUS turn's bubble.
-function unqueue(items: Item[]): Item[] {
-  if (!items.some((it) => it.kind === "user" && it.queued)) return items; // keep the same reference
-  return items.map((it) => (it.kind === "user" && it.queued ? { kind: "user", text: it.text } as Item : it));
-}
-
-// A background task reporting in, or a message relayed from another session, is ASYNCHRONOUS: it
-// arrives when it happens, not at a content-block boundary, so it is not evidence that the model
-// finished what it was writing. Every other event in the stream is in-band and does end a block.
-const isAsyncNotice = (it: Item | undefined): boolean => !!it && it.kind === "notice" && (it.noticeKind === "task" || it.noticeKind === "peer");
-// Index of the block a delta continues: the last item that is not an async notice. Without the skip
-// a task card landing mid-sentence became the last item, the next text_delta found no assistant
-// bubble to grow, and the paragraph was cut at whatever character had arrived: "...whether those f"
-// / task card / "ixes are actually systematic."
-function openBlockIdx(items: Item[], end: number): number {
-  let i = end - 1;
-  while (i >= 0 && isAsyncNotice(items[i])) i--;
-  return i;
-}
-
-// Freeze a still-live thinking block's duration. applyEvent normally does this when the next event
-// lands, but a turn that ends WITHOUT one (the service restarted, the stream closed, the turn errored)
-// left the block ticking forever: one read "Thinking 598m 32s" the morning after a restart, while the
-// conversation list correctly showed the chat as idle.
-function freezeThinking(items: Item[]): Item[] {
-  const i = openBlockIdx(items, liveEnd(items));
-  const l = items[i];
-  if (!l || l.kind !== "thinking" || !l.started || l.elapsed != null) return items;
-  const c = items.slice();
-  c[i] = { ...l, elapsed: Date.now() - l.started };
-  return c;
-}
-
-// `queued` = this event arrived while a turn was already streaming (see isQueuedUser). Only the two
-// call sites that know the conversation is mid-turn pass it; every replay/fold path leaves it false
-// and therefore behaves exactly as it did before.
-function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
-  const end = liveEnd(items); // = items.length unless a message is queued behind the live turn
-  const open = openBlockIdx(items, end); // = end - 1 unless an async notice landed mid-block
-  // Freeze a live "thinking" block's duration the instant the first non-thinking event lands, so
-  // "Thought for Ns" is fixed once the model stops reasoning (and survives reconnects in state).
-  // An async notice is not such an event: the model is still thinking, a task just reported in.
-  const asyncNoticeEvent = e.t === "notice" && (e.kind === "task" || e.kind === "peer");
-  if (e.t !== "thinking" && e.t !== "thinking_delta" && e.t !== "thinking_progress" && !asyncNoticeEvent) {
-    const l = items[open];
-    if (l && l.kind === "thinking" && l.started && l.elapsed == null) {
-      items = items.slice(); items[open] = { ...l, elapsed: Date.now() - l.started };
-    }
+// Freeze every live thinking block (one with a start and no end). The normal path is an exact
+// block_end from the stream; this covers the turn ending or the socket dying without one.
+function freezeOpen(items: Item[]): Item[] {
+  let out: Item[] | null = null;
+  for (let i = items.length - 1; i >= 0 && i >= items.length - 20; i--) {
+    const it = items[i];
+    if (it.kind === "thinking" && it.started && it.elapsed == null) { out = out || items.slice(); out[i] = { ...it, elapsed: Date.now() - it.started }; }
   }
-  const last = items[open];
+  return out || items;
+}
+// Index of the streamed block with this id, searching back from the end. Blocks are addressed as
+// <message id>:<block index> straight from the API stream, so a delta always finds ITS block no
+// matter what landed after it: a tool card, a task notice, a message from another device. Nothing
+// can split a paragraph any more, because nothing else is that block. That single property retires
+// the queued-message pinning, the "async notice" skip and the "which item is open" guessing that
+// used to live here.
+function findBlock(items: Item[], bid: string): number {
+  for (let i = items.length - 1; i >= 0 && i >= items.length - 40; i--) {
+    const it = items[i];
+    if ((it.kind === "assistant" || it.kind === "thinking") && it.bid === bid) return i;
+  }
+  return -1;
+}
+
+// The one fold from events to items. Pure and order-preserving: everything appends, deltas grow
+// their own block by id, and the few events that update an existing item (tool results, subagent
+// progress, ask answers, usage stamps) find it by its own id.
+function applyEvent(items: Item[], e: AppEvent): Item[] {
   switch (e.t) {
     case "user": {
-      // A loaded skill arrives as a user message that dumps the whole skill file ("Base directory
-      // for this skill: <path>/<name>"). Render a compact card instead. (Also done server-side; this
-      // covers transcripts replayed before that backend build ships, so no restart is needed.)
+      // A loaded skill arrives as a user message that dumps the whole skill file. Render a compact card.
       const sk = skillLoadName(e.text);
-      if (sk) return addItem(items, { kind: "notice", noticeKind: "skill", text: sk });
-      // Queued turns stack at the very end, in send order. A turn that is NOT queued starts a new
-      // turn, so any leftover tag is stale by definition.
-      if (queued) return [...items, { kind: "user", text: sanitizeUserText(e.text), queued: true }];
-      return [...unqueue(items), { kind: "user", text: sanitizeUserText(e.text) }];
+      if (sk) return [...items, { kind: "notice", noticeKind: "skill", text: sk }];
+      return [...items, { kind: "user", text: sanitizeUserText(e.text) }];
     }
     case "text":
-    case "text_delta":
-      // Still mid-paragraph: grow the block and leave anything queued pinned below it. Splitting a
-      // sentence to slot a message in is the thing we are avoiding.
-      if (last && last.kind === "assistant") { const c = items.slice(); c[open] = { ...last, text: last.text + e.text }; return c; }
-      // A NEW text block is the clean seam: the previous paragraph is finished and any tool cards are
-      // already rendered, so release whatever was queued and let this paragraph land AFTER it. The
-      // message ends up between the tool uses and the next part of the reply, instead of staying
-      // pinned at the very bottom while the response grew above it.
-      return [...unqueue(items), { kind: "assistant", text: e.text }];
-    case "thinking_delta":
-      if (last && last.kind === "thinking") { const c = items.slice(); c[open] = { ...last, text: last.text + e.text }; return c; }
-      return [...unqueue(items), { kind: "thinking", text: e.text, started: Date.now() }];
+    case "text_delta": {
+      if (e.bid) {
+        const i = findBlock(items, e.bid);
+        if (i >= 0) { const c = items.slice(); const it = c[i] as Extract<Item, { kind: "assistant" }>; c[i] = { ...it, text: it.text + e.text }; return c; }
+        return [...freezeOpen(items), { kind: "assistant", text: e.text, bid: e.bid }];
+      }
+      // No block id (synthetic text, or an older producer): grow the last bubble if it is one.
+      const last = items[items.length - 1];
+      if (e.t === "text_delta" && last && last.kind === "assistant") { const c = items.slice(); c[c.length - 1] = { ...last, text: last.text + e.text }; return c; }
+      return [...freezeOpen(items), { kind: "assistant", text: e.text }];
+    }
+    case "thinking_delta": {
+      const i = e.bid ? findBlock(items, e.bid) : (items[items.length - 1]?.kind === "thinking" ? items.length - 1 : -1);
+      if (i >= 0) { const c = items.slice(); const it = c[i] as Extract<Item, { kind: "thinking" }>; c[i] = { ...it, text: it.text + e.text }; return c; }
+      return [...freezeOpen(items), { kind: "thinking", text: e.text, started: Date.now(), bid: e.bid }];
+    }
     case "thinking_progress": {
       // estimated_tokens resets across thinking sub-segments (goes up, then drops back on a new
       // segment). Track the running peak per segment and carry a base of prior peaks so the
       // displayed count is a monotonic total for the whole block, not the instantaneous reading.
       const v = e.tokens || 0;
-      if (last && last.kind === "thinking") {
-        const peak = last._peak || 0;
-        const base = last._base || 0;
+      const i = e.bid ? findBlock(items, e.bid) : (items[items.length - 1]?.kind === "thinking" ? items.length - 1 : -1);
+      if (i >= 0) {
+        const it = items[i] as Extract<Item, { kind: "thinking" }>;
+        const peak = it._peak || 0, base = it._base || 0;
         const nextBase = v < peak ? base + peak : base; // reset detected -> bank the last peak
-        const nextPeak = v < peak ? v : v;
-        const c = items.slice();
-        c[open] = { ...last, _base: nextBase, _peak: nextPeak, tokens: nextBase + nextPeak };
-        return c;
+        const c = items.slice(); c[i] = { ...it, _base: nextBase, _peak: v, tokens: nextBase + v }; return c;
       }
-      return [...unqueue(items), { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now() }];
+      return [...freezeOpen(items), { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now(), bid: e.bid }];
     }
-    case "thinking": return [...unqueue(items), { kind: "thinking", text: e.text }];
-    // A new tool call is the same clean seam as a new paragraph: whatever the agent was part way
-    // through is finished, and the SDK hands a mid-turn message to the agent at a tool boundary, so
-    // by the time the NEXT call is issued it has already read it. Release the queue first, or the
-    // card for the work the message asked for renders ABOVE the message that asked for it.
-    case "tool_use": return [...unqueue(items), { kind: "tool", id: e.id, name: e.name, input: e.input }];
+    case "thinking": return [...freezeOpen(items), { kind: "thinking", text: e.text, bid: e.bid }];
+    case "tool_use": return [...freezeOpen(items), { kind: "tool", id: e.id, name: e.name, input: e.input }];
     case "agent_progress": {
       // Attach live subagent progress to its Task tool card (matched by tool_use id).
       for (let i = items.length - 1; i >= 0; i--) {
@@ -405,28 +367,27 @@ function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
       const max = activeCtxMax;
       const pctBefore = max && e.preTokens != null ? (e.preTokens / max) * 100 : undefined;
       const pctAfter = max && e.postTokens != null ? (e.postTokens / max) * 100 : undefined;
-      return addItem(items, { kind: "compact", savedTokens: saved || undefined, durationMs: e.durationMs, pctBefore, pctAfter });
+      return [...items, { kind: "compact", savedTokens: saved || undefined, durationMs: e.durationMs, pctBefore, pctAfter }];
     }
-    case "notice": return addItem(items, { kind: "notice", noticeKind: e.kind, text: e.text, from: e.from, status: e.status });
+    case "notice": return [...items, { kind: "notice", noticeKind: e.kind, text: e.text, from: e.from, status: e.status }];
     case "result": {
-      // The turn is over: release anything queued behind it (see unqueue) BEFORE stamping usage.
-      const rel = unqueue(items);
       // Stamp the turn's real token usage onto the most recent assistant block so the summary can
       // show it (output = tokens Claude actually generated, incl. thinking + tool-call args).
-      if (!e.usage) return rel;
-      for (let i = rel.length - 1; i >= 0; i--) { if (rel[i].kind === "assistant") { const c = rel.slice(); c[i] = { ...(c[i] as Extract<Item, { kind: "assistant" }>), usage: e.usage }; return c; } }
-      return rel;
+      const done = freezeOpen(items);
+      if (!e.usage) return done;
+      for (let i = done.length - 1; i >= 0; i--) { if (done[i].kind === "assistant") { const c = done.slice(); c[i] = { ...(c[i] as Extract<Item, { kind: "assistant" }>), usage: e.usage }; return c; } }
+      return done;
     }
     case "ask": {
       if (items.some((it) => it.kind === "ask" && it.askId === e.askId)) return items; // de-dupe (transcript + live)
-      return addItem(items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText });
+      return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText }];
     }
     case "ask_done": {
       const idx = items.findIndex((it) => it.kind === "ask" && it.askId === e.askId);
       if (idx < 0) return items;
       const c = items.slice(); c[idx] = { ...(c[idx] as Extract<Item, { kind: "ask" }>), answered: e.answer }; return c;
     }
-    default: return items;
+    default: return items; // init/busy/status/context/model/hello/hb/compacting/closed/error/tool_start carry no item
   }
 }
 
@@ -448,17 +409,28 @@ export interface StoreHooks {
   onResult: (store: ConvStore) => void;                  // a turn finished (reorder the sidebar)
   onEvent: (store: ConvStore, e: AppEvent) => void;      // raw event tap (voice mode + stall clock)
   onContext: (store: ConvStore) => void;                 // refresh the context gauge
+  onResync: (store: ConvStore) => void;                  // the runner's log is a different epoch than our cursor: reload from the transcript
 }
 
 // How long an unacknowledged optimistic user turn keeps the conversation "busy" once the SERVER has
 // reported idle. Past this it's an orphan (dead turn, or a backend restart) and is dropped.
 const ECHO_TTL = 30_000;
+// Server heartbeat is every 15s; three missed in a row means the socket is gone.
+const HB_DEAD = 50_000;
 
 class ConvStore {
   id: string;
   items: Item[] = [];
   version = 0;           // bumped on any change — the useSyncExternalStore snapshot
-  seq = -1;             // last _seq seen (dedupe across auto-reconnects)
+  seq = -1;             // last _seq seen: the resume cursor, sent as ?since= on every reconnect
+  epoch: string | null = null; // which live log `seq` belongs to; a different epoch on the server means reload
+  private connectMode: "resume" | "tail" | "full" = "full"; // how the current socket was opened (decides what hello does to seq)
+  lastHb = 0;           // last heartbeat or event; a socket quiet past HB_DEAD is dead, not idle
+  phase: Phase = "idle";
+  phaseSince = 0;
+  phaseDetail: string | undefined = undefined;
+  model: string | null = null;  // what THIS conversation runs on (init / model events / replay), not the picker default
+  ctx: { used: number; max?: number } | null = null; // context occupancy from the stream; the ring reads this
   busy = false;
   cwd: string | null = null;
   compacting = false;
@@ -475,7 +447,7 @@ class ConvStore {
   // Optimistic user turns awaiting their SSE echo. Timestamped, because an echo that never arrives
   // (the turn died, or the backend restarted mid-turn) otherwise pins busy=true through every
   // reconcile below: stuck Stop button, and markRead is gated on !busy so the unread dot sticks too.
-  private pendingEcho: { text: string; at: number }[] = [];
+  private pendingEcho: { cid?: string; text: string; at: number }[] = [];
   sendState: "sending" | "delivered" | "read" | "queued" | "failed" | null = null; // delivery of the latest sent turn (Google-Messages-style ticks)
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
   private cachedItems: Item[] = [];   // tail-diff baseline for the cache writer
@@ -491,10 +463,17 @@ class ConvStore {
   // ---- the one and only EventSource ----
   connect(tail = false) {
     if (this.es) return; // already the single socket for this conversation
+    // With a cursor from a known epoch, RESUME: the server replays exactly what we missed. That is
+    // the whole fix for "sent from my phone, never showed on the laptop": a fresh EventSource carries
+    // no Last-Event-ID, so a deliberate reconnect used to ask for future-only and drop the gap.
+    const resume = this.epoch && this.seq >= 0;
+    const q = resume ? `?epoch=${encodeURIComponent(this.epoch!)}&since=${this.seq}` : tail ? "?tail=1" : "";
+    this.connectMode = resume ? "resume" : tail ? "tail" : "full";
     let es: EventSource;
-    try { es = new EventSource(`/app/stream/${encodeURIComponent(this.id)}${tail ? "?tail=1" : ""}`); } catch { return; }
+    try { es = new EventSource(`/app/stream/${encodeURIComponent(this.id)}${q}`); } catch { return; }
     this.es = es;
-    es.onmessage = (ev) => { let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; } this.ingest(e); };
+    this.lastHb = Date.now();
+    es.onmessage = (ev) => { let e: AppEvent; try { e = JSON.parse(ev.data); } catch { return; } this.lastHb = Date.now(); this.ingest(e); };
     es.onerror = () => { if (es.readyState === EventSource.CLOSED) this.disconnect(); }; // 404/fatal -> drop; transient -> browser retries the same socket
     this.signal(); // connected flips -> re-render (the Stop button depends on it)
   }
@@ -508,6 +487,21 @@ class ConvStore {
 
   // ---- event reduction (the single applyEvent per conversation) ----
   ingest(e: AppEvent) {
+    if (e.t === "hb") return; // lastHb already stamped in onmessage
+    if (e.t === "hello") {
+      if (e.resync) {
+        // Our cursor belongs to a log this runner never had (it restarted). Drop it and reload.
+        this.epoch = e.epoch; this.seq = -1;
+        this.mgr.hooks?.onResync(this);
+        return;
+      }
+      this.epoch = e.epoch;
+      // Future-only or full-replay sockets start from the server's current cursor, so the next
+      // reconnect resumes from here. A RESUME socket must not: the replay of the gap is about to
+      // arrive with seqs at or below this, and bumping first would make the dedupe drop it.
+      if (this.connectMode !== "resume") this.seq = Math.max(this.seq, e.seq);
+      return;
+    }
     if (typeof e._seq === "number") { if (e._seq <= this.seq) return; this.seq = e._seq; }
     this.evDirty = true; // a live event: the transcript cursor no longer matches what we hold
     this.mgr.hooks?.onEvent(this, e);
@@ -516,30 +510,50 @@ class ConvStore {
     switch (e.t) {
       case "init":
         if (e.sessionId && e.sessionId !== this.id) this.mgr.rebind(this, e.sessionId);
+        if (e.model) this.model = e.model;
         this.mgr.hooks?.onInit(this, e.sessionId);
         return;
-      case "busy": this.busy = e.busy; if (!e.busy) { this.items = freezeThinking(this.items); this.touch(); } this.signal(); return;
+      case "status": {
+        this.phase = e.phase; this.phaseSince = e.since; this.phaseDetail = e.detail;
+        const b = e.phase !== "idle";
+        if (b !== this.busy) this.busy = b;
+        if (!b) { this.items = freezeOpen(this.items); this.touch(); } else this.signal();
+        return;
+      }
+      case "block_end": {
+        // Exact end of a streamed block. Freezes a thinking timer the moment the model stops
+        // thinking, instead of whenever the next unrelated event happened to land.
+        const i = findBlock(this.items, e.bid);
+        if (i >= 0) { const it = this.items[i]; if (it.kind === "thinking" && it.started && it.elapsed == null) { const c = this.items.slice(); c[i] = { ...it, elapsed: Date.now() - it.started }; this.items = c; this.touch(); } }
+        return;
+      }
+      case "context": this.ctx = { used: e.used, max: e.max ?? this.ctx?.max }; this.signal(); this.mgr.hooks?.onContext(this); return;
+      case "model": this.model = e.model; this.signal(); return;
+      case "busy": if (this.busy !== e.busy) { this.busy = e.busy; if (!e.busy) { this.items = freezeOpen(this.items); this.touch(); } else this.signal(); } return;
       case "compacting":
         this.compacting = e.active; this.compactStart = e.active ? (this.compactStart || Date.now()) : 0; this.signal(); return;
       case "compact":
         this.compacting = false; this.compactStart = 0;
         this.items = applyEvent(this.items, e); this.touch(); this.mgr.hooks?.onContext(this); return;
       case "user": {
+        // Our own turn echoed back: matched by the cid we sent (exact), falling back to text for an
+        // echo from before cids existed. Anything else is another device's, the terminal's, or a peer
+        // agent's turn, and simply appends: with block ids a reply in progress keeps growing in its
+        // own block above it, so there is nothing to pin or tag any more.
         const clean = sanitizeUserText(e.text);
-        const i = this.pendingEcho.findIndex((p) => p.text === clean);
-        if (i !== -1) { this.pendingEcho.splice(i, 1); if (this.sendState === "sending") this.setSendState("delivered"); return; } // our own optimistic turn echoed back = server has it
+        const i = e.cid ? this.pendingEcho.findIndex((p) => p.cid === e.cid) : this.pendingEcho.findIndex((p) => p.text === clean);
+        if (i !== -1) { this.pendingEcho.splice(i, 1); if (this.sendState === "sending") this.setSendState("delivered"); return; }
         const last = this.items[this.items.length - 1];
         if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) return;
-        // Someone else's turn (another device, the terminal, a peer agent) landing mid-stream is
-        // queued behind the running one exactly like ours, so tag it the same way.
-        this.items = applyEvent(this.items, e, this.busy); this.touch(); return;
+        this.items = applyEvent(this.items, e); this.touch(); return;
       }
       case "result":
         this.busy = false; this.items = applyEvent(this.items, e); this.touch();
+        if (e.usage?.context) this.ctx = { used: e.usage.context, max: this.ctx?.max }; // replay has no context events; the result carries the same number
         this.mgr.hooks?.onResult(this); this.mgr.hooks?.onContext(this); return;
       case "error":
-        this.busy = false; this.items = unqueue(addItem(freezeThinking(this.items), { kind: "assistant", text: "\n\n_error: " + e.message + "_" })); this.touch(); return;
-      case "closed": this.items = freezeThinking(this.items); this.touch(); this.disconnect(); return;
+        this.busy = false; this.items = [...freezeOpen(this.items), { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]; this.touch(); return;
+      case "closed": this.items = freezeOpen(this.items); this.phase = "idle"; this.touch(); this.disconnect(); return;
       default: this.items = applyEvent(this.items, e); this.touch(); return;
     }
   }
@@ -549,7 +563,7 @@ class ConvStore {
   // now (so the send is visibly acknowledged) but pinned BELOW the reply that is still streaming
   // instead of splitting it. doEdit passes false, because a rewind cancels the running turn and its rerun
   // must appear under the edited bubble, not above it.
-  addOptimisticUser(text: string, queued = this.busy) { this.pendingEcho.push({ text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text }, queued); this.busy = true; this.setSendState("sending"); this.touch(); }
+  addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
   // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
   // below), and restore the pre-edit view if the server rejects the edit.
   truncateFrom(index: number) { this.items = this.items.slice(0, Math.max(0, index)); this.pendingEcho = []; this.touch(); }
@@ -566,15 +580,10 @@ class ConvStore {
   beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
   endCompactFallback() { if (this.compacting) { this.compacting = false; this.compactStart = 0; this.signal(); } }
   showItems(items: Item[]) { this.items = items; this.signal(); } // transient placeholder view (offline note / queued)
-  // The server says idle but our local state still thinks a reply is outstanding, and resyncing has
-  // already failed to clear it. Take the server's word rather than resyncing forever. Terminal state
-  // of the stall watchdog, not a retry: it drops the orphaned echo and lets the Stop button clear.
-  forceIdle() {
-    const had = this.pendingEcho.length > 0 || this.busy;
-    this.pendingEcho = []; this.busy = false;
-    if (this.sendState === "sending" || this.sendState === "delivered") { this.sendState = "read"; this.signal(); return; }
-    if (had) this.signal();
-  }
+  // A socket that has not carried a heartbeat or an event in this long is dead, whatever the browser
+  // thinks. Reconnect resumes from `seq`, so nothing is lost. Replaces the stall watchdog, which had
+  // to guess from silence and reloaded the whole conversation with no cursor when it guessed wrong.
+  deadSocket(now = Date.now()): boolean { return !!this.es && this.lastHb > 0 && now - this.lastHb > HB_DEAD; }
 
   // ---- hydration + reconcile (the cache-vs-network policy) ----
   hydrate(items: Item[], meta: { busy?: boolean; cwd?: string | null; evCount?: number }) {
@@ -905,6 +914,31 @@ function turnThinkingTotals(items: Item[], i: number): { ms: number; tokens: num
   return any ? { ms, tokens } : null;
 }
 
+// What the runner is doing when there is nothing streaming to look at: starting the session, waiting
+// on the API, inside a tool, retrying an API error, rate-limited, compacting. The old three dots
+// covered all of those with one animation, which is why "is it still thinking?" had no answer.
+function PhaseLine({ phase, since, detail }: { phase: Phase; since: number; detail?: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+  const secs = since ? Math.max(0, Math.round((now - since) / 1000)) : 0;
+  const label = phase === "starting" ? "Starting the session"
+    : phase === "waiting" ? "Waiting for the model"
+    : phase === "tool" ? `Running ${detail || "a tool"}`
+    : phase === "retrying" ? `API error, retrying${detail ? ` (${detail})` : ""}`
+    : phase === "limited" ? "Rate limited, waiting for the window to reset"
+    : phase === "compacting" ? "Compacting"
+    : "";
+  if (!label) return null;
+  return (
+    <div className="msg bubble-assistant">
+      <div style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--muted)", fontSize: 13 }}>
+        <div className="typing"><span></span><span></span><span></span></div>
+        <span>{label}{secs >= 3 ? ` · ${fmtDur(secs)}` : ""}</span>
+      </div>
+    </div>
+  );
+}
+
 // Thinking indicator. LIVE: "Thinking… 12s · ~340 tokens" ticking each second. When done we hide
 // the standalone indicator (the turn summary under the final reply carries the totals), unless the
 // platform actually exposed the reasoning text — then we show that.
@@ -1016,7 +1050,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
     const { images, files, body } = parseUserText(it.text);
     return (
       <div className="msg">
-        <div className={"bubble-user" + (it.queued ? " queued" : "")} {...menuBind(body || it.text, "user")}>
+        <div className="bubble-user" {...menuBind(body || it.text, "user")}>
           {images.map((p, k) => <img key={k} className="msg-img" loading="lazy" src={`/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`} alt="attachment" />)}
           {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
           {body && <div className="bubble-user-text">{body}</div>}
@@ -1064,9 +1098,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   // Turn-final assistant block? Show a Claude-Code-style footer: thinking time + the turn's REAL
   // token usage (output = what Claude generated this turn, from the SDK result message).
   const next = items[i + 1];
-  // A message QUEUED behind this turn sits below the live reply, so it does not end it. Without that
-  // guard, the turn summary would pop in mid-stream the moment you typed a follow-up.
-  const turnFinal = isQueuedUser(next) ? false : (!next || next.kind === "user" || next.kind === "compact");
+  const turnFinal = !next || next.kind === "user" || next.kind === "compact";
   const think = turnFinal ? turnThinkingTotals(items, i) : null;
   const usage = it.usage;
   const parts: string[] = [];
@@ -1148,7 +1180,15 @@ function App() {
   const busy = activeStore?.busy ?? false;
   const todos = useMemo(() => latestTodos(items), [items]); // current task checklist (latest TodoWrite), pinned above the composer
   const compacting = activeStore?.compacting ?? false;
-  const [model, setModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
+  const phase: Phase = activeStore?.phase ?? "idle";
+  const phaseSince = activeStore?.phaseSince ?? 0;
+  const phaseDetail = activeStore?.phaseDetail;
+  // The picker shows what THIS conversation runs on. The stored default only applies to a new chat;
+  // switching to a conversation that runs on another model shows that model, and picking one inside a
+  // conversation changes that conversation alone.
+  const [defaultModel, setDefaultModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
+  const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
+  const model = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
@@ -1215,10 +1255,7 @@ function App() {
   const onArtifactResizeMove = (e: React.PointerEvent) => { if (!artifactDrag.current) return; const dx = artifactDrag.current.startX - e.clientX; setArtifactW(Math.max(360, Math.min(window.innerWidth - 320, artifactDrag.current.startW + dx))); }; // drag left = wider right panel
   const onArtifactResizeUp = () => { if (artifactDrag.current) { artifactDrag.current = null; try { localStorage.setItem("ct-artifact-w", String(Math.round(artifactW))); } catch { /* */ } } };
 
-  const lastEventAt = useRef(Date.now()); // for the stall watchdog: when did the active stream last speak
-  // Stall-watchdog attempts for the active conversation, so a resync that can't clear the condition
-  // gives up instead of reopening the stream on a loop. `settled` = we've already forced it idle.
-  const resyncRef = useRef<{ id: string; n: number; settled: boolean }>({ id: "", n: 0, settled: false });
+  const loadConvRef = useRef<(id: string) => Promise<void>>(async () => {}); // for hooks wired before loadConv is defined
   // Messages typed DURING a compaction, each bound to the conversation it was typed in. It used to
   // hold bare strings and the flush sent them to whatever conversation happened to be ON SCREEN, so
   // switching tabs while a compaction finished delivered your message to the wrong chat, silently.
@@ -1240,7 +1277,7 @@ function App() {
   const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
   const voiceSinks = useRef<Set<(e: AppEvent) => void>>(new Set()); // voice-mode event subscribers
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
-  useEffect(() => { modelRef.current = model; }, [model]);
+  useEffect(() => { modelRef.current = defaultModel; }, [defaultModel]); // what a NEW chat starts on
 
   const nextOffsetRef = useRef(0);
   const loadingMoreRef = useRef(false);
@@ -1319,6 +1356,17 @@ function App() {
   }, []);
   const refreshContext = useCallback((id: string | null) => {
     if (!id || id.startsWith("pending-")) { setContext(null); return; }
+    // The stream reports context on every assistant message (and replay on every result), so a
+    // conversation that has said anything has an exact figure already. No round trip, no jumping
+    // between an estimate and the truth.
+    const s = manager.get(id);
+    if (s?.ctx) {
+      if (s.ctx.max) ctxMaxSet(id, s.ctx.max);
+      const max = s.ctx.max || ctxMaxGet(id);
+      activeCtxMax = max;
+      setContext({ percentage: Math.min(100, (s.ctx.used / max) * 100), total: s.ctx.used, max, estimated: false });
+      return;
+    }
     api.context(id).then((d) => {
       if (d?.available) { ctxMaxSet(id, d.max); activeCtxMax = d.max; setContext({ percentage: d.percentage, total: d.total, max: d.max, estimated: false }); return; }
       const max = ctxMaxGet(id); // THIS conversation's window (from when it was last live), not a global
@@ -1391,7 +1439,7 @@ function App() {
     // or flaky link shows your chats immediately instead of an empty sidebar until the network answers.
     // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
     void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id); }).catch(() => {});
     refreshConvs();
     refreshFavs();
     const c = new URLSearchParams(location.search).get("c");
@@ -1722,10 +1770,17 @@ function App() {
         // released turns render after the divider rather than above it.
         if (e.t === "compact") queueMicrotask(() => flushCompactRef.current(store));
         if (store !== activeStoreRef.current) return;
-        lastEventAt.current = Date.now(); // stall watchdog: the active stream is alive
         for (const fn of voiceSinks.current) { try { fn(e); } catch {} } // feed voice mode
       },
       onContext: (store) => { if (store === activeStoreRef.current) refreshContext(store.id); },
+      // Our cursor belongs to a log this runner never had (it restarted): the store's live tail is
+      // history the server cannot replay. Reload the open one from the transcript; a background one is
+      // emptied so the pool re-seeds it the same way.
+      onResync: (store) => {
+        store.disconnect();
+        if (store === activeStoreRef.current) { void loadConvRef.current(store.id); return; }
+        store.items = []; store.hydrated = false; store.evDirty = true;
+      },
     };
     return () => { manager.hooks = null; };
   }, [refreshConvs, refreshContext]);
@@ -1774,9 +1829,9 @@ function App() {
     compactQueue.current = compactQueue.current.filter((it) => !take.includes(it));
     void (async () => {
       for (const { store: s, text } of take) {
-        s.addOptimisticUser(text); // now renders below the compaction divider (card already applied)
         const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
-        const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined };
+        s.addOptimisticUser(text, cid); // now renders below the compaction divider (card already applied)
+        const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: (s.id.startsWith("new-") ? modelRef.current : s.model) || undefined, cwd: cwdRef.current || undefined };
         try { if (s.connected) await api.send({ id: s.id, text, cid }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
         catch { await offline.enqueueSend(body); void refreshQueue(); }
       }
@@ -1848,6 +1903,7 @@ function App() {
     } finally { if (activeStoreRef.current === s) setLoadingConv(false); }
   }, [defaultCwd]);
 
+  loadConvRef.current = loadConv;
   const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setEditing(null); setEditError(null); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
   // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
@@ -1920,46 +1976,22 @@ function App() {
   }, [drainQueueUI, loadConv, refreshFavs, refreshQueue]);
   // #endregion
 
-  // Stall watchdog: on a weak link the SSE can die silently mid-turn, so it LOOKS like Claude stopped
-  // working until you send again (which reopens the stream). While a reply is outstanding, if the
-  // stream has gone quiet, resync from the server: reattaches the stream and picks up the ending or
-  // the missed events.
-  //
-  // Deliberately NOT gated on `busy`. Every queue/timeout path in submitText calls setBusy(false), so a
-  // turn the server accepted can sit with busy=false and no reply forever, which is the "two ticks then
-  // silence" stall. Treat "the server has our turn (ticks) and the last thing on screen is still our own
-  // message" as outstanding too, and resync that as well.
+  // Liveness. The server heartbeats every 15s as a data frame we can see; a socket quiet for HB_DEAD
+  // is dead, whatever the browser says, and is reopened. The reopen resumes from `seq`, so nothing is
+  // lost and nothing is reloaded. This replaces a watchdog that inferred death from silence, reloaded
+  // the whole conversation, and reconnected with no cursor: a busy chat between two long tool calls
+  // looked dead to it every 15s, and every message from another device sent in one of those gaps was
+  // dropped on the floor.
   useEffect(() => {
     const t = setInterval(() => {
-      const id = activeIdRef.current;
-      if (!id || id.startsWith("pending-") || !navigator.onLine) return;
-      const s = activeStoreRef.current;
-      if (!s) return;
-      const last = s.items[s.items.length - 1];
-      const awaitingReply = (s.sendState === "delivered" || s.sendState === "read") && last?.kind === "user";
-      if (!s.busy && !awaitingReply) { resyncRef.current = { id, n: 0, settled: false }; return; } // idle, or the reply landed
-      if (resyncRef.current.id !== id) resyncRef.current = { id, n: 0, settled: false }; // per-conversation attempts
-      const quietFor = Date.now() - lastEventAt.current;
-      const st = statuses[id];
-      const serverDone = st ? !st.busy : false; // server knows this conv and says the turn ended
-      // The server says this conversation is idle and resyncing has already failed to clear our local
-      // outstanding state, so another resync would do exactly the same thing. Stop, and take the
-      // server's word. Without this cap a resync that can't clear the condition reopens the SSE every
-      // few seconds forever, which is worse than the stall it was meant to fix.
-      if (serverDone && resyncRef.current.n >= 2) {
-        if (!resyncRef.current.settled) { resyncRef.current.settled = true; s.forceIdle(); }
-        return;
-      }
-      // Missed the ending (server done but we still show busy) -> resync fast. A live turn resyncs after
-      // a shorter silence so a weak-signal stall recovers on its own. A turn with no reply at all waits
-      // longer, since nothing has started streaming yet and a slow first token is normal. Drop the
-      // (possibly silently-dead) socket first so loadConv's connect() actually reopens it instead of
-      // no-opping on a stale one.
-      const threshold = serverDone ? 6000 : s.busy ? 15000 : 25000;
-      if (quietFor > threshold) { resyncRef.current.n++; lastEventAt.current = Date.now(); s.disconnect(); void loadConv(id); }
-    }, 4000);
+      if (!navigator.onLine) return;
+      const now = Date.now();
+      for (const st of manager.stores.values()) if (st.deadSocket(now)) { st.disconnect(); st.connect(); }
+      const a = activeStoreRef.current;
+      if (a && !a.connected && a.phase !== "idle" && a.epoch && !a.id.startsWith("new-") && !a.id.startsWith("pending-")) a.connect();
+    }, 5000);
     return () => clearInterval(t);
-  }, [statuses, loadConv]);
+  }, []);
 
   // #region search: debounced content search (title filtering is instant + client-side below)
   useEffect(() => {
@@ -1988,11 +2020,11 @@ function App() {
     // During compaction, hold the message ENTIRELY (no optimistic render yet). flushCompact renders +
     // sends it once the compact card is in place, so it lands BELOW the compaction divider, not above.
     if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push({ store: s!, text }); return s!.id; }
-    s!.addOptimisticUser(text); // renders the turn, flips busy, sets sendState "sending"
     // Stable client id so a redelivery (offline queue OR a timeout requeue) is deduped server-side
-    // instead of posting the same turn twice.
+    // instead of posting the same turn twice, and so the server's echo of this turn matches it exactly.
     const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
-    const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: modelRef.current || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
+    s!.addOptimisticUser(text, cid); // renders the turn, flips busy, sets sendState "sending"
+    const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: (s!.id.startsWith("new-") ? modelRef.current : s!.model) || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
     const queue = async () => {
       await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued);
       // A chat STARTED offline has no server id yet, so it wouldn't show anywhere. Drop a local
@@ -2117,10 +2149,10 @@ function App() {
     stickBottom.current = true; setAtBottom(true);
     const snapshot = s.items;
     s.truncateFrom(ed.i);             // drop the edited bubble + everything after
-    s.addOptimisticUser(text, false); // re-render the edited text below; arms the echo dedup
     const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    s.addOptimisticUser(text, cid); // re-render the edited text below; arms the echo dedup
     try {
-      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: ed.orig, model: modelRef.current || undefined }), 30000);
+      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: ed.orig, model: s.model || undefined }), 30000);
       if (r?.error) { s.restore(snapshot); return "Couldn't edit that message: " + r.error; }
       if (s.sendState === "sending") s.setSendState("delivered");
       return null;
@@ -2194,8 +2226,14 @@ function App() {
   const pendingAsk = useMemo(() => items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined, [items]);
 
   const onPickModel = async (m: string) => {
-    setModel(m); localStorage.setItem("ct-app-model", m); setMenuOpen(false); setOtherOpen(false);
-    if (activeStoreRef.current?.connected && activeId) { try { await api.setModel({ id: activeId, model: m }); } catch { /* */ } }
+    setMenuOpen(false); setOtherOpen(false);
+    const s = activeStoreRef.current;
+    if (s && !s.id.startsWith("new-") && !s.id.startsWith("pending-")) {
+      s.model = m; s.signal(); // this conversation only; the server's model event confirms it for every device
+      if (s.connected) { try { await api.setModel({ id: s.id, model: m }); } catch { /* not live: the next send resumes with s.model */ } }
+      return;
+    }
+    setDefaultModel(m); localStorage.setItem("ct-app-model", m); // new-chat page: the default for future chats
   };
 
   const startRename = () => { if (!activeId) return; setTitleDraft(convs.find((c) => c.sessionId === activeId)?.title || ""); setEditingTitle(true); };
@@ -2552,7 +2590,8 @@ function App() {
             <div className="thread">
               {threadNodes}
               {compacting && <CompactionBanner start={activeStore?.compactStart ?? 0} />}
-              {busy && !compacting && items[liveEnd(items) - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
+              {!compacting && phase !== "idle" && phase !== "thinking" && phase !== "writing" && <PhaseLine phase={phase} since={phaseSince} detail={phaseDetail} />}
+              {busy && phase === "idle" && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
             </div>
           )}
         </div>
