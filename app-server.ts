@@ -5,7 +5,7 @@
 // to this sidecar, and /_ct/app* strips to the same). Returns a Response for an app route,
 // or null to let server.ts keep matching its own routes.
 
-import { join } from "path";
+import { join, resolve } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
@@ -35,6 +35,10 @@ export interface AppCtx {
   // extraUsers, e.g. stonkbot/sleeper). Matched on the DIR, not the transcript, so their thousands
   // of automated runs never even get read — cheap, and they can't swamp the recent window.
   defaultCwd: string; // cwd for a brand-new chat (cfg.spawnCwd || HOME)
+  downloadRoots: string[]; // extra roots /app/api/download may read from, on top of the chat's own
+  // cwd. Claude routinely writes to a path outside the directory the chat was started in (a render
+  // into a project folder while the chat sits in $HOME), and restricting reads to the cwd made every
+  // one of those a 403: inline images rendered as a broken box with alt text, download cards 404'd.
   models: { id: string; label: string }[]; // quick picks
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
   favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
@@ -794,12 +798,21 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // image previews in the chat log still resolve.
     if (!base && /^[A-Za-z0-9-]{6,}$/.test(id)) { const t = findTranscript(ctx, id); if (t) base = (await convMeta(t.path)).cwd || undefined; }
     base = base || ctx.defaultCwd;
-    const target = rel.startsWith("/") ? rel : join(base, rel);
-    if (!target.startsWith(base + "/") && target !== base) return jsonRes({ error: "path outside conversation" }, ctx, req, 403);
+    const target = resolve(rel.startsWith("/") ? rel : join(base, rel)); // resolve() so a ".." in the path cannot walk out of a root
+    // Traversal guard. The chat's own cwd always counts; the configured roots cover the rest of the
+    // owner's filesystem, so a file Claude wrote outside the directory the chat happens to sit in
+    // still resolves. A guest container ships no roots, so it keeps the old cwd-only behaviour.
+    const under = (root: string) => target === root || target.startsWith(root.replace(/\/+$/, "") + "/");
+    if (!under(base) && !ctx.downloadRoots.some(under)) return jsonRes({ error: "path outside conversation" }, ctx, req, 403);
     const f = Bun.file(target);
     if (!(await f.exists())) return jsonRes({ error: "not found" }, ctx, req, 404);
     const name = target.split("/").pop() || "download";
-    return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"` } });
+    // Images are usually rendered inline in the chat rather than saved, and "attachment" makes
+    // opening one in a new tab download it instead of showing it. Everything else stays an
+    // attachment so a click on a file card is still a download.
+    const inline = /^image\//.test(f.type || "");
+    const safeName = name.replace(/[^A-Za-z0-9._-]/g, "_");
+    return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"` } });
   }
 
   return new Response("Not Found", { status: 404, headers: ctx.cors(req) });

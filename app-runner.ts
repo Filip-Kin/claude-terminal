@@ -373,6 +373,30 @@ export interface ConvOpts {
 // Metadata for a still-open ask_user prompt, so a reconnecting client can re-render it.
 export type PendingAsk = { askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean };
 
+// An exhausted subscription does NOT always arrive as a rate_limit_event. The CLI also injects a
+// SYNTHETIC assistant message whose entire text is "You've hit your session limit · resets 2:30pm
+// (America/New_York)". Nothing recognised it, so that sentence was rendered as if Claude had said it
+// and the turn was silently abandoned: no notice, no auto-resume. Recognise it and treat it as the
+// rejection it is.
+const SESSION_LIMIT_RE = /hit your (?:session|usage) limit/i;
+// The clock time out of that sentence, as a fallback for when no structured resetsAt arrived. The
+// message states its own zone, which on this box is the server's zone, so a local-time reading is
+// correct here; a wrong guess only shifts the displayed time, since armResume re-checks at wake-up.
+function sessionLimitResetAt(text: string, now = Date.now()): number | null {
+  const m = text.match(/resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+  if (!m) return null;
+  const h = (Number(m[1]) % 12) + (/pm/i.test(m[3]) ? 12 : 0);
+  const d = new Date(now);
+  d.setHours(h, Number(m[2] || 0), 0, 0);
+  if (d.getTime() <= now) d.setDate(d.getDate() + 1); // a bare wall clock that has passed means tomorrow
+  return d.getTime();
+}
+function limitNoticeText(resumeAt: number | null): string {
+  if (!resumeAt) return "Subscription limit reached. This turn will auto-resume when the limit resets.";
+  const when = new Date(resumeAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return `Subscription limit reached. This turn will auto-resume around ${when} when the limit resets.`;
+}
+
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
   cwd: string;
@@ -745,8 +769,7 @@ export class Conversation {
     if (!rl || !this.currentTurnText || !this.id) return;
     try {
       armResume({ convId: this.id, text: this.currentTurnText, resumeAt: rl.resumeAt, rateLimitType: rl.type, createdAt: Date.now() });
-      const when = new Date(rl.resumeAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      this.emit({ t: "notice", kind: "info", text: `Subscription limit reached — this turn will auto-resume around ${when} when the limit resets.` });
+      this.emit({ t: "notice", kind: "info", text: limitNoticeText(rl.resumeAt) });
     } catch { /* */ }
   }
 
@@ -807,6 +830,19 @@ export class Conversation {
         break;
       }
       case "assistant": {
+        // A synthetic "You've hit your session limit" message means the turn was refused. It is not
+        // a rate_limit_event, so without this the auto-resume never armed and the user got the bare
+        // sentence instead of the notice. Arm from the message's own clock time.
+        if (anyM.message?.model === "<synthetic>") {
+          const t = textOfContent(anyM.message?.content);
+          if (SESSION_LIMIT_RE.test(t)) {
+            if (!this.pendingRateLimit) {
+              const at = sessionLimitResetAt(t) ?? this.resetAtFrom({});
+              if (at) this.pendingRateLimit = { resumeAt: at, type: "five_hour" };
+            }
+            break; // armRateLimitedResume() emits the notice when the turn ends
+          }
+        }
         // text + thinking are streamed above via stream_event; from the aggregated
         // message we only need tool_use (its input is complete here).
         const blocks = (anyM.message?.content as any[]) || [];
@@ -1027,6 +1063,17 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         out.push({ t: "user", text: txt });
       }
     } else if (o.type === "assistant" && msg) {
+      // Same synthetic session-limit message as the live path. Replaying its text put "You've hit
+      // your session limit" in the thread as though Claude had written it, which is why a reloaded
+      // conversation disagreed with the one that was open when the limit hit.
+      if (msg.model === "<synthetic>") {
+        const t = textOfContent(msg.content);
+        if (SESSION_LIMIT_RE.test(t)) {
+          const at = sessionLimitResetAt(t, o.timestamp ? Date.parse(o.timestamp) || Date.now() : Date.now());
+          out.push({ t: "notice", kind: "info", text: limitNoticeText(at) });
+          continue;
+        }
+      }
       const blocks = (msg.content as any[]) || [];
       for (const b of blocks) {
         if (b?.type === "text") out.push({ t: "text", text: b.text });

@@ -625,6 +625,11 @@ const appCtx: AppCtx = {
   // them wholesale from the chat-app list, same as listTranscripts() does for the terminal drawer.
   hideProjectDirs: (() => { const a: string[] = []; for (const dirs of Object.values(cfg.extraUsers || {})) for (const d of dirs as string[]) a.push(d); return a; })(),
   defaultCwd: SPAWN_CWD,
+  // Roots the chat app may serve files from, on top of each conversation's own cwd. Owner-gated
+  // already (appRoutes requires Remote-User == OWNER), so this is a traversal guard, not an auth
+  // boundary. Defaults to the owner's home; set cfg.downloadRoots to add the data volumes Claude
+  // actually writes to. A guest container leaves it unset and keeps the cwd-only behaviour.
+  downloadRoots: (cfg.downloadRoots as string[] | undefined) || [HOME],
   models: APP_MODELS,
   moreModels: APP_MORE_MODELS,
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
@@ -715,6 +720,12 @@ if (cfg.statusPush !== false) {
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
+  // Bun defaults idleTimeout to 10 SECONDS and kills any connection quiet for that long. The chat
+  // app's SSE streams sit idle between turns and their keepalive ping is every 20s, so the server
+  // was killing every stream before its own keepalive could ever fire: the client saw the socket
+  // drop, waited out `retry: 3000`, reconnected, and repeated forever. That reads as "I keep going
+  // offline" on a perfectly good wired LAN (1058 stream opens in one hour). Well above the ping.
+  idleTimeout: 120,
   async fetch(req) {
     const path = new URL(req.url).pathname;
 
