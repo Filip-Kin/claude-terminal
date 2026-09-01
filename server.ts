@@ -323,11 +323,27 @@ function broadcast() {
   const enc = new TextEncoder();
   for (const c of sseClients) { try { c.enqueue(enc.encode("data: tick\n\n")); } catch {} }
 }
+// At most one push every BROADCAST_MIN_MS. usage.db is in WAL mode and the WAL is written
+// continuously while any session is running, so the old 300ms debounce pushed about three times a
+// second: every open dashboard reloaded and re-rendered every chart at that rate, which burns CPU on
+// every tab and rebuilt the SVG under the cursor, taking any open tooltip with it.
+//
+// A THROTTLE, not a longer debounce. clearTimeout on each write means a bigger debounce window would
+// simply never elapse under a steady write load, and the dashboard would stop updating until the box
+// went quiet. This fires on the leading edge after a lull (so an idle board is still immediate) and
+// at most once per window during a burst.
+const BROADCAST_MIN_MS = 3000;
 let watchTimer: any = null;
+let lastBroadcast = 0;
+function scheduleBroadcast() {
+  if (watchTimer) return; // a push is already pending; it will carry this write too
+  const wait = Math.max(0, BROADCAST_MIN_MS - (Date.now() - lastBroadcast));
+  watchTimer = setTimeout(() => { watchTimer = null; lastBroadcast = Date.now(); broadcast(); }, wait);
+}
 if (USAGE_PAGE) {
   try {
-    // WAL writes land in usage.db-wal, so watch the whole DB directory, debounced.
-    watch(dirname(DB_PATH), () => { clearTimeout(watchTimer); watchTimer = setTimeout(broadcast, 300); });
+    // WAL writes land in usage.db-wal, so watch the whole DB directory.
+    watch(dirname(DB_PATH), scheduleBroadcast);
   } catch (e) { console.error("db watch failed", e); }
 }
 // #endregion
