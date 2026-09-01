@@ -304,6 +304,19 @@ function openBlockIdx(items: Item[], end: number): number {
   return i;
 }
 
+// Freeze a still-live thinking block's duration. applyEvent normally does this when the next event
+// lands, but a turn that ends WITHOUT one (the service restarted, the stream closed, the turn errored)
+// left the block ticking forever: one read "Thinking 598m 32s" the morning after a restart, while the
+// conversation list correctly showed the chat as idle.
+function freezeThinking(items: Item[]): Item[] {
+  const i = openBlockIdx(items, liveEnd(items));
+  const l = items[i];
+  if (!l || l.kind !== "thinking" || !l.started || l.elapsed != null) return items;
+  const c = items.slice();
+  c[i] = { ...l, elapsed: Date.now() - l.started };
+  return c;
+}
+
 // `queued` = this event arrived while a turn was already streaming (see isQueuedUser). Only the two
 // call sites that know the conversation is mid-turn pass it; every replay/fold path leaves it false
 // and therefore behaves exactly as it did before.
@@ -505,7 +518,7 @@ class ConvStore {
         if (e.sessionId && e.sessionId !== this.id) this.mgr.rebind(this, e.sessionId);
         this.mgr.hooks?.onInit(this, e.sessionId);
         return;
-      case "busy": this.busy = e.busy; this.signal(); return;
+      case "busy": this.busy = e.busy; if (!e.busy) { this.items = freezeThinking(this.items); this.touch(); } this.signal(); return;
       case "compacting":
         this.compacting = e.active; this.compactStart = e.active ? (this.compactStart || Date.now()) : 0; this.signal(); return;
       case "compact":
@@ -525,8 +538,8 @@ class ConvStore {
         this.busy = false; this.items = applyEvent(this.items, e); this.touch();
         this.mgr.hooks?.onResult(this); this.mgr.hooks?.onContext(this); return;
       case "error":
-        this.busy = false; this.items = unqueue(addItem(this.items, { kind: "assistant", text: "\n\n_error: " + e.message + "_" })); this.touch(); return;
-      case "closed": this.disconnect(); return;
+        this.busy = false; this.items = unqueue(addItem(freezeThinking(this.items), { kind: "assistant", text: "\n\n_error: " + e.message + "_" })); this.touch(); return;
+      case "closed": this.items = freezeThinking(this.items); this.touch(); this.disconnect(); return;
       default: this.items = applyEvent(this.items, e); this.touch(); return;
     }
   }
