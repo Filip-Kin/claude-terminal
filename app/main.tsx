@@ -290,20 +290,37 @@ function unqueue(items: Item[]): Item[] {
   return items.map((it) => (it.kind === "user" && it.queued ? { kind: "user", text: it.text } as Item : it));
 }
 
+// A background task reporting in, or a message relayed from another session, is ASYNCHRONOUS: it
+// arrives when it happens, not at a content-block boundary, so it is not evidence that the model
+// finished what it was writing. Every other event in the stream is in-band and does end a block.
+const isAsyncNotice = (it: Item | undefined): boolean => !!it && it.kind === "notice" && (it.noticeKind === "task" || it.noticeKind === "peer");
+// Index of the block a delta continues: the last item that is not an async notice. Without the skip
+// a task card landing mid-sentence became the last item, the next text_delta found no assistant
+// bubble to grow, and the paragraph was cut at whatever character had arrived: "...whether those f"
+// / task card / "ixes are actually systematic."
+function openBlockIdx(items: Item[], end: number): number {
+  let i = end - 1;
+  while (i >= 0 && isAsyncNotice(items[i])) i--;
+  return i;
+}
+
 // `queued` = this event arrived while a turn was already streaming (see isQueuedUser). Only the two
 // call sites that know the conversation is mid-turn pass it; every replay/fold path leaves it false
 // and therefore behaves exactly as it did before.
 function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
   const end = liveEnd(items); // = items.length unless a message is queued behind the live turn
+  const open = openBlockIdx(items, end); // = end - 1 unless an async notice landed mid-block
   // Freeze a live "thinking" block's duration the instant the first non-thinking event lands, so
   // "Thought for Ns" is fixed once the model stops reasoning (and survives reconnects in state).
-  if (e.t !== "thinking" && e.t !== "thinking_delta" && e.t !== "thinking_progress") {
-    const l = items[end - 1];
+  // An async notice is not such an event: the model is still thinking, a task just reported in.
+  const asyncNoticeEvent = e.t === "notice" && (e.kind === "task" || e.kind === "peer");
+  if (e.t !== "thinking" && e.t !== "thinking_delta" && e.t !== "thinking_progress" && !asyncNoticeEvent) {
+    const l = items[open];
     if (l && l.kind === "thinking" && l.started && l.elapsed == null) {
-      items = items.slice(); items[end - 1] = { ...l, elapsed: Date.now() - l.started };
+      items = items.slice(); items[open] = { ...l, elapsed: Date.now() - l.started };
     }
   }
-  const last = items[end - 1];
+  const last = items[open];
   switch (e.t) {
     case "user": {
       // A loaded skill arrives as a user message that dumps the whole skill file ("Base directory
@@ -320,14 +337,14 @@ function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
     case "text_delta":
       // Still mid-paragraph: grow the block and leave anything queued pinned below it. Splitting a
       // sentence to slot a message in is the thing we are avoiding.
-      if (last && last.kind === "assistant") { const c = items.slice(); c[end - 1] = { ...last, text: last.text + e.text }; return c; }
+      if (last && last.kind === "assistant") { const c = items.slice(); c[open] = { ...last, text: last.text + e.text }; return c; }
       // A NEW text block is the clean seam: the previous paragraph is finished and any tool cards are
       // already rendered, so release whatever was queued and let this paragraph land AFTER it. The
       // message ends up between the tool uses and the next part of the reply, instead of staying
       // pinned at the very bottom while the response grew above it.
       return [...unqueue(items), { kind: "assistant", text: e.text }];
     case "thinking_delta":
-      if (last && last.kind === "thinking") { const c = items.slice(); c[end - 1] = { ...last, text: last.text + e.text }; return c; }
+      if (last && last.kind === "thinking") { const c = items.slice(); c[open] = { ...last, text: last.text + e.text }; return c; }
       return [...unqueue(items), { kind: "thinking", text: e.text, started: Date.now() }];
     case "thinking_progress": {
       // estimated_tokens resets across thinking sub-segments (goes up, then drops back on a new
@@ -340,7 +357,7 @@ function applyEvent(items: Item[], e: AppEvent, queued = false): Item[] {
         const nextBase = v < peak ? base + peak : base; // reset detected -> bank the last peak
         const nextPeak = v < peak ? v : v;
         const c = items.slice();
-        c[end - 1] = { ...last, _base: nextBase, _peak: nextPeak, tokens: nextBase + nextPeak };
+        c[open] = { ...last, _base: nextBase, _peak: nextPeak, tokens: nextBase + nextPeak };
         return c;
       }
       return [...unqueue(items), { kind: "thinking", text: "", tokens: v, _base: 0, _peak: v, started: Date.now() }];
