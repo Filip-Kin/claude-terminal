@@ -505,6 +505,10 @@
   newBtn.className = "ctab-btn ctab-new";
   newBtn.textContent = "+";
   newBtn.title = "New session";
+  const spawnBtn = document.createElement("div"); // spawn a detached tab on a prompt + model (ct-spawn)
+  spawnBtn.className = "ctab-btn ctab-spawn";
+  spawnBtn.title = "Spawn a tab on a prompt";
+  spawnBtn.textContent = "\u26A1";
   const spacer = document.createElement("div");
   spacer.className = "ctab-spacer";
   const usageBtn = document.createElement("a");
@@ -547,6 +551,7 @@
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
+  bar.appendChild(spawnBtn); // ct-spawn
   bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(netBtn);
   bar.appendChild(chatBtn); // link out to the /app chat UI
@@ -619,6 +624,97 @@
   }
 
   async function newSession() {
+  // #region spawn dialog (ct-spawn)
+  // "+" opens a plain interactive tab. This opens a DETACHED tab already working on a prompt, on a
+  // model you choose: the same thing `claude-spawn --prompt … --model …` does from a chat, so the UI
+  // offers exactly what the route accepts (prompt, name, cwd, model). Self-contained: its own CSS
+  // and DOM, nothing shared with the other modals, so it survives them changing.
+  let spawnEl = null, spawnEsc = null, spawnModels = null;
+  const SPAWN_CSS = [
+    "#ct-spawnmodal{position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif}",
+    "#ct-spawnmodal .ct-spawn{width:min(560px,94vw);max-height:90vh;display:flex;flex-direction:column;background:#1f1f1f;color:#e6e6e6;border:1px solid #383838;border-radius:12px;box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}",
+    "#ct-spawnmodal .ct-spawn-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-spawnmodal .ct-spawn-x{cursor:pointer;font-size:20px;line-height:1;opacity:.7}#ct-spawnmodal .ct-spawn-x:hover{opacity:1}",
+    "#ct-spawnmodal .ct-spawn-body{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px}",
+    "#ct-spawnmodal label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#aaa}",
+    "#ct-spawnmodal input,#ct-spawnmodal textarea,#ct-spawnmodal select{font:inherit;font-size:14px;color:inherit;background:#161616;border:1px solid #3a3a3a;border-radius:8px;padding:8px 10px;outline:none}",
+    "#ct-spawnmodal textarea{min-height:120px;resize:vertical}",
+    "#ct-spawnmodal input:focus,#ct-spawnmodal textarea:focus,#ct-spawnmodal select:focus{border-color:#6b8afd}",
+    "#ct-spawnmodal .ct-spawn-row{display:flex;gap:10px}#ct-spawnmodal .ct-spawn-row label{flex:1 1 0;min-width:0}",
+    "#ct-spawnmodal .ct-spawn-foot{flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;padding:10px 14px;border-top:1px solid #383838}",
+    "#ct-spawnmodal button{font:inherit;font-size:13px;padding:7px 14px;border-radius:8px;border:1px solid #3a3a3a;background:#262626;color:#e6e6e6;cursor:pointer}",
+    "#ct-spawnmodal button.primary{background:#3b82f6;border-color:#3b82f6;color:#fff}#ct-spawnmodal button:disabled{opacity:.5;cursor:default}",
+    "#ct-spawnmodal .ct-spawn-err{color:#f87171;font-size:12px;min-height:14px}",
+    "body.theme-light #ct-spawnmodal .ct-spawn{background:#fff;color:#222;border-color:#ddd}",
+    "body.theme-light #ct-spawnmodal .ct-spawn-head,body.theme-light #ct-spawnmodal .ct-spawn-foot{border-color:#ececec}",
+    "body.theme-light #ct-spawnmodal input,body.theme-light #ct-spawnmodal textarea,body.theme-light #ct-spawnmodal select{background:#fafafa;border-color:#d7d7d7;color:#222}",
+    "body.theme-light #ct-spawnmodal button{background:#f3f3f3;border-color:#d7d7d7;color:#333}",
+    "body.theme-light #ct-spawnmodal label{color:#666}",
+  ].join("\n");
+  function closeSpawn() {
+    if (spawnEl) { spawnEl.remove(); spawnEl = null; }
+    if (spawnEsc) { document.removeEventListener("keydown", spawnEsc, true); spawnEsc = null; }
+  }
+  async function loadSpawnModels() {
+    if (spawnModels) return spawnModels;
+    try {
+      const r = await api("app/api/models");
+      const d = await r.json();
+      spawnModels = (d.models || []).concat(d.moreModels || []).map((m) => ({ id: m.id, label: m.label || m.id }));
+    } catch (e) { spawnModels = []; }
+    // The CLI's aliases always work even if the probe failed, so the menu is never empty.
+    if (!spawnModels.length) spawnModels = [{ id: "opus", label: "Opus" }, { id: "sonnet", label: "Sonnet" }, { id: "haiku", label: "Haiku" }, { id: "fable", label: "Fable" }];
+    return spawnModels;
+  }
+  async function openSpawn() {
+    if (spawnEl) return;
+    if (!document.getElementById("ct-spawn-css")) { const st = document.createElement("style"); st.id = "ct-spawn-css"; st.textContent = SPAWN_CSS; document.head.appendChild(st); }
+    spawnEl = document.createElement("div"); spawnEl.id = "ct-spawnmodal";
+    const panel = document.createElement("div"); panel.className = "ct-spawn";
+    const head = document.createElement("div"); head.className = "ct-spawn-head";
+    const h = document.createElement("span"); h.textContent = "Spawn a tab";
+    const x = document.createElement("span"); x.className = "ct-spawn-x"; x.textContent = "\u00d7"; x.addEventListener("click", closeSpawn);
+    head.appendChild(h); head.appendChild(x);
+    const body = document.createElement("div"); body.className = "ct-spawn-body";
+    const mk = (labelText, el) => { const l = document.createElement("label"); l.textContent = labelText; l.appendChild(el); return l; };
+    const prompt = document.createElement("textarea"); prompt.placeholder = "What the new tab's Claude should start working on. It auto-submits.";
+    const name = document.createElement("input"); name.placeholder = "short-name (optional, becomes the tab and agent name)";
+    const cwd = document.createElement("input"); cwd.placeholder = "working directory (optional)";
+    const model = document.createElement("select");
+    const def = document.createElement("option"); def.value = ""; def.textContent = "Default model"; model.appendChild(def);
+    loadSpawnModels().then((ms) => { for (const m of ms) { const o = document.createElement("option"); o.value = m.id; o.textContent = m.label; model.appendChild(o); } });
+    const err = document.createElement("div"); err.className = "ct-spawn-err";
+    const row = document.createElement("div"); row.className = "ct-spawn-row";
+    row.appendChild(mk("Name", name)); row.appendChild(mk("Model", model));
+    body.appendChild(mk("Prompt", prompt)); body.appendChild(row); body.appendChild(mk("Directory", cwd)); body.appendChild(err);
+    const foot = document.createElement("div"); foot.className = "ct-spawn-foot";
+    const cancel = document.createElement("button"); cancel.textContent = "Cancel"; cancel.addEventListener("click", closeSpawn);
+    const go = document.createElement("button"); go.className = "primary"; go.textContent = "Spawn";
+    go.addEventListener("click", async () => {
+      const p = prompt.value.trim();
+      if (!p) { err.textContent = "A prompt is required."; prompt.focus(); return; }
+      go.disabled = true; err.textContent = "";
+      try {
+        const r = await api("sessions/spawn", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: p, name: name.value.trim() || undefined, cwd: cwd.value.trim() || undefined, model: model.value || undefined }) });
+        if (!r.ok) { err.textContent = (await r.text()) || ("Spawn failed (" + r.status + ")"); go.disabled = false; return; }
+        const { id } = await r.json();
+        closeSpawn();
+        showToast("Spawned " + id + (model.value ? " on " + (model.options[model.selectedIndex] || {}).textContent : ""), "ok");
+        refresh(); // the tab appears in the bar; it keeps working whether or not you open it
+      } catch (e) { err.textContent = "Could not reach the server."; go.disabled = false; }
+    });
+    foot.appendChild(cancel); foot.appendChild(go);
+    panel.appendChild(head); panel.appendChild(body); panel.appendChild(foot);
+    spawnEl.appendChild(panel);
+    spawnEl.addEventListener("click", (e) => { if (e.target === spawnEl) closeSpawn(); });
+    spawnEsc = (e) => { if (e.key === "Escape") { e.stopPropagation(); closeSpawn(); } };
+    document.addEventListener("keydown", spawnEsc, true);
+    document.body.appendChild(spawnEl);
+    prompt.focus();
+  }
+  // #endregion
+
     try {
       const r = await api("sessions/new", { method: "POST" });
       const { id } = await r.json();
@@ -1378,6 +1474,13 @@
       const subBody = Object.assign({}, sub.toJSON(), { cadence: /Android/i.test(navigator.userAgent), ua: navigator.userAgent });
       await api("subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(subBody) });
       showToast("Notifications enabled 🦆", "success");
+    const srow = document.createElement("div"); srow.className = "ct-draw-row ct-draw-new"; // ct-spawn
+    const sp = document.createElement("span"); sp.textContent = "\u26A1";
+    sp.style.cssText = "width:9px;display:flex;justify-content:center;font-size:15px;flex:0 0 auto";
+    const sl = document.createElement("span"); sl.className = "lbl"; sl.textContent = "Spawn a tab on a prompt";
+    srow.appendChild(sp); srow.appendChild(sl);
+    srow.addEventListener("click", () => { closeDrawer(); openSpawn(); });
+    list.appendChild(srow);
     } catch (e) {
       log("subscribe failed", e);
       showToast("Could not enable notifications", "error");
@@ -1415,6 +1518,7 @@
   }
   // #endregion
 
+  spawnBtn.addEventListener("click", openSpawn); // ct-spawn
   // #region watch heartbeat (suppress pushes for the tab you're actively looking at)
   // While this tab is on screen, tell the server which session it's showing so a
   // prompt-finished/waiting push for that session is suppressed. On mobile the app
