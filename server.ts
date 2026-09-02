@@ -584,9 +584,10 @@ const SPAWN_HELPER: string =
 // root, a guest's /workspace). Falls back to HOME.
 const SPAWN_CWD: string = cfg.spawnCwd || HOME;
 
-async function spawnWorker(name: string | undefined, cwd: string, prompt: string): Promise<{ id: string } | { error: string }> {
+async function spawnWorker(name: string | undefined, cwd: string, prompt: string, model?: string): Promise<{ id: string } | { error: string }> {
   const args = [SPAWN_HELPER, "--cwd", cwd, "--prompt-file", "-"]; // prompt over stdin: no argv limit, no quoting
   if (name) args.push("--name", name);
+  if (model) args.push("--model", model); // straight through to `claude --model`; omitted = the CLI's default
   try {
     const proc = Bun.spawn(args, {
       env: { ...process.env, TMUX_TMPDIR: process.env.TMUX_TMPDIR || "/tmp" },
@@ -992,7 +993,9 @@ const server = Bun.serve({
       if (!prompt) return new Response("Missing prompt", { status: 400 });
       const cwd = body.cwd ? String(body.cwd) : SPAWN_CWD;
       const name = body.name ? String(body.name).replace(/[^A-Za-z0-9_-]/g, "") : undefined;
-      const res = await spawnWorker(name || undefined, cwd, prompt);
+      // Model alias or full id (opus, fable, claude-fable-5-1). Same charset the CLI accepts.
+      const model = body.model ? String(body.model).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 64) : undefined;
+      const res = await spawnWorker(name || undefined, cwd, prompt, model || undefined);
       if ("error" in res) return new Response(res.error, { status: 500 });
       pending.set(res.id, Math.floor(Date.now() / 1000)); // show the tab instantly
       return Response.json({ id: res.id }, { headers: cors(req) });
