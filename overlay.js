@@ -547,7 +547,6 @@
   bar.appendChild(listEl);
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
-  bar.appendChild(spawnBtn); // ct-spawn
   bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(netBtn);
   bar.appendChild(chatBtn); // link out to the /app chat UI
@@ -1409,7 +1408,6 @@
     bellBtn.classList.toggle("on", on);
   }
   if (pushSupported()) {
-  spawnBtn.addEventListener("click", openSpawn); // ct-spawn
     bellBtn.addEventListener("click", async () => { await toggleNotif(); paintBell(); });
     paintBell();
   } else {
