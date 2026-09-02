@@ -48,6 +48,7 @@ export interface SpawnedEntry {
   running: boolean;
   failed?: boolean;
   startedAt?: number;       // epoch ms
+  endedAt?: number;         // epoch ms it finished, when the server tells us (or start + duration)
   durationMs?: number;
   tokens?: number;
   toolUses?: number;
@@ -160,7 +161,7 @@ function normEntry(raw: unknown, i: number): SpawnedEntry | null {
     sessionId: sessionId ?? str(tb.sessionId),
     running: !!running,
     failed: failed || undefined,
-    startedAt, durationMs,
+    startedAt, endedAt: running ? undefined : (endedAt ?? (startedAt && durationMs ? startedAt + durationMs : undefined)), durationMs,
     tokens: num(o.tokens) ?? num(o.totalTokens) ?? num(wf.totalTokens) ?? num(usage.total) ?? num(usage.totalTokens),
     toolUses: num(o.toolUses) ?? num(o.tool_uses) ?? num(o.toolCalls) ?? num(o.toolCount) ?? num(o.tools) ?? num(wf.totalToolCalls),
     lastTool: str(o.lastTool) ?? str(o.last_tool) ?? str(o.currentTool),

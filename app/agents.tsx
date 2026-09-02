@@ -518,10 +518,27 @@ function runningLabel(running: SpawnedEntry[]): string {
   return running.length === 1 ? `1 ${noun} running` : `${running.length} ${noun === "spawned" ? noun : noun + "s"} running`;
 }
 
+// How long a finished item lingers in the pinned strip before it lives only in the full-screen list.
+const STRIP_FINISHED_MS = 60 * 60 * 1000; // an hour
+// A finished LOCAL entry (parsed from the thread) may carry no end time. Stamp when we first saw it
+// finished so it still ages out. Module scope so it survives re-renders; a reload re-derives, and by
+// then the server list usually carries a real endedAt anyway.
+const firstSeenFinished = new Map<string, number>();
+function finishedAt(e: SpawnedEntry, now: number): number {
+  if (e.endedAt) return e.endedAt;
+  let t = firstSeenFinished.get(e.key);
+  if (t == null) { t = now; firstSeenFinished.set(e.key, t); }
+  return t;
+}
+
 function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[]; onOpen?: (e: SpawnedEntry) => void; onOpenIndex?: () => void }): React.JSX.Element | null {
   injectAgentStripCss();
+  const now = Date.now();
   const running = entries.filter((e) => e.running);
-  const rest = entries.length - running.length;
+  // Show running work, plus anything finished in the last hour so you actually see it complete. Older
+  // finished work drops out of the pinned strip and stays reachable only in the full list.
+  const shown = entries.filter((e) => e.running || now - finishedAt(e, now) < STRIP_FINISHED_MS);
+  const rest = entries.length - shown.length; // finished + aged out of the strip
   if (!entries.length) return null;
 
   const row = (e: SpawnedEntry) => {
@@ -536,33 +553,37 @@ function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[];
       </>
     );
     const hint = e.kind === "tab" ? `Switch to this conversation — ${e.label}` : `Open this ${KIND_LABEL[e.kind].toLowerCase()} — ${e.label}`;
+    const cls = "as-row" + (e.running ? "" : " as-row-done"); // finished rows dim, so the eye goes to what's live
     return onOpen
-      ? <button className="as-row as-tap" key={e.key} onClick={() => onOpen(e)} title={hint}>{body}</button>
-      : <div className="as-row" key={e.key}>{body}</div>;
+      ? <button className={cls + " as-tap"} key={e.key} onClick={() => onOpen(e)} title={hint}>{body}</button>
+      : <div className={cls} key={e.key}>{body}</div>;
   };
 
-  // Nothing in flight: render NOTHING. The idle "N spawned · review" line sat above the composer
-  // permanently for any conversation that had ever used an agent, which is clutter in the one place
-  // that has to stay small on a phone. Finished work is still reachable: the strip appears while
-  // agents run and its header button opens the full-screen view, which lists finished items too.
-  if (!running.length) return null;
+  // Nothing running AND nothing finished recently: render NOTHING. The idle "N spawned · review" line
+  // used to sit above the composer permanently for any conversation that had ever used an agent, which
+  // is clutter in the one place that has to stay small on a phone. Everything stays reachable through
+  // the header button, which opens the full-screen view that lists finished items too.
+  if (!shown.length) return null;
 
+  const headLabel = running.length ? runningLabel(running) : `${shown.length} recently finished`;
   return (
     <div className="as-strip" role="status" aria-live="polite">
       {onOpenIndex ? (
         <button className="as-head as-head-tap" onClick={onOpenIndex} title="Open the full spawned-work view">
-          <span className="as-spin" aria-hidden="true" />
-          <span className="as-head-label">{runningLabel(running)}</span>
-          {rest > 0 && <span className="as-sub">{rest} finished</span>}
+          {running.length ? <span className="as-spin" aria-hidden="true" /> : null}
+          <span className="as-head-label">{headLabel}</span>
+          {rest > 0 && <span className="as-sub">{rest} more</span>}
           <span className="as-chev" aria-hidden="true">›</span>
         </button>
       ) : (
         <div className="as-head">
-          <span className="as-spin" aria-hidden="true" />
-          {runningLabel(running)}
+          {running.length ? <span className="as-spin" aria-hidden="true" /> : null}
+          {headLabel}
         </div>
       )}
-      {running.map(row)}
+      {/* Capped + scrollable: a run with many agents (7+ observed) must not push the composer off
+          the screen. About five rows tall, then scroll. */}
+      <div className="as-rows">{shown.map(row)}</div>
     </div>
   );
 }
@@ -637,7 +658,9 @@ function injectAgentStripCss() {
   .as-head-label{flex:1;min-width:0}
   .as-spin{width:11px;height:11px;border-radius:50%;border:2px solid var(--line,#3a322c);border-top-color:var(--accent,#d97757);animation:as-spin .9s linear infinite;flex:0 0 auto}
   @keyframes as-spin{to{transform:rotate(360deg)}}
+  .as-rows{max-height:180px;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;margin:0 -4px;padding:0 4px}
   .as-row{display:flex;align-items:center;gap:8px;padding:3px 0;min-width:0;width:100%}
+  .as-row-done .as-ic,.as-row-done .as-label{opacity:.55}
   .as-tap{background:transparent;border:0;color:inherit;font:inherit;text-align:left;cursor:pointer;padding:5px 6px;margin:0 -6px;border-radius:7px;min-height:32px}
   .as-tap:hover,.as-tap:focus-visible{background:var(--bg-3,#2a2420);outline:none}
   .as-dot{width:6px;height:6px;border-radius:50%;background:var(--accent,#d97757);flex:0 0 auto}
