@@ -105,6 +105,19 @@ type Item =
   | { kind: "compact"; savedTokens?: number; durationMs?: number; pctBefore?: number; pctAfter?: number };
 // #endregion
 
+// The model the CLI/SDK reports for a conversation is the RESOLVED id (claude-fable-5-1), but a
+// picker entry can carry a context-window suffix (claude-fable-5-1[1m]), so an exact id compare
+// misses and the selector shows the raw id instead of highlighting the right row. Match on the base
+// id (before any "[...]") and return the picker's own id. Unknown, or the list not loaded yet -> unchanged.
+const baseModelId = (id: string) => id.replace(/\[[^\]]*\]$/, "");
+function canonicalModelId(reported: string, list: { id: string }[]): string {
+  if (!reported || !list.length) return reported;
+  if (list.some((m) => m.id === reported)) return reported;
+  const base = baseModelId(reported);
+  const hit = list.find((m) => baseModelId(m.id) === base);
+  return hit ? hit.id : reported;
+}
+
 // #region api
 const J = (r: Response) => r.json();
 // Reject a request that hasn't resolved within `ms`. A hung POST on a weak link never rejects on its
@@ -1203,7 +1216,8 @@ function App() {
   // conversation changes that conversation alone.
   const [defaultModel, setDefaultModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
-  const model = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
+  const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
+  const model = canonicalModelId(rawModel, [...models, ...moreModels]);
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
