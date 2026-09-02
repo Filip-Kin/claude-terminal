@@ -317,14 +317,18 @@ export interface MergedToolItem {
   result?: unknown;
   isError?: boolean;
   progress?: AgentProgress; // live subagent progress merged on by main.tsx (agent_progress event)
+  done?: "completed" | "failed" | "stopped"; // a background agent's task_notification (main.tsx agent_done event)
 }
 
 // Drop-in replacement for <ToolCard> when the tool is a subagent/workflow. main.tsx can, in its
 // item-render switch, check isAgentTool(it.name, it.input) and render this instead of <ToolCard>.
 export function AgentToolCard({ it }: { it: MergedToolItem }) {
   const toolResult = it.result === undefined ? undefined : { content: it.result, isError: it.isError };
-  // `running` is left to the card: it knows a launch ack is not a result.
-  return <AgentActivityCard toolUse={{ id: it.id, name: it.name, input: it.input }} toolResult={toolResult} progress={it.progress} />;
+  // `running` is left to the card (it knows a launch ack is not a result) UNLESS the server has said
+  // the background agent finished: its tool_result was only the ack, so the card would never learn.
+  const running = it.done ? false : undefined;
+  const failed = it.done === "failed" || it.done === "stopped";
+  return <AgentActivityCard toolUse={{ id: it.id, name: it.name, input: it.input }} toolResult={failed && !toolResult ? { content: `Agent ${it.done}.`, isError: true } : toolResult} running={running} progress={it.progress} />;
 }
 // #endregion
 

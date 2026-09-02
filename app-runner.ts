@@ -86,7 +86,10 @@ export type AppEvent =
   // Context window occupancy, from the usage the API reports on every assistant message. One source.
   | { t: "context"; used: number; max?: number }
   // The model this conversation runs on: at init, and whenever it is switched.
-  | { t: "model"; model: string };
+  | { t: "model"; model: string }
+  // A background subagent finished. Its Task tool_result was only a launch ack, so without this the
+  // card said "Running" forever after the work was done.
+  | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string };
 
 export type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
@@ -893,6 +896,7 @@ export class Conversation {
         else if (anyM.subtype === "task_notification") {
           const extra = anyM.usage ? ` (${anyM.usage.total_tokens || 0} tokens, ${anyM.usage.tool_uses || 0} tools)` : "";
           this.emit({ t: "notice", kind: "task", text: String(anyM.summary || "background task") + extra, status: String(anyM.status || "done") });
+          if (anyM.tool_use_id) this.emit({ t: "agent_done", id: String(anyM.tool_use_id), status: anyM.status || "completed", summary: anyM.summary ? String(anyM.summary).slice(0, 400) : undefined });
         }
         else if (anyM.subtype === "notification") {
           const isPeer = anyM.triggeredBy === "peer-send-message" || anyM.provenance === "peer-send-message";
@@ -1254,6 +1258,8 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         // output/thinking = cumulative turn totals so the footer matches what was shown live.
         out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output: turnOut, thinking: turnThink, cacheCreate, cacheRead, context, total: context + turnOut, costUsd: 0, durationMs } });
       }
+    } else if (o.type === "system" && o.subtype === "task_notification" && o.tool_use_id) {
+      out.push({ t: "agent_done", id: String(o.tool_use_id), status: o.status || "completed", summary: o.summary ? String(o.summary).slice(0, 400) : undefined });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       turnOut = 0; turnThink = 0; turnStartTs = 0; // compaction is a fresh turn boundary
       const md = compactMeta(o); // transcript spells it compactMetadata/camelCase, the live SDK compact_metadata/snake_case

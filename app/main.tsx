@@ -85,7 +85,8 @@ type AppEvent =
   | { t: "status"; phase: Phase; since: number; detail?: string; _seq?: number } // what the runner is doing, from the SDK's own events
   | { t: "block_end"; bid: string; _seq?: number }                     // a streamed block finished (exact end of a thinking timer)
   | { t: "context"; used: number; max?: number; _seq?: number }        // context occupancy, from the usage on each assistant message
-  | { t: "model"; model: string; _seq?: number };                      // the model this conversation runs on
+  | { t: "model"; model: string; _seq?: number }                       // the model this conversation runs on
+  | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string; _seq?: number }; // a background subagent finished
 type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
 type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
@@ -98,7 +99,7 @@ type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; usage?: TurnUsage; bid?: string }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
-  | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string } }
+  | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }; done?: "completed" | "failed" | "stopped" }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "notice"; noticeKind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
   | { kind: "compact"; savedTokens?: number; durationMs?: number; pctBefore?: number; pctAfter?: number };
@@ -277,9 +278,9 @@ let activeCtxMax = DEFAULT_CTX;
 
 // Freeze every live thinking block (one with a start and no end). The normal path is an exact
 // block_end from the stream; this covers the turn ending or the socket dying without one.
-function freezeOpen(items: Item[]): Item[] {
+function freezeOpen(items: Item[], all = false): Item[] {
   let out: Item[] | null = null;
-  for (let i = items.length - 1; i >= 0 && i >= items.length - 20; i--) {
+  for (let i = items.length - 1; i >= 0 && (all || i >= items.length - 20); i--) {
     const it = items[i];
     if (it.kind === "thinking" && it.started && it.elapsed == null) { out = out || items.slice(); out[i] = { ...it, elapsed: Date.now() - it.started }; }
   }
@@ -350,6 +351,13 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
         if (it.kind === "tool" && it.id === e.id) { const c = items.slice(); c[i] = { ...it, progress: { tokens: e.tokens, toolUses: e.toolUses, durationMs: e.durationMs, lastTool: e.lastTool } }; return c; }
       }
       return items; // the Task tool_use card hasn't arrived yet -> ignore
+    }
+    case "agent_done": {
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (it.kind === "tool" && it.id === e.id) { const c = items.slice(); c[i] = { ...it, done: e.status }; return c; }
+      }
+      return items;
     }
     case "tool_result": {
       for (let i = items.length - 1; i >= 0; i--) {
@@ -587,6 +595,9 @@ class ConvStore {
 
   // ---- hydration + reconcile (the cache-vs-network policy) ----
   hydrate(items: Item[], meta: { busy?: boolean; cwd?: string | null; evCount?: number }) {
+    // A thinking timer that was live when the cache was written is stale now, whatever the clock
+    // says: one read "Thinking 382m" the evening after a restart. Freeze every one on the way in.
+    items = freezeOpen(items, true);
     this.items = items; this.cachedItems = items; this.hydrated = true;
     if (meta.busy != null) this.busy = meta.busy;
     if (meta.cwd != null) this.cwd = meta.cwd;
@@ -942,18 +953,21 @@ function PhaseLine({ phase, since, detail }: { phase: Phase; since: number; deta
 // Thinking indicator. LIVE: "Thinking… 12s · ~340 tokens" ticking each second. When done we hide
 // the standalone indicator (the turn summary under the final reply carries the totals), unless the
 // platform actually exposed the reasoning text — then we show that.
-function ThinkingCard({ it, isLast }: { it: Extract<Item, { kind: "thinking" }>; isLast: boolean }) {
+function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinking" }>; isLast: boolean; busy: boolean }) {
+  // Live means: last item, no block_end yet, and the conversation is actually busy. Before the third
+  // condition a stale block at the end of a dead turn ticked from its start time forever.
+  const live = isLast && it.elapsed == null && busy;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!isLast) return; // only the live block ticks
+    if (!live) return; // only the live block ticks
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
-  }, [isLast]);
-  if (!isLast) {
+  }, [live]);
+  if (!live) {
     // finished: only worth showing if the reasoning text is exposed (usually redacted on subscription auth)
     return it.text ? (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>) : null;
   }
-  const secs = it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
+  const secs = it.elapsed != null ? Math.round(it.elapsed / 1000) : it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
   const meta = [secs == null ? "" : fmtDur(secs), it.tokens ? `~${it.tokens} tokens` : ""].filter(Boolean).join(" · ");
   return (
     <div className="thinking-live">
@@ -1008,7 +1022,7 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
   );
 }
 
-function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
+function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy }: { items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
   // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
   // audio actually plays (Kokoro TTS can take a moment), then a subtle "playing" state until it ends.
@@ -1073,7 +1087,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
     return <div className="compact-div">conversation compacted</div>;
   }
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
-  if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
+  if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} busy={!!busy} />;
   if (it.kind === "tool") return isAgentTool(it.name, it.input) ? <div data-agent-id={it.id}><AgentToolCard it={it} /></div> : <ToolCard it={it} />;
   if (it.kind === "notice") {
     if (it.noticeKind === "skill") {
@@ -1128,6 +1142,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
 // turn-final footer), so compare exactly those: during streaming only the tail item changes
 // identity, so only the tail re-renders.
 const MessageBlock = React.memo(MessageBlockInner, (a, b) => {
+  if (a.busy !== b.busy) return false; // a thinking timer's liveness depends on it
   if (a.i !== b.i || a.convId !== b.convId || a.sendStatus !== b.sendStatus || a.reading !== b.reading) return false;
   if (a.onAnswer !== b.onAnswer || a.onMenu !== b.onMenu || a.onOpenArtifact !== b.onOpenArtifact) return false;
   if (a.items === b.items) return true;
@@ -2380,7 +2395,7 @@ function App() {
           i = j - 1; continue;
         }
       }
-      nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
+      nodes.push(<MessageBlock key={i} items={items} i={i} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
     }
     return nodes;
   }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, setArtifact]);
