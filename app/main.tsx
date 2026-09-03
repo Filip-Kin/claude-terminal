@@ -117,6 +117,20 @@ function canonicalModelId(reported: string, list: { id: string }[]): string {
   const hit = list.find((m) => baseModelId(m.id) === base);
   return hit ? hit.id : reported;
 }
+// A friendly name for a model the picker list does not carry. The dynamic list from the CLI is only
+// the handful of current models, so a conversation that last ran on, say, claude-opus-5 had no row to
+// match and the pill showed the raw id — which looks broken. Turn "claude-opus-5" into "Opus 5",
+// "claude-opus-4-8" into "Opus 4.8", dropping a claude- prefix and any trailing yyyymmdd date.
+function prettyModel(id: string): string {
+  if (!id) return "Model";
+  let t = id.replace(/^claude-/, "").replace(/\[[^\]]*\]$/, "").replace(/-\d{8}$/, "");
+  if (t === "default") return "Default";
+  const parts = t.split("-");
+  const fam = parts.shift() || t;
+  const family = fam.charAt(0).toUpperCase() + fam.slice(1);
+  const version = parts.join(".");
+  return version ? `${family} ${version}` : family;
+}
 
 // #region api
 const J = (r: Response) => r.json();
@@ -2326,7 +2340,7 @@ function App() {
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey && !IS_TOUCH) { e.preventDefault(); void doSend(); } };
   const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => { setInput(e.target.value); const ta = e.target; ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; };
 
-  const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || model || "Model";
+  const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || prettyModel(model);
   // Collapsed pill: drop any "(…)" qualifier so it stays short and single-line (e.g. "Default
   // (recommended)" -> "Default"). The dropdown row keeps the full name + description.
   const modelBtnLabel = modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel;
