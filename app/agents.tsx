@@ -531,8 +531,17 @@ function finishedAt(e: SpawnedEntry, now: number): number {
   return t;
 }
 
+// Minimized/expanded state for the pinned strip, persisted in localStorage so a fold survives a
+// reload and a turn boundary. A module-level store rather than component state so it does not reset
+// when the list re-renders from a poll.
+const collapsedStrip = {
+  get(): boolean { try { return localStorage.getItem("ct-spawn-collapsed") === "1"; } catch { return false; } },
+  set(v: boolean) { try { localStorage.setItem("ct-spawn-collapsed", v ? "1" : "0"); } catch { /* */ } },
+};
+
 function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[]; onOpen?: (e: SpawnedEntry) => void; onOpenIndex?: () => void }): React.JSX.Element | null {
   injectAgentStripCss();
+  const [, rerender] = useState(0); // toggle minimize -> re-read the persisted flag
   const now = Date.now();
   const running = entries.filter((e) => e.running);
   // Show running work, plus anything finished in the last hour so you actually see it complete. Older
@@ -566,24 +575,31 @@ function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[];
   if (!shown.length) return null;
 
   const headLabel = running.length ? runningLabel(running) : `${shown.length} recently finished`;
+  // Minimize collapses to the single header line, persisted so it stays that way across turns and
+  // reloads. On a phone the strip sits directly above the composer, so being able to fold it away is
+  // the difference between the thread being usable and not while a big run is in flight.
+  const collapsed = collapsedStrip.get();
+  const toggle = () => { collapsedStrip.set(!collapsed); rerender((n) => n + 1); };
   return (
-    <div className="as-strip" role="status" aria-live="polite">
-      {onOpenIndex ? (
-        <button className="as-head as-head-tap" onClick={onOpenIndex} title="Open the full spawned-work view">
-          {running.length ? <span className="as-spin" aria-hidden="true" /> : null}
+    <div className={"as-strip" + (collapsed ? " as-collapsed" : "")} role="status" aria-live="polite">
+      <div className="as-head">
+        {running.length ? <span className="as-spin" aria-hidden="true" /> : null}
+        {onOpenIndex ? (
+          <button className="as-head-open" onClick={onOpenIndex} title="Open the full spawned-work view">
+            <span className="as-head-label">{headLabel}</span>
+            {rest > 0 && <span className="as-sub">{rest} more</span>}
+            <span className="as-chev" aria-hidden="true">›</span>
+          </button>
+        ) : (
           <span className="as-head-label">{headLabel}</span>
-          {rest > 0 && <span className="as-sub">{rest} more</span>}
-          <span className="as-chev" aria-hidden="true">›</span>
+        )}
+        <button className="as-min" onClick={toggle} title={collapsed ? "Show the list" : "Minimize"} aria-label={collapsed ? "Show the list" : "Minimize"} aria-expanded={!collapsed}>
+          <span className="as-caret" aria-hidden="true" />
         </button>
-      ) : (
-        <div className="as-head">
-          {running.length ? <span className="as-spin" aria-hidden="true" /> : null}
-          {headLabel}
-        </div>
-      )}
+      </div>
       {/* Capped + scrollable: a run with many agents (7+ observed) must not push the composer off
-          the screen. About five rows tall, then scroll. */}
-      <div className="as-rows">{shown.map(row)}</div>
+          the screen. ~3 rows tall, then scroll. Hidden entirely when minimized. */}
+      {!collapsed && <div className="as-rows">{shown.map(row)}</div>}
     </div>
   );
 }
@@ -651,15 +667,21 @@ function injectAgentStripCss() {
   if (stripCssDone || typeof document === "undefined") return;
   stripCssDone = true;
   const css = `
-  .as-strip{max-width:760px;margin:0 auto 8px;padding:9px 12px;background:var(--bg-2,#211c18);border:1px solid var(--line,#3a322c);border-radius:11px;font-size:12.5px}
-  .as-head{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--text-2,#b8afa5);margin-bottom:6px}
-  .as-head-tap{width:100%;background:transparent;border:0;font:inherit;font-weight:600;color:var(--text-2,#b8afa5);text-align:left;cursor:pointer;padding:2px 6px;margin:0 -6px 4px;border-radius:7px;min-height:32px}
-  .as-head-tap:hover,.as-head-tap:focus-visible{background:var(--bg-3,#2a2420);outline:none}
-  .as-head-label{flex:1;min-width:0}
+  .as-strip{max-width:760px;margin:0 auto 8px;padding:7px 12px;background:var(--bg-2,#211c18);border:1px solid var(--line,#3a322c);border-radius:11px;font-size:12.5px}
+  .as-strip.as-collapsed{padding:6px 12px}
+  .as-head{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--text-2,#b8afa5)}
+  .as-strip:not(.as-collapsed) .as-head{margin-bottom:4px}
+  .as-head-open{flex:1;min-width:0;display:flex;align-items:center;gap:7px;background:transparent;border:0;font:inherit;font-weight:600;color:var(--text-2,#b8afa5);text-align:left;cursor:pointer;padding:2px 6px;margin:0 -6px;border-radius:7px;min-height:28px}
+  .as-head-open:hover,.as-head-open:focus-visible{background:var(--bg-3,#2a2420);outline:none}
+  .as-min{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:26px;height:26px;background:transparent;border:0;color:var(--text-3,#8a8078);cursor:pointer;border-radius:7px}
+  .as-min:hover,.as-min:focus-visible{background:var(--bg-3,#2a2420);color:var(--text-2,#b8afa5);outline:none}
+  .as-caret{width:8px;height:8px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(45deg);transition:transform .15s;margin-top:-3px}
+  .as-collapsed .as-caret{transform:rotate(-135deg);margin-top:3px}
+  .as-head-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .as-spin{width:11px;height:11px;border-radius:50%;border:2px solid var(--line,#3a322c);border-top-color:var(--accent,#d97757);animation:as-spin .9s linear infinite;flex:0 0 auto}
   @keyframes as-spin{to{transform:rotate(360deg)}}
-  .as-rows{max-height:180px;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;margin:0 -4px;padding:0 4px}
-  .as-row{display:flex;align-items:center;gap:8px;padding:3px 0;min-width:0;width:100%}
+  .as-rows{max-height:112px;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;margin:0 -4px;padding:0 4px}
+  .as-row{display:flex;align-items:center;gap:8px;padding:2px 0;min-width:0;width:100%}
   .as-row-done .as-ic,.as-row-done .as-label{opacity:.55}
   .as-tap{background:transparent;border:0;color:inherit;font:inherit;text-align:left;cursor:pointer;padding:5px 6px;margin:0 -6px;border-radius:7px;min-height:32px}
   .as-tap:hover,.as-tap:focus-visible{background:var(--bg-3,#2a2420);outline:none}
