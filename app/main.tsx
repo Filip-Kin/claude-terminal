@@ -517,10 +517,14 @@ class ConvStore {
         return;
       }
       this.epoch = e.epoch;
-      // Future-only or full-replay sockets start from the server's current cursor, so the next
-      // reconnect resumes from here. A RESUME socket must not: the replay of the gap is about to
-      // arrive with seqs at or below this, and bumping first would make the dedupe drop it.
-      if (this.connectMode !== "resume") this.seq = Math.max(this.seq, e.seq);
+      // Adopt the server's cursor ONLY on a first connect that has no position yet (seq < 0): a
+      // future-only / full-replay socket, where jumping to the top avoids re-rendering the current
+      // buffer we already hold from the transcript. Once we have ANY position, DON'T touch seq here.
+      // The browser's own EventSource auto-retry reuses the socket (connectMode stays stale) but DOES
+      // send Last-Event-ID, so the server replays the gap right after this hello; bumping to the top
+      // first made every gap event look already-seen and dropped it, cutting the START off a block
+      // that was mid-stream when the socket dropped. Let the replayed events advance seq themselves.
+      if (this.seq < 0) this.seq = e.seq;
       return;
     }
     if (typeof e._seq === "number") { if (e._seq <= this.seq) return; this.seq = e._seq; }
