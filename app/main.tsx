@@ -1276,6 +1276,7 @@ function App() {
   // truth from an actual 4s request heartbeat: false when requests are failing, which lets the banner
   // show "connection unstable" even while the browser insists it's online.
   const [reachable, setReachable] = useState(true);
+  const netMiss = useRef(0); // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
   const [queued, setQueued] = useState(0);
   const [artifact, setArtifact] = useState<Artifact | null>(null); // the artifact open in the split-screen / sheet viewer
   const [artifactW, setArtifactW] = useState<number>(() => { const v = Number(localStorage.getItem("ct-artifact-w")); return v >= 360 && v <= 1400 ? v : 560; }); // desktop split panel width (px), draggable + persisted
@@ -1510,8 +1511,8 @@ function App() {
   useEffect(() => {
     const pull = () => {
       if (navigator.onLine) api.statuses()
-        .then((d) => { setStatuses(d?.statuses || {}); setReachable(true); })   // a real response = link works
-        .catch(() => setReachable(false));                                       // request failed = link is down despite navigator.onLine
+        .then((d) => { setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); })   // a real response = link works
+        .catch(() => { netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
       void refreshQueue();
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
