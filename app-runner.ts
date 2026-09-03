@@ -102,6 +102,11 @@ export type TurnUsage = { input: number; output: number; thinking: number; cache
 export type RewindInfo = { canRewind?: boolean; error?: string; filesChanged?: string[]; insertions?: number; deletions?: number };
 
 type Sub = (e: AppEvent) => void;
+// Max concurrent SSE subscribers per conversation before the oldest is evicted. No real client holds
+// more than a handful (one per open tab/device); anything past this is leaked reconnections that a
+// proxy never reported as closed. Generous enough for every legitimate viewer, low enough that a leak
+// can never make the server fan every token out to a hundred dead sockets.
+const SUBS_CAP = 12;
 // #endregion
 
 // #region dictation cleanup
@@ -473,7 +478,12 @@ export class Conversation {
   private lastTurnAt = 0; // wall clock of the previous turn, for the turn-context stamp below
   private apiErrors = 0; // retried API failures in the CURRENT turn (reset at each result)
   private closed = false;
-  private subs = new Set<Sub>();
+  // Each SSE subscriber, with when it attached and how to shut its stream. A Map (not a Set) so the
+  // oldest can be evicted when a conversation accumulates too many — see SUBS_CAP. Behind a proxy that
+  // holds the upstream connection open (Zoraxy), a client that reloads or navigates away leaves its
+  // subscriber alive until the stream's own lifetime expires, so without a cap the count climbs into
+  // the hundreds and every event is written to every dead socket.
+  private subs = new Map<Sub, { at: number; evict?: () => void }>();
   private hooks = new Set<Sub>(); // internal lifecycle listeners (init/closed bookkeeping); do NOT count as client subscribers, or the idle reaper never fires
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
   private pendingAsks = new Map<string, (answer: string) => void>(); // ask_user awaiting a tap
@@ -506,8 +516,8 @@ export class Conversation {
   // fromNow: subscribe to FUTURE events only (no buffer replay). Used when a client reopens a
   // live conversation and has already rebuilt the current turn from the transcript + pending
   // asks, so replaying the buffer would double-render it.
-  subscribe(fn: Sub, fromNow = false): () => void {
-    this.subs.add(fn);
+  subscribe(fn: Sub, fromNow = false, evict?: () => void): () => void {
+    this.addSub(fn, evict);
     // Replay only the CURRENT turn (from the last turn boundary), so a client that reopens
     // an already-live conversation doesn't get every prior turn re-injected. The client has
     // the earlier turns from the transcript, and _seq dedupe covers mid-turn reconnects.
@@ -521,10 +531,25 @@ export class Conversation {
   // "future only" and every event emitted during the gap is lost for good — which is how a one-shot
   // event like the compaction card disappears while the streamed text around it looks fine. Safe to
   // over-deliver: the client drops anything whose _seq it has already seen.
-  subscribeSince(fn: Sub, sinceSeq: number): () => void {
-    this.subs.add(fn);
+  subscribeSince(fn: Sub, sinceSeq: number, evict?: () => void): () => void {
+    this.addSub(fn, evict);
     for (const e of this.log) { const s = (e as any)._seq; if (typeof s === "number" && s > sinceSeq) fn(e); }
     return () => this.subs.delete(fn);
+  }
+
+  // Register a subscriber and, if this conversation now has more than SUBS_CAP, evict the OLDEST.
+  // A single client keeps one stream per conversation, so a two-figure count is always leaked
+  // reconnections a proxy never told us had closed; dropping the oldest reclaims them without
+  // touching anyone actually watching (their stream reconnects and resumes from its cursor anyway).
+  private addSub(fn: Sub, evict?: () => void) {
+    this.subs.set(fn, { at: Date.now(), evict });
+    if (this.subs.size <= SUBS_CAP) return;
+    const oldest = [...this.subs.entries()].sort((a, b) => a[1].at - b[1].at);
+    for (let i = 0; i < oldest.length - SUBS_CAP; i++) {
+      const [f, meta] = oldest[i];
+      this.subs.delete(f);
+      try { meta.evict?.(); } catch {}
+    }
   }
 
   // Internal lifecycle listener (session-id registration, close bookkeeping). Unlike subscribe(),
@@ -545,7 +570,7 @@ export class Conversation {
     // client must not look idle to the sweeper (it only used to be bumped on send()).
     this.log.push(e);
     if (this.log.length > 5000) { const drop = this.log.length - 5000; this.log.splice(0, drop); this.runStart = Math.max(0, this.runStart - drop); }
-    for (const s of this.subs) {
+    for (const s of this.subs.keys()) {
       try { s(e); } catch {}
     }
     for (const s of this.hooks) {

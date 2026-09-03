@@ -219,7 +219,7 @@ const shortCid = (c: unknown) => (typeof c === "string" && c ? c.slice(0, 8) : "
 // that were never reaped because hasSubscribers() never went false. Closing on a timer bounds a leak
 // to one cycle: EventSource reconnects by itself after `retry`, and subscribeSince() hands back the
 // gap, which is exactly the resume path any dropped connection already uses.
-const MAX_STREAM_MS = 10 * 60_000;
+const MAX_STREAM_MS = 3 * 60_000; // was 10 min. Behind Zoraxy a client's leaked subscriber only reaps on THIS timer (cancel/abort never fire), so at any reconnect rate the pile = rate x lifetime; 3 min keeps it small while the resume cursor makes the extra reconnects invisible.
 
 function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Request, fromNow = false): Response {
   let unsub = () => {};
@@ -263,19 +263,20 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
       write({ t: "hello", epoch: conv.epoch, seq: conv.seq, resync });
       write(conv.statusEvent()); // current phase straight away, not whenever it next changes
       tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, epoch: epochParam ? (sameEpoch ? "same" : "stale") : undefined, busy: conv.busy ? 1 : 0 });
+      // Tear this stream down. Both the abort and the lifetime paths close the controller themselves,
+      // so cancel() never runs and would not log the close; log it here or the open/close counter goes
+      // blind, which is the metric this whole problem was found with. `evicted` is the runner dropping
+      // the oldest subscriber when a conversation piles past its cap.
+      const shut = (why: string) => { tlog("stream-close", { conv: conv.id, why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
       // replays the gap (resume), this run's buffer (fromNow=false), or nothing — then live. A stale
-      // epoch streams future-only: the client is about to reload the whole thing anyway.
-      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom) : conv.subscribe(write, fromNow || resync);
+      // epoch streams future-only: the client is about to reload the whole thing anyway. evict lets
+      // the runner shut THIS stream when the conversation exceeds its subscriber cap.
+      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom, () => shut("evicted")) : conv.subscribe(write, fromNow || resync, () => shut("evicted"));
       // Heartbeat as a DATA frame. It used to be an SSE comment, which EventSource never surfaces to
       // JavaScript, so the client could not tell a quiet stream from a dead one and guessed with a
       // timer. If the client is gone the enqueue throws (caught) and the stream is torn down.
       ping = setInterval(() => { try { controller.enqueue(enc2.encode(`data: {"t":"hb"}\n\n`)); } catch { cleanup(); } }, 15_000);
-      // Bun aborts the request signal when it does notice the client is gone. cancel() covers the
-      // clean case; this covers the ones it misses, and costs nothing when both fire.
-      // Both of these close the controller themselves, so cancel() never runs and would not log the
-      // close. Log it here or the open/close counter goes blind, which is the metric this whole
-      // problem was found with.
-      const shut = (why: string) => { tlog("stream-close", { conv: conv.id, why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
+      // Bun aborts the request signal when it notices the client is gone (covers what cancel misses).
       try { req.signal.addEventListener("abort", () => shut("abort"), { once: true }); } catch { /* no signal on this runtime */ }
       // Retire the stream on schedule so a socket we cannot prove is dead cannot leak forever.
       life = setTimeout(() => shut("expired"), MAX_STREAM_MS);
