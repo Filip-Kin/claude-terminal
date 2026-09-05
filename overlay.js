@@ -419,7 +419,8 @@
     "body.theme-light #ct-connmodal .ct-applying{background:rgba(255,255,255,.85)}",
     "body.theme-light #ct-connmodal .ct-applying .msg{color:#333}",
     "#ct-connmodal .ct-conn{margin-top:" + (BAR_H + 12) + "px;width:min(640px,94vw);max-height:82vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}",
-    "#ct-connmodal .ct-conn-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-connmodal .ct-conn-err{margin:0 0 10px;padding:9px 11px;border-radius:8px;font-size:12.5px;line-height:1.4;color:#fca5a5;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.4)}", // ct-connerr
+    "#ct-connmodal .ct-conn-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
     "#ct-connmodal .ct-conn-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
     "#ct-connmodal .ct-conn-close:hover{opacity:1}",
     "#ct-connmodal .ct-conn-body{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 12px}",
@@ -1052,6 +1053,13 @@
     for (const s of (data.status && data.status.tunnels) || []) st[s.id] = s;
     listEl.innerHTML = "";
     const tuns = data.tunnels || [];
+    // A whole-apply failure (the hub or a tunnel didn't come up) is reported here so it is impossible
+    // to miss: the applier restores the session and writes this so the user sees WHAT failed, not a
+    // dead page. Per-tunnel reasons still show on each row below. // ct-connerr
+    if (data.status && data.status.error) {
+      const err = document.createElement("div"); err.className = "ct-conn-err"; err.textContent = data.status.error;
+      listEl.appendChild(err);
+    }
     if (!tuns.length) {
       const e = document.createElement("div");
       e.className = "ct-conn-note";
