@@ -41,14 +41,19 @@ const saveDraft = (id: string | null, v: string) => { try { if (v.trim()) localS
 
 // Long-press (touch, ~500ms, cancelled on scroll) or right-click (desktop) → open a context menu at
 // (x, y). Returns handlers to spread onto the target element.
+// A right-click / long-press on an IMAGE must fall through to the browser's own menu (Copy image,
+// Save image as) instead of our text menu — the images are served inline, so native save works.
+const isImageTarget = (t: EventTarget | null) => (t as HTMLElement | null)?.tagName === "IMG";
+
 function longPressBind(open: (x: number, y: number) => void) {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let sx = 0, sy = 0, fired = false, firedAt = 0;
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   return {
-    onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); open(e.clientX, e.clientY); },
-    // 600ms hold, cancelled by any real movement (a scroll or a normal tap never opens the menu).
-    onTouchStart: (e: React.TouchEvent) => { const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy); }, 600); },
+    onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); open(e.clientX, e.clientY); },
+    // 600ms hold, cancelled by any real movement (a scroll or a normal tap never opens the menu). On
+    // an image the hold is left to the browser so its native "save image" sheet can open.
+    onTouchStart: (e: React.TouchEvent) => { if (isImageTarget(e.target)) return; const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy); }, 600); },
     onTouchMove: (e: React.TouchEvent) => { const t = e.touches[0]; if (t && (Math.abs(t.clientX - sx) > 8 || Math.abs(t.clientY - sy) > 8)) clear(); },
     onTouchEnd: (e: React.TouchEvent) => { clear(); if (fired) e.preventDefault(); },
     onTouchCancel: clear,
@@ -1073,7 +1078,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   const menuBind = (text: string, kind: "user" | "assistant"): Record<string, unknown> => {
     if (!onMenu) return {};
     if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y) => onMenu(x, y, text, kind, i)) };
-    return { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
+    return { onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
   };
   if (it.kind === "user") {
     // A message from another Claude session -> a tidy card, not the raw XML tag.
