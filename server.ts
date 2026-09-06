@@ -73,6 +73,19 @@ if (db) db.exec("PRAGMA busy_timeout = 5000;");
 const ROLLING_HOURS = 5, GAUGE_MAX = 5_000_000, HOURLY_HOURS = 168, SPARK_HOURS = 48;
 const ACTIVE_MS = 15 * 60 * 1000;
 const SUBSCRIPTION_USD = Number(cfg.subscriptionUsd || 0);
+// "Weighted output tokens": each model's output tokens scaled by how much of the shared session
+// limit that model actually costs, so a heavy-model user is billed for the load they put on the
+// subscription rather than a flat per-token rate. Weight = the model's API output price relative to
+// Sonnet 5 ($10/M = 1.0): Opus 2.5x, Fable 5x, Haiku 0.5x. Overridable via cfg.modelWeights.
+const MODEL_WEIGHTS: Record<string, number> = Object.assign({
+  "claude-opus-5": 2.5, "claude-opus-4-8": 2.5, "claude-opus-4-7": 2.5, "claude-opus-4-6": 2.5,
+  "claude-sonnet-5": 1.0, "claude-sonnet-4-6": 1.5, "claude-sonnet-4-5": 1.5,
+  "claude-haiku-4-5": 0.5, "claude-haiku-4-5-20251001": 0.5,
+  "claude-fable-5-1": 5.0, "claude-fable-5": 5.0,
+}, cfg.modelWeights || {});
+// A model the map does not know is weighted 1.0 (treated as a Sonnet-class token) rather than
+// dropped, so a new model still counts toward the bill until its weight is added.
+const modelWeight = (m: string) => MODEL_WEIGHTS[m] ?? MODEL_WEIGHTS[String(m).replace(/-\d{8}$/, "")] ?? 1.0;
 
 const pad = (n: number) => String(n).padStart(2, "0");
 const hourKeyOf = (d: Date) =>
@@ -115,6 +128,18 @@ const qUsers = db?.query("SELECT user FROM cumulative ORDER BY user") as any;
 const qHours = db?.query("SELECT hour_utc, total, output FROM hourly WHERE user = ?") as any;
 const qCum = db?.query("SELECT * FROM cumulative WHERE user = ?") as any;
 const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
+// Per-user, per-month, per-model output for the weighted-token metric. Lazy: model_usage only
+// exists once a collector carrying that schema has run.
+let qModelMonth: any = null, qModelMonthChecked = false;
+function modelMonthQuery() {
+  if (qModelMonthChecked || !db) return qModelMonth;
+  qModelMonthChecked = true;
+  try {
+    if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get())
+      qModelMonth = db.query("SELECT user, substr(minute_utc,1,7) AS mk, model, sum(output) AS output FROM model_usage GROUP BY user, mk, model");
+  } catch { qModelMonth = null; }
+  return qModelMonth;
+}
 
 // External-peer queries are prepared lazily: the external_* tables only exist once a
 // collector that carries the newer schema has run. A vanilla DB (or a fresh deploy
@@ -202,6 +227,15 @@ function buildLeaderboard() {
   for (let i = 0; i < HOURLY_HOURS; i++) hour_ms.push(hour0.getTime() - (HOURLY_HOURS - 1 - i) * 3600e3);
 
   const byMonth: Record<string, Record<string, number>> = {};
+  // Weighted output per month per user, from model_usage. A user/month with raw output but no model
+  // rows (model tracking started mid-history) falls back to its raw output below, weight 1.
+  const wByMonth: Record<string, Record<string, number>> = {};
+  const mmq = modelMonthQuery();
+  if (mmq) for (const r of mmq.all() as any[]) (wByMonth[r.mk] ??= {})[r.user] = (wByMonth[r.mk][r.user] || 0) + (r.output || 0) * modelWeight(r.model);
+  const weightedFor = (mk: string, user: string, rawOut: number) => {
+    const w = wByMonth[mk]?.[user];
+    return w != null ? w : rawOut; // no model breakdown -> count raw output at weight 1
+  };
   const users: any[] = [];
   for (const { user } of qUsers.all() as any[]) {
     const hours = new Map<string, any>();
@@ -231,6 +265,7 @@ function buildLeaderboard() {
       spark: sparkSeries(hours, now, SPARK_HOURS),
       hourly: sparkSeries(hours, now, HOURLY_HOURS),
       month_output: monthOutput,
+      month_weighted: Math.round(weightedFor(monthPrefix, user, monthOutput)),
     });
   }
 
@@ -240,25 +275,29 @@ function buildLeaderboard() {
   const months: any[] = [];
   for (const mk of Object.keys(byMonth).sort()) {
     const outs: Record<string, number> = {};
-    for (const u of allUsers) outs[u] = byMonth[mk][u] || 0;
+    const wtd: Record<string, number> = {};
+    for (const u of allUsers) { outs[u] = byMonth[mk][u] || 0; wtd[u] = weightedFor(mk, u, outs[u]); }
     const total = Object.values(outs).reduce((a, b) => a + b, 0);
-    const cents = splitCents(outs, pot);
+    const wtotal = Object.values(wtd).reduce((a, b) => a + b, 0);
+    // The subscription is split by WEIGHTED output, so a heavy-model user pays for the load they put
+    // on the shared limit, not a flat per-token rate.
+    const cents = splitCents(wtd, pot);
     const rows = allUsers.map((u) => ({
-      user: u, name: nameOf[u], output: outs[u],
-      pct: total ? Math.round((1000 * outs[u]) / total) / 10 : 0,
+      user: u, name: nameOf[u], output: outs[u], weighted: Math.round(wtd[u]),
+      pct: wtotal ? Math.round((1000 * wtd[u]) / wtotal) / 10 : 0,
       share_usd: cents[u] / 100,
     }));
-    rows.sort((a, b) => b.output - a.output);
-    months.push({ key: mk, label: monthLabel(mk), total, rows });
+    rows.sort((a, b) => b.weighted - a.weighted);
+    months.push({ key: mk, label: monthLabel(mk), total, weighted_total: Math.round(wtotal), rows });
   }
 
   const cur: Record<string, number> = {};
-  for (const u of allUsers) cur[u] = byMonth[monthPrefix]?.[u] || 0;
+  for (const u of allUsers) cur[u] = weightedFor(monthPrefix, u, byMonth[monthPrefix]?.[u] || 0);
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
   const curCents = splitCents(cur, pot);
   for (const u of users) {
     u.share_usd = curCents[u.user] / 100;
-    u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0;
+    u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0; // share of WEIGHTED output
   }
 
   // External peers: shown on the board but deliberately NOT in the split above. They
@@ -292,18 +331,20 @@ function buildLeaderboard() {
         spark: sparkSeries(hours, now, SPARK_HOURS),
         hourly: sparkSeries(hours, now, HOURLY_HOURS),
         month_output: monthOutput,
+        month_weighted: Math.round(weightedFor(monthPrefix, extKey(peer, user), monthOutput)),
         share_usd: null,
         month_pct: null,
       });
     }
   }
 
-  users.sort((a, b) => b.month_output - a.month_output || b.output_total - a.output_total);
+  users.sort((a, b) => (b.month_weighted || 0) - (a.month_weighted || 0) || b.output_total - a.output_total);
 
   return {
     generated_at: now.toISOString().replace(/\.\d+Z$/, "+00:00"),
     window_hours: ROLLING_HOURS, gauge_max: GAUGE_MAX, subscription_usd: SUBSCRIPTION_USD,
     month_label: monthLabel(monthPrefix), current_month: monthPrefix,
+    model_weights: MODEL_WEIGHTS,
     months, hour_ms, spark_hours: SPARK_HOURS, users,
     subscription: latestSubscription(),
   };
