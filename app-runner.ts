@@ -502,6 +502,7 @@ export class Conversation {
   private forkNext = false;     // one-shot: the next run() should fork the session (edit-and-rerun)
   private runGen = 0;           // bumped per run() so a superseded run's finally stays quiet
   private inited = false;       // an init event has been seen (the SDK session is live)
+  private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -631,10 +632,25 @@ export class Conversation {
     else this.queue.push(msg);
   }
 
+  // Change the model for THIS conversation. The SDK's live setModel writes to the query's control
+  // transport, which is NOT writable mid-turn ("ProcessTransport is not ready for writing"): calling
+  // it while a turn streams both threw AND wedged the query, so the turn never answered. So never push
+  // it live during a turn. Record it, reflect it in the UI immediately, and apply it at the next idle
+  // boundary (applyPendingModel, called from the result handler). Applied now only if already idle.
   async setModel(model: string) {
     this.model = model;
-    if (this.q) { try { await this.q.setModel(model); } catch (e: any) { this.emit({ t: "error", message: "setModel: " + (e?.message || e) }); return; } }
-    this.emit({ t: "model", model }); // every device watching this chat shows the switch, not just the one that made it
+    this.pendingModel = model;
+    this.emit({ t: "model", model }); // every device watching this chat shows the switch right away
+    if (!this.busy) await this.applyPendingModel();
+  }
+  // Push a queued model change to the live query. Only safe when the query is up and idle. On the
+  // transient "not ready" error it stays pending and is retried at the next idle boundary; it is never
+  // surfaced as a thread error, because a control-plane hiccup is not something the user said.
+  private async applyPendingModel() {
+    if (!this.pendingModel || !this.q || !this.inited || this.closed || this.busy) return;
+    const m = this.pendingModel;
+    try { await this.q.setModel(m); this.pendingModel = undefined; }
+    catch (e: any) { tlog("setmodel-defer", { conv: this.id, msg: String(e?.message || e).slice(0, 80) }); }
   }
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
@@ -1028,6 +1044,7 @@ export class Conversation {
         // only the client knows what it has not seen echoed back yet.
         this.setPhase("idle");
         this.apiErrors = 0; // per-turn counter
+        void this.applyPendingModel(); // a model change picked mid-turn takes effect now the turn is done
         tlog("done", { conv: this.id, subtype: anyM.subtype, ms: anyM.duration_ms || 0, listeners: this.subs.size });
         this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
         const u = anyM.usage || {};
