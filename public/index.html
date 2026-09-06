@@ -119,9 +119,10 @@
   <header>
     <div>
       <h1>Claude usage leaderboard</h1>
-      <p class="sub">Ranked by output tokens used this calendar month. Output is what actually counts
-      against the subscription limit; cache reads make the raw total huge but barely move the needle.
-      Numbers come straight off each session's transcript and refresh on their own.</p>
+      <p class="sub">Ranked by <b>weighted output tokens</b> this calendar month: each model's output
+      scaled by how much of the shared session limit it uses (an Opus token counts 2.5x a Sonnet one,
+      Haiku 0.5x, Fable 5x). Cache reads make the raw total huge but barely move the needle. Numbers
+      come straight off each session's transcript and refresh on their own.</p>
     </div>
     <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="updated">loading</span></span></div>
   </header>
@@ -141,16 +142,17 @@
       <h2>Monthly split</h2>
       <select id="monthSel" class="msel" aria-label="Choose month"></select>
     </div>
-    <p id="billIntro">The subscription divided by output tokens used that calendar month. Not a bill, just a
-    rough sense of what each person's usage is worth.</p>
+    <p id="billIntro">The subscription divided by <b>weighted output tokens</b> that calendar month, so a
+    heavy-model user pays for the load they put on the limit, not a flat per-token rate. Not a bill,
+    just a rough sense of what each person's usage is worth.</p>
     <div class="billbar" id="billBar"></div>
     <div class="billrows" id="billRows"></div>
     <div class="billfoot" id="billFoot"></div>
   </div>
 
   <div class="panel" id="monthlyPanel">
-    <h2>Output by month</h2>
-    <p>Total output tokens each person used, month by month.</p>
+    <h2>Weighted output by month</h2>
+    <p>Weighted output tokens each person used, month by month (Opus 2.5x, Sonnet 1x, Haiku 0.5x, Fable 5x).</p>
     <div id="monthlyChart" style="height:300px"></div>
   </div>
 
@@ -263,7 +265,7 @@ function mainOpts(d){
 // are not in the split. Their activity still shows on the hourly chart and their card.
 const splitUsers = (d) => d.users.filter(u => !u.external);
 const monthlySeries = (d) => splitUsers(d).map(u => ({ name:u.name,
-  data: d.months.map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? r.output : 0; }) }));
+  data: chartMonths(d).map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? (r.weighted ?? r.output) : 0; }) }));
 function monthlyOpts(d){
   return {
     chart:{ type:"bar", height:300, stacked:true, fontFamily:"inherit", background:"transparent",
@@ -312,12 +314,12 @@ function renderSplit(d, key){
     const row = document.createElement("div"); row.className="billrow";
     row.innerHTML = `
       <span class="bn"><span class="swatch" style="background:${colorFor(r.user)}"></span>${r.name}</span>
-      <span class="bp">${fmt(r.output)} output</span>
+      <span class="bp">${fmt(r.weighted ?? r.output)} weighted</span>
       <span class="bd">${money(r.share_usd)}</span>`;
     rows.appendChild(row);
   });
   document.getElementById("billFoot").innerHTML =
-    `<b>${fmt(m.total)}</b> output tokens in ${m.label}, split into the ${money(d.subscription_usd)} above. `
+    `<b>${fmt(m.weighted_total ?? m.total)}</b> weighted output tokens in ${m.label}, split into the ${money(d.subscription_usd)} above. `
     + `A rough gauge of the value each person got.`;
 }
 
@@ -339,7 +341,7 @@ function build(d){
         ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>
       <div class="spark" id="spark-${u.user}"></div>
-      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>output this month</span></div>
+      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>weighted output this month</span></div>
       <div class="meta">
         <span>last 5h <b class="num" id="fivh-${u.user}">0</b></span>
         <span>total output <b class="num" id="tot-${u.user}">0</b></span>
@@ -353,7 +355,7 @@ function build(d){
   d.users.forEach(u => {
     const s = new ApexCharts(document.getElementById("spark-"+u.user), sparkOpts(u.user, sparkData(d,u)));
     s.render(); sparks[u.user]=s;
-    countUp(document.getElementById("mo-"+u.user), u.month_output);
+    countUp(document.getElementById("mo-"+u.user), u.month_weighted ?? u.month_output);
     countUp(document.getElementById("fivh-"+u.user), u.output_5h);
     countUp(document.getElementById("tot-"+u.user), u.output_total);
     countUp(document.getElementById("all-"+u.user), u.tokens_total);
@@ -373,7 +375,7 @@ function build(d){
 
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
   document.getElementById("foot").textContent =
-    "Ranked by output this calendar month. Sparklines cover the last "+d.spark_hours+" hours. This page refreshes every 30 seconds.";
+    "Ranked by weighted output this calendar month. Sparklines cover the last "+d.spark_hours+" hours. This page refreshes every 30 seconds.";
 }
 
 function refresh(d){
