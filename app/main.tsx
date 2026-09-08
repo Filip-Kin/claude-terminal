@@ -4,6 +4,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
+import { extractMath } from "./mathrender";
 import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
@@ -850,7 +851,7 @@ function rewriteLocalRefs(html: string, convId: string | null): string {
 }
 
 function Assistant({ text, convId }: { text: string; convId?: string | null }) {
-  const html = useMemo(() => rewriteLocalRefs(marked.parse(text || "") as string, convId ?? null), [text, convId]);
+  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId ?? null); }, [text, convId]);
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 

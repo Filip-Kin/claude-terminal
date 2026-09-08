@@ -483,3 +483,7 @@ a { color: var(--accent-2); }
 .settings-row-err { color: var(--err, #ef4444); }
 /* A toggle mid-request (subscribing can take a moment on a weak link) */
 .toggle.busy { opacity: .6; pointer-events: none; }
+
+/* KaTeX math: let a wide display equation scroll instead of overflowing the bubble; flag render errors. */
+.md .katex-display{overflow-x:auto;overflow-y:hidden;padding:2px 0;max-width:100%}
+.md .math-err{color:var(--danger,#f87171);font-family:ui-monospace,monospace;font-size:.9em}

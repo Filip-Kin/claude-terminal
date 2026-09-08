@@ -14,6 +14,7 @@
 // is unchanged from main.tsx (marked + the same local-ref rewrite), so it is no less safe than today.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { marked } from "marked";
+import { extractMath } from "./mathrender";
 import hljs from "highlight.js/lib/common";
 
 // Defensive: match main.tsx's marked config so the module renders identically if used on its own.
@@ -486,7 +487,7 @@ export function ArtifactViewer({ artifact, mode, onClose }: { artifact: Artifact
 
 // #region AssistantContent (drop-in replacement for main.tsx's <Assistant>)
 function Markdown({ text, convId }: { text: string; convId: string | null }) {
-  const html = useMemo(() => rewriteLocalRefs(marked.parse(text || "") as string, convId), [text, convId]);
+  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId); }, [text, convId]);
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 

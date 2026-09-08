@@ -19,6 +19,15 @@ const ASSETS = join(OUT, "assets");
 rmSync(ASSETS, { recursive: true, force: true });
 mkdirSync(ASSETS, { recursive: true });
 
+// KaTeX stylesheet + fonts for math rendering. Copied on every build because the rm above wipes
+// ASSETS; served static (no content hash) and referenced by index.html. The CSS points at fonts/
+// with relative urls, so the fonts sit beside it under assets/katex/.
+import { cpSync } from "fs";
+const KATEX = join(APP, "..", "node_modules", "katex", "dist");
+mkdirSync(join(ASSETS, "katex", "fonts"), { recursive: true });
+cpSync(join(KATEX, "katex.min.css"), join(ASSETS, "katex", "katex.min.css"));
+cpSync(join(KATEX, "fonts"), join(ASSETS, "katex", "fonts"), { recursive: true });
+
 const res = await Bun.build({
   entrypoints: [join(APP, "main.tsx")],
   outdir: ASSETS,
