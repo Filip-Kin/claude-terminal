@@ -243,6 +243,9 @@ const api = {
     const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
     return fetch("/app/api/upload", { method: "POST", body: fd }).then(J);
   },
+  reads: () => withTimeout(fetch("/app/api/reads").then(J)),
+  pushReads: (reads: Record<string, number>) =>
+    fetch("/app/api/reads", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ reads }) }).then(J),
   favorites: () => withTimeout(fetch("/app/api/favorites").then(J)),
   toggleFav: (id: string, fav: boolean) =>
     fetch("/app/api/favorites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, fav }) }).then(J),
@@ -1397,6 +1400,19 @@ function App() {
       .catch(() => {})
       .finally(() => { loadingMoreRef.current = false; });
   }, [hasMore]);
+  // Pull the server read markers and merge by max into the local map, so a chat read on another
+  // device shows read here too. Local wins only where it is NEWER (a read this device made offline).
+  const syncReads = useCallback(() => {
+    api.reads().then((d) => {
+      const srv: Record<string, number> = d.reads || {};
+      const local = lastReadRef.current;
+      let localAhead: Record<string, number> | null = null;
+      for (const [id, t] of Object.entries(srv)) if ((t as number) > (local[id] || 0)) local[id] = t as number;
+      for (const [id, t] of Object.entries(local)) if (t > (srv[id] || 0)) (localAhead ??= {})[id] = t;
+      saveLastRead(local); setReadTick((x) => x + 1);
+      if (localAhead) void api.pushReads(localAhead).catch(() => {}); // push markers the server hasn't got
+    }).catch(() => { /* offline: local map holds */ });
+  }, []);
   const refreshFavs = useCallback(() => {
     api.favorites().then((d) => {
       const srv = new Set<string>((d.favorites || []).map((x: any) => String(x)));
@@ -1467,6 +1483,7 @@ function App() {
     const conv = (list ?? convsRef.current).find((c) => c.sessionId === id);
     const mark = conv ? Math.max(conv.mtime, lastReadRef.current[id] || 0) : (lastReadRef.current[id] || Date.now());
     lastReadRef.current[id] = mark; saveLastRead(lastReadRef.current); setReadTick((t) => t + 1);
+    void api.pushReads({ [id]: mark }).catch(() => { /* offline: local marker holds; a later syncReads reconciles */ });
     // Tell the service worker what is now read so it can dismiss any tray notification whose
     // conversations have all been read. A "conversation finished" notification otherwise sat there
     // until tapped, even though you had already opened and read it.
@@ -1496,6 +1513,7 @@ function App() {
     api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id); }).catch(() => {});
     refreshConvs();
     refreshFavs();
+    syncReads();
     const c = new URLSearchParams(location.search).get("c");
     if (c) void loadConv(c);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2011,6 +2029,7 @@ function App() {
       void (async () => {
         await drainQueueUI();
         refreshFavs(); // flush favourite toggles made while offline
+        syncReads();    // reconcile read markers made on other devices while we were offline
         // Reload the open conversation: while offline it may have shown a partial/uncached view,
         // and a fresh server fetch pulls the full history now that we're back.
         const id = activeIdRef.current;
@@ -2027,7 +2046,7 @@ function App() {
     // "sending N queued" banner) forever. Retry every 8s until it's empty.
     const t = setInterval(() => { if (navigator.onLine && !drainingRef.current) { drainingRef.current = true; void drainQueueUI().finally(() => { drainingRef.current = false; }); } }, 8000);
     return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); clearInterval(t); };
-  }, [drainQueueUI, loadConv, refreshFavs, refreshQueue]);
+  }, [drainQueueUI, loadConv, refreshFavs, refreshQueue, syncReads]);
   // #endregion
 
   // Liveness. The server heartbeats every 15s as a data frame we can see; a socket quiet for HB_DEAD

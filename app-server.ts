@@ -43,6 +43,7 @@ export interface AppCtx {
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
   favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
   titlesFile: string; // JSON map {sessionId: customTitle} — user-renamed conversations
+  readsFile: string;  // JSON map {sessionId: lastReadMs} — per-conversation read marker, server-side so unread syncs across devices
   mcpFile: string; // JSON map {name: McpServerConfig} — MCP servers the SDK connects for /app chats
   claudeDir: string; // ~/.claude — for memory (CLAUDE.md) + skills management
   sttUrl?: string; // local Whisper service base URL (loopback); enables hands-free voice in
@@ -77,6 +78,19 @@ async function loadFavs(file: string): Promise<Set<string>> {
   return favSet;
 }
 async function saveFavs(file: string) { if (favSet) await Bun.write(file, JSON.stringify([...favSet])); }
+// #endregion
+
+// #region read markers (per-conversation lastRead ms) — server-side so unread state syncs across
+// devices. Reading a chat on the phone clears its unread dot on the laptop, instead of every device
+// keeping its own localStorage marker and lighting up phantom unreads on the others.
+let readMap: Record<string, number> | null = null;
+async function loadReads(file: string): Promise<Record<string, number>> {
+  if (readMap) return readMap;
+  try { const o = JSON.parse(await Bun.file(file).text()); readMap = o && typeof o === "object" ? o : {}; }
+  catch { readMap = {}; }
+  return readMap!;
+}
+async function saveReads(file: string) { if (readMap) await Bun.write(file, JSON.stringify(readMap)); }
 // #endregion
 
 // #region custom titles (renamed conversations) — server-side map, syncs across devices
@@ -573,6 +587,26 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (b.fav) f.add(id); else f.delete(id);
     await saveFavs(ctx.favoritesFile);
     return jsonRes({ favorites: [...f] }, ctx, req);
+  }
+
+  // Read markers. GET returns the whole {id: lastReadMs} map; POST merges one or many, keeping the
+  // MAX per id so the most-recent read on any device wins and a stale device can never un-read a chat.
+  if (req.method === "GET" && path === "/app/api/reads") {
+    return jsonRes({ reads: await loadReads(ctx.readsFile) }, ctx, req);
+  }
+  if (req.method === "POST" && path === "/app/api/reads") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const m = await loadReads(ctx.readsFile);
+    const incoming: Record<string, unknown> = (b && typeof b.reads === "object" && b.reads) ? b.reads
+      : (b && b.id) ? { [String(b.id)]: b.at ?? Date.now() } : {};
+    let changed = false;
+    for (const [id, at] of Object.entries(incoming)) {
+      const t = Number(at);
+      if (!id || !Number.isFinite(t)) continue;
+      if (t > (m[id] || 0)) { m[id] = t; changed = true; }
+    }
+    if (changed) await saveReads(ctx.readsFile);
+    return jsonRes({ reads: m }, ctx, req);
   }
 
   if (req.method === "GET" && path === "/app/api/conversations") {
