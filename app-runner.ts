@@ -262,6 +262,52 @@ class CleanupSession {
 }
 const cleanupSession = new CleanupSession();
 
+// #region conversation title generation (short AI summary, background)
+// The sidebar title was the first line of the user's message, which is noisy (and leaked the hidden
+// <turn-context> tag on short turns). Generate a 3-6 word summary with Haiku instead. Disposable
+// per call: this runs in the background off the conversation-list path, once per conversation ever
+// (the result is persisted server-side), so a short-lived query is fine and needs no warm session.
+const TITLE_MODEL = process.env.TITLE_MODEL || "claude-haiku-4-5";
+const TITLE_SYSTEM = [
+  "You write a very short title for a chat conversation, summarizing what the user wants.",
+  "Rules: 3 to 6 words. No quotes, no trailing punctuation, no emoji. Plain Title-ish case.",
+  "It is a label, not a sentence. Output ONLY the title, nothing else.",
+].join(" ");
+
+export async function generateTitle(userText: string, assistantText: string, timeoutMs = 20000): Promise<string | null> {
+  const u = (userText || "").replace(HIDDEN_STRIP, "").trim().slice(0, 1500);
+  if (!u) return null;
+  const a = (assistantText || "").trim().slice(0, 1500);
+  const content = `The user opened a chat. Write its title.\n\n<first_user_message>\n${u}\n</first_user_message>` +
+    (a ? `\n\n<assistant_reply>\n${a}\n</assistant_reply>` : "");
+  let buf = "";
+  try {
+    const q = query({
+      prompt: (async function* () { yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null } as SDKUserMessage; })(),
+      options: {
+        model: TITLE_MODEL, systemPrompt: TITLE_SYSTEM,
+        allowedTools: [], skills: [], mcpServers: {}, settingSources: [],
+        thinking: { type: "disabled" }, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true,
+      },
+    });
+    const pump = (async () => {
+      for await (const m of q as AsyncIterable<SDKMessage>) {
+        const anyM = m as any;
+        if (anyM.type === "assistant") { for (const b of (anyM.message?.content as any[]) || []) if (b?.type === "text") buf += b.text; }
+        else if (anyM.type === "result") break;
+      }
+    })();
+    await Promise.race([pump, new Promise((r) => setTimeout(r, timeoutMs))]);
+    try { q.close?.(); } catch { /* */ }
+  } catch { return null; }
+  // One line, strip wrapping quotes/trailing punctuation the model sometimes adds anyway.
+  const title = buf.split("\n").map((l) => l.trim()).filter(Boolean)[0] || "";
+  const clean = title.replace(/^["'`]+|["'`]+$/g, "").replace(/[.\s]+$/, "").trim().slice(0, 80);
+  return clean || null;
+}
+// #endregion
+
+/** Spin the cleanup process up while the user is still talking, so the wait at the end is the model only. */
 /** Spin the cleanup process up while the user is still talking, so the wait at the end is the model only. */
 export function warmDictation(): void { try { cleanupSession.warm(); } catch { /* */ } }
 

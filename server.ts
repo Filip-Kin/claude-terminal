@@ -693,6 +693,7 @@ const appCtx: AppCtx = {
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
   readsFile: join(STATE_DIR, "claude-app-reads.json"),
+  autoTitlesFile: join(STATE_DIR, "claude-app-autotitles.json"),
   mcpFile: join(STATE_DIR, "claude-app-mcp.json"),
   claudeDir: join(HOME, ".claude"),
   // Rolling 5-hour output tokens for the owner + a link to the usage dashboard, for the app's
