@@ -7,7 +7,7 @@
 // Auth: inherits the box's Claude login (claude.ai subscription, apiKeySource "none") —
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
-import { query, deleteSession, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
+import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import { mkdirSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +53,7 @@ export type AppEvent =
   // input and can trail it by seconds on a big argument, which is too late for voice mode to
   // tell "narration before a tool call" from "the actual answer".
   | { t: "tool_start"; id: string; name: string }
+  | { t: "title"; title: string } // AI title for the conversation, parsed from the first turn's leading <title>
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
   | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string } // live subagent progress, keyed by the Task tool_use id
   | { t: "compact"; trigger: "manual" | "auto"; preTokens?: number; postTokens?: number; durationMs?: number } // a compaction finished; metadata drives the "freed Nk" card
@@ -262,60 +263,7 @@ class CleanupSession {
 }
 const cleanupSession = new CleanupSession();
 
-// #region conversation title generation (short AI summary, background)
-// The sidebar title was the first line of the user's message, which is noisy (and leaked the hidden
-// <turn-context> tag on short turns). Generate a 3-6 word summary with Haiku instead. Disposable
-// per call: this runs in the background off the conversation-list path, once per conversation ever
-// (the result is persisted server-side), so a short-lived query is fine and needs no warm session.
-const TITLE_MODEL = process.env.TITLE_MODEL || "claude-haiku-4-5";
-const TITLE_SYSTEM = [
-  "You write a very short title for a chat conversation, summarizing what the user wants.",
-  "Rules: 3 to 6 words. No quotes, no trailing punctuation, no emoji. Plain Title-ish case.",
-  "It is a label, not a sentence. Output ONLY the title, nothing else.",
-].join(" ");
 
-export async function generateTitle(userText: string, assistantText: string, timeoutMs = 20000): Promise<string | null> {
-  const u = (userText || "").replace(HIDDEN_STRIP, "").trim().slice(0, 1500);
-  if (!u) return null;
-  const a = (assistantText || "").trim().slice(0, 1500);
-  const content = `The user opened a chat. Write its title.\n\n<first_user_message>\n${u}\n</first_user_message>` +
-    (a ? `\n\n<assistant_reply>\n${a}\n</assistant_reply>` : "");
-  let buf = "";
-  let sid = "";
-  try {
-    const q = query({
-      prompt: (async function* () { yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null } as SDKUserMessage; })(),
-      options: {
-        model: TITLE_MODEL, systemPrompt: TITLE_SYSTEM,
-        allowedTools: [], skills: [], mcpServers: {}, settingSources: [],
-        thinking: { type: "disabled" }, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true,
-      },
-    });
-    const pump = (async () => {
-      for await (const m of q as AsyncIterable<SDKMessage>) {
-        const anyM = m as any;
-        if (anyM.session_id) sid = anyM.session_id;
-        if (anyM.type === "assistant") { for (const b of (anyM.message?.content as any[]) || []) if (b?.type === "text") buf += b.text; }
-        else if (anyM.type === "result") break;
-      }
-    })();
-    await Promise.race([pump, new Promise((r) => setTimeout(r, timeoutMs))]);
-    try { q.close?.(); } catch { /* */ }
-  } catch { return null; }
-  finally {
-    // Every query writes a session transcript to the projects dir. A one-shot title generator must
-    // not leave one behind, or each call becomes a phantom "conversation" in the list (titled with
-    // this very prompt) that then gets titled itself — a runaway. Delete it.
-    if (sid) { try { await deleteSession(sid); } catch { /* */ } }
-  }
-  // One line, strip wrapping quotes/trailing punctuation the model sometimes adds anyway.
-  const title = buf.split("\n").map((l) => l.trim()).filter(Boolean)[0] || "";
-  const clean = title.replace(/^["'`]+|["'`]+$/g, "").replace(/[.\s]+$/, "").trim().slice(0, 80);
-  // Never accept an echo of our own prompt as a title (thinking-off Haiku sometimes parrots).
-  if (!clean || /first_user_message|opened a chat|write its title/i.test(clean)) return null;
-  return clean;
-}
-// #endregion
 
 /** Spin the cleanup process up while the user is still talking, so the wait at the end is the model only. */
 /** Spin the cleanup process up while the user is still talking, so the wait at the end is the model only. */
@@ -339,6 +287,12 @@ export async function cleanDictation(raw: string, timeoutMs = 15000): Promise<st
 // so replay strips it from the visible transcript; the live UI already renders the user's own words.
 const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; your reply will be read aloud by text-to-speech. Keep it brief and conversational: lead with the answer in one or two spoken sentences. Do not use markdown, bullet or numbered lists, tables, code blocks, headings, or URLs unless explicitly asked. Write times and numbers as words a voice would say (for example 'five thirty PM', not '5:30 PM'). Only expand if the user asks for detail.";
 export function decorateVoiceTurn(text: string): string { return `${text}\n\n<voice-mode>${VOICE_DIRECTIVE}</voice-mode>`; }
+// Appended to the FIRST turn of a new chat so the sidebar gets a real title without a second query.
+// The model opens its reply with <title>3-6 words</title>; the runner strips that off the live stream
+// and the client strips it on replay, so the user never sees it, and convMeta reads it back off the
+// transcript for the conversation list. Wrapped in a sentinel so HIDDEN_STRIP keeps it out of the
+// user's own displayed message too.
+const TITLE_DIRECTIVE = "<title-request>Before anything else in your reply, output a 3 to 6 word title for this conversation wrapped in <title></title> tags, on its own line, then continue normally. The title is hidden from the user; it labels the chat in a list. No quotes, no trailing punctuation.</title-request>";
 // #endregion
 
 // #region dynamic model list
@@ -401,7 +355,8 @@ const APP_UI_SYSTEM_APPEND = [
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.
-const HIDDEN_STRIP = /\s*<(voice-mode|turn-context)>[\s\S]*?<\/\1>\s*/g;
+const HIDDEN_STRIP = /\s*<(voice-mode|turn-context|title-request)>[\s\S]*?<\/\1>\s*/g;
+const TITLE_TAG = /<title>[\s\S]*?<\/title>\s*/i; // the conversation-title tag the first reply opens with
 // #endregion
 
 // When Claude loads a skill, its whole body is injected as a user message that starts with
@@ -559,6 +514,8 @@ export class Conversation {
   private runGen = 0;           // bumped per run() so a superseded run's finally stays quiet
   private inited = false;       // an init event has been seen (the SDK session is live)
   private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
+  private titleScan = false;   // true during a new chat's first turn: withhold a leading <title> from the stream
+  private titleBuf = "";
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -858,7 +815,8 @@ export class Conversation {
       this.runStart = this.log.length; // first turn's replay boundary
       this.emit({ t: "user", text: first, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
-      yield { type: "user", message: { role: "user", content: first + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+      this.titleScan = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
+      yield { type: "user", message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     }
     while (!this.closed) {
       const next = this.queue.shift() ?? (await new Promise<SDKUserMessage | null>((res) => { this.waiter = res; }));
@@ -942,6 +900,33 @@ export class Conversation {
     } catch { /* */ }
   }
 
+  // Withhold text until we know whether the reply opens with <title>...</title>. Emits the title as
+  // its own event and streams only the real answer. Bounded: at most the first line is buffered.
+  private scanTitle(text: string, bid?: string) {
+    this.titleBuf += text;
+    const lead = this.titleBuf.replace(/^\s+/, "");
+    const open = "<title>";
+    if (lead.length < open.length && open.startsWith(lead)) return; // still might be "<title>", wait
+    if (lead.startsWith(open)) {
+      const end = this.titleBuf.indexOf("</title>");
+      if (end < 0) { if (this.titleBuf.length > 200) this.flushTitle(bid); return; } // wait for close (capped)
+      else {
+        const title = this.titleBuf.slice(this.titleBuf.indexOf(open) + open.length, end).replace(/\s+/g, " ").trim().slice(0, 80);
+        if (title) this.emit({ t: "title", title });
+        const rest = this.titleBuf.slice(end + "</title>".length).replace(/^\s*\n/, "");
+        this.titleScan = false; this.titleBuf = "";
+        if (rest) this.emit({ t: "text_delta", text: rest, bid });
+      }
+      return;
+    }
+    this.flushTitle(bid); // the reply did not open with a title -> emit the buffer as normal text
+  }
+  private flushTitle(bid?: string) {
+    if (!this.titleScan) return;
+    const buf = this.titleBuf; this.titleScan = false; this.titleBuf = "";
+    if (buf) this.emit({ t: "text_delta", text: buf, bid });
+  }
+
   private handle(m: SDKMessage) {
     const anyM = m as any;
     if (anyM.session_id && anyM.session_id !== this.id) this.id = anyM.session_id;
@@ -1013,13 +998,13 @@ export class Conversation {
         if (ev?.type === "content_block_start") {
           const cb = ev.content_block;
           // A tool_use block opening = the text just before it was narration, not the final answer.
-          if (cb?.type === "tool_use") { this.emit({ t: "tool_start", id: cb.id, name: cb.name }); this.setPhase("tool", cb.name); }
+          if (cb?.type === "tool_use") { if (this.titleScan) this.flushTitle(bid); this.emit({ t: "tool_start", id: cb.id, name: cb.name }); this.setPhase("tool", cb.name); }
           else if (cb?.type === "thinking") this.setPhase("thinking");
           else if (cb?.type === "text") this.setPhase("writing");
         }
         if (ev?.type === "content_block_delta") {
           const d = ev.delta;
-          if (d?.type === "text_delta" && d.text) this.emit({ t: "text_delta", text: d.text, bid });
+          if (d?.type === "text_delta" && d.text) { if (this.titleScan) this.scanTitle(d.text, bid); else this.emit({ t: "text_delta", text: d.text, bid }); }
           else if (d?.type === "thinking_delta") {
             // subscription auth redacts the thinking text (d.thinking === ""); we still get
             // estimated_tokens progress, so surface a live "thinking" indicator either way.
@@ -1098,6 +1083,7 @@ export class Conversation {
         // never drains. It pinned two conversations "in progress" for over an hour. A mid-turn
         // message surviving the idle announcement is the CLIENT's job (see trailingUnsent), because
         // only the client knows what it has not seen echoed back yet.
+        if (this.titleScan) this.flushTitle();
         this.setPhase("idle");
         this.apiErrors = 0; // per-turn counter
         void this.applyPendingModel(); // a model change picked mid-turn takes effect now the turn is done
@@ -1332,7 +1318,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       for (let bi = 0; bi < blocks.length; bi++) {
         const b = blocks[bi];
         const bid = `${o.uuid || msg.id || "r"}:${bi}`; // same shape as the live <message id>:<index>
-        if (b?.type === "text") out.push({ t: "text", text: b.text, bid });
+        if (b?.type === "text") out.push({ t: "text", text: String(b.text || "").replace(TITLE_TAG, ""), bid }); // drop the hidden <title> the first reply carries
         else if (b?.type === "thinking") out.push({ t: "thinking", text: b.thinking || "", bid });
         else if (b?.type === "tool_use" && b.name === "mcp__app-ui__ask_user") {
           // reconstruct the ask card from the tool input (askId = tool_use id); a matching
