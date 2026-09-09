@@ -7,7 +7,7 @@
 // Auth: inherits the box's Claude login (claude.ai subscription, apiKeySource "none") —
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
-import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
+import { query, deleteSession, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import { mkdirSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -281,6 +281,7 @@ export async function generateTitle(userText: string, assistantText: string, tim
   const content = `The user opened a chat. Write its title.\n\n<first_user_message>\n${u}\n</first_user_message>` +
     (a ? `\n\n<assistant_reply>\n${a}\n</assistant_reply>` : "");
   let buf = "";
+  let sid = "";
   try {
     const q = query({
       prompt: (async function* () { yield { type: "user", message: { role: "user", content }, parent_tool_use_id: null } as SDKUserMessage; })(),
@@ -293,6 +294,7 @@ export async function generateTitle(userText: string, assistantText: string, tim
     const pump = (async () => {
       for await (const m of q as AsyncIterable<SDKMessage>) {
         const anyM = m as any;
+        if (anyM.session_id) sid = anyM.session_id;
         if (anyM.type === "assistant") { for (const b of (anyM.message?.content as any[]) || []) if (b?.type === "text") buf += b.text; }
         else if (anyM.type === "result") break;
       }
@@ -300,10 +302,18 @@ export async function generateTitle(userText: string, assistantText: string, tim
     await Promise.race([pump, new Promise((r) => setTimeout(r, timeoutMs))]);
     try { q.close?.(); } catch { /* */ }
   } catch { return null; }
+  finally {
+    // Every query writes a session transcript to the projects dir. A one-shot title generator must
+    // not leave one behind, or each call becomes a phantom "conversation" in the list (titled with
+    // this very prompt) that then gets titled itself — a runaway. Delete it.
+    if (sid) { try { await deleteSession(sid); } catch { /* */ } }
+  }
   // One line, strip wrapping quotes/trailing punctuation the model sometimes adds anyway.
   const title = buf.split("\n").map((l) => l.trim()).filter(Boolean)[0] || "";
   const clean = title.replace(/^["'`]+|["'`]+$/g, "").replace(/[.\s]+$/, "").trim().slice(0, 80);
-  return clean || null;
+  // Never accept an echo of our own prompt as a title (thinking-off Haiku sometimes parrots).
+  if (!clean || /first_user_message|opened a chat|write its title/i.test(clean)) return null;
+  return clean;
 }
 // #endregion
 
