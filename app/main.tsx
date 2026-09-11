@@ -2482,13 +2482,16 @@ function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">Choose a model<button className="modal-x" onClick={() => setOtherOpen(false)} aria-label="Close">×</button></div>
             <div className="modal-list">
-              {moreModels.map((m) => (
-                <button key={m.id} className={m.id === model ? "active" : ""} onClick={() => onPickModel(m.id)}>
-                  <span className="mm-label">{m.label}</span>
-                  <span className="mm-id">{m.id}</span>
-                  {m.id === model && <span className="dot">●</span>}
-                </button>
-              ))}
+              {moreModels.map((m) => {
+                const active = baseModelId(m.id) === baseModelId(model); // match across [1m]/alias variants, not just exact id
+                return (
+                  <button key={m.id} className={active ? "active" : ""} onClick={() => onPickModel(m.id)}>
+                    <span className="mm-label">{m.label}</span>
+                    <span className="mm-id">{m.id}</span>
+                    {active && <span className="dot">●</span>}
+                  </button>
+                );
+              })}
             </div>
           </div>
         </div>
