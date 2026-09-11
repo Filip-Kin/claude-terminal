@@ -374,10 +374,14 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
 
   // --- API ---
   if (req.method === "GET" && path === "/app/api/models") {
-    // Prefer the CLI's live supported-models menu; fall back to the config list if the probe fails.
-    // A dynamic list is already the curated menu, so there's no separate "Other…" list.
-    let models = ctx.models, moreModels = ctx.moreModels;
-    try { const dyn = await getSupportedModels(); if (dyn.length) { models = dyn; moreModels = []; } } catch { /* keep config fallback */ }
+    // Quick-picks come from the CLI's live supported-models probe (falls back to config if it fails).
+    // The "Other models" dialog ALWAYS carries the full config list, minus anything already a quick-
+    // pick, so every model (Fable, Opus 4.8, ...) stays selectable even when a box's probe reports a
+    // short menu. A dialog id is passed straight to --model, so a probe-omitted model still works.
+    let models = ctx.models;
+    try { const dyn = await getSupportedModels(); if (dyn.length) models = dyn; } catch { /* keep config quick-picks */ }
+    const quick = new Set(models.map((m) => m.id.replace(/\[[^\]]*\]$/, "")));
+    const moreModels = ctx.moreModels.filter((m) => !quick.has(m.id.replace(/\[[^\]]*\]$/, "")));
     return jsonRes({ models, moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
   }
 
