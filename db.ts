@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS external_meta (
   fetched_at    TEXT,
   PRIMARY KEY (peer, user)
 );
+CREATE TABLE IF NOT EXISTS external_model_usage (
+  peer   TEXT NOT NULL,
+  user   TEXT NOT NULL,
+  mk     TEXT NOT NULL,   -- month YYYY-MM (UTC)
+  model  TEXT NOT NULL,
+  output INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (peer, user, mk, model)
+);
 `;
 
 export function openDb(path: string): Database {

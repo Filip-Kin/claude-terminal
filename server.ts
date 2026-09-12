@@ -131,6 +131,16 @@ const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 // Per-user, per-month, per-model output for the weighted-token metric. Lazy: model_usage only
 // exists once a collector carrying that schema has run.
 let qModelMonth: any = null, qModelMonthChecked = false;
+let qExtModelMonth: any = null, qExtModelMonthChecked = false;
+function externalModelMonthQuery() {
+  if (qExtModelMonthChecked || !db) return qExtModelMonth;
+  qExtModelMonthChecked = true;
+  try {
+    if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='external_model_usage'").get())
+      qExtModelMonth = db.query("SELECT peer, user, mk, model, sum(output) AS output FROM external_model_usage GROUP BY peer, user, mk, model");
+  } catch { qExtModelMonth = null; }
+  return qExtModelMonth;
+}
 function modelMonthQuery() {
   if (qModelMonthChecked || !db) return qModelMonth;
   qModelMonthChecked = true;
@@ -195,9 +205,23 @@ function latestSubscription() {
 // buckets (last 45 days) + cumulative + meta per local user, so the puller reconstructs
 // the same gauges against its own clock. Only local users are exported (external users
 // are read from other tables), so peers never chain each other's data.
+// Per-user per-month per-model output, for the weighted metric to travel with the export so a peer's
+// board can weight it (not just count raw output). Lazy: model_usage may not exist on an old DB.
+let qExportModels: any = null, qExportModelsChecked = false;
+function exportModelsQuery() {
+  if (qExportModelsChecked || !db) return qExportModels;
+  qExportModelsChecked = true;
+  try {
+    if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get())
+      qExportModels = db.query("SELECT substr(minute_utc,1,7) AS mk, model, sum(output) AS output FROM model_usage WHERE user = ? GROUP BY mk, model");
+  } catch { qExportModels = null; }
+  return qExportModels;
+}
+
 function buildExport() {
   if (!db) return { peer: OWNER, generated_at: new Date().toISOString(), users: [] };
   const cutoff = hourKeyOf(new Date(Date.now() - 45 * 24 * 3600e3));
+  const emq = exportModelsQuery();
   const users: any[] = [];
   for (const { user } of qUsers.all() as any[]) {
     const cum = (qCum.get(user) as any) || { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 };
@@ -214,6 +238,7 @@ function buildExport() {
       },
       meta: { sessions: meta.sessions || 0, models: meta.models || "[]", last_activity: meta.last_activity || null },
       hourly,
+      models: emq ? (emq.all(user) as any[]).map((r) => ({ mk: r.mk, model: r.model, output: r.output })) : [],
     });
   }
   return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(), users };
@@ -232,6 +257,10 @@ function buildLeaderboard() {
   const wByMonth: Record<string, Record<string, number>> = {};
   const mmq = modelMonthQuery();
   if (mmq) for (const r of mmq.all() as any[]) (wByMonth[r.mk] ??= {})[r.user] = (wByMonth[r.mk][r.user] || 0) + (r.output || 0) * modelWeight(r.model);
+  // External peers' per-model output, keyed by the same extKey buildLeaderboard uses for their rows,
+  // so weightedFor() weights a peer's output when their export carried model detail (raw otherwise).
+  const emmq = externalModelMonthQuery();
+  if (emmq) for (const r of emmq.all() as any[]) { const k = extKey(r.peer, r.user); (wByMonth[r.mk] ??= {})[k] = (wByMonth[r.mk][k] || 0) + (r.output || 0) * modelWeight(r.model); }
   const weightedFor = (mk: string, user: string, rawOut: number) => {
     const w = wByMonth[mk]?.[user];
     return w != null ? w : rawOut; // no model breakdown -> count raw output at weight 1

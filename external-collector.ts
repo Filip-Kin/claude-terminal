@@ -24,6 +24,8 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
   const delCum = db.prepare("DELETE FROM external_cum WHERE peer = ?");
   const delHours = db.prepare("DELETE FROM external_hourly WHERE peer = ?");
   const delMeta = db.prepare("DELETE FROM external_meta WHERE peer = ?");
+  const delModels = db.prepare("DELETE FROM external_model_usage WHERE peer = ?");
+  const insModels = db.prepare("INSERT OR REPLACE INTO external_model_usage (peer, user, mk, model, output) VALUES (?, ?, ?, ?, ?)");
   const insCum = db.prepare(
     `INSERT INTO external_cum (peer, user, name, input, output, cache_creation, cache_read, total)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -58,6 +60,7 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
         delCum.run(peerName);
         delHours.run(peerName);
         delMeta.run(peerName);
+        delModels.run(peerName);
         for (const u of exportUsers) {
           const user = String(u?.user || "").trim();
           if (!user) continue;
@@ -72,6 +75,11 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
           for (const h of Array.isArray(u.hourly) ? u.hourly : []) {
             if (!h?.hour_utc) continue;
             insHours.run(peerName, user, String(h.hour_utc), num(h.total), num(h.output));
+          }
+          // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
+          for (const mm of Array.isArray(u.models) ? u.models : []) {
+            if (!mm?.mk || !mm?.model) continue;
+            insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output));
           }
         }
       });
