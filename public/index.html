@@ -384,7 +384,7 @@ function refresh(d){
   // entrance animation still runs in build().
   d.users.forEach(u => {
     if(sparks[u.user]) sparks[u.user].updateSeries([{name:"output", data:sparkData(d,u)}], false);
-    const vals = { mo:u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total };
+    const vals = { mo:u.month_weighted ?? u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total }; // weighted, to match the card label + ranking
     for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
   });
   populateMonths(d);
