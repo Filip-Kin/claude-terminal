@@ -850,7 +850,11 @@ function rewriteLocalRefs(html: string, convId: string | null): string {
   const dl = (p: string) => `/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`;
   return html
     .replace(/<img([^>]*?)\ssrc="([^"]+)"([^>]*)>/g, (m, pre, src, post) => /^(https?:|data:|blob:|\/app\/api\/)/i.test(src) ? `<img${pre} src="${src}"${post} loading="lazy">` : `<img${pre} src="${dl(src)}"${post} loading="lazy">`)
-    .replace(/<a([^>]*?)\shref="([^"]+)"([^>]*)>/g, (m, pre, href, post) => /^(https?:|mailto:|#|\/app\/api\/)/i.test(href) ? m : `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`);
+    .replace(/<a([^>]*?)\shref="([^"]+)"([^>]*)>/g, (m, pre, href, post) => {
+      if (/^https?:/i.test(href)) return `<a${pre} href="${href}"${post} target="_blank" rel="noreferrer noopener">`; // external -> new tab, keep the chat open
+      if (/^(mailto:|tel:|#|\/app\/api\/)/i.test(href)) return m; // mail/anchor/download handled elsewhere
+      return `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`; // local file
+    });
 }
 
 function Assistant({ text, convId }: { text: string; convId?: string | null }) {
