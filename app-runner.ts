@@ -515,6 +515,7 @@ export class Conversation {
   private inited = false;       // an init event has been seen (the SDK session is live)
   private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
   private titleScan = false;   // true during a new chat's first turn: withhold a leading <title> from the stream
+  private running = false;     // the run() query loop is alive; a send while false means the subprocess died and must be re-run
   private titleBuf = "";
 
   constructor(id: string, opts: ConvOpts) {
@@ -641,8 +642,16 @@ export class Conversation {
     this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
-    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); }
-    else this.queue.push(msg);
+    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); return; }
+    this.queue.push(msg);
+    // If the query loop has ended (the subprocess crashed or was killed), inputGen already returned
+    // and nothing will ever consume this queue -> the conversation accepts messages but never
+    // answers. Restart the query, resuming this session, so the queued turn is actually processed.
+    if (!this.running) {
+      if (!this.resume && this.inited) this.resume = this.id; // resume THIS session, not a fresh one
+      tlog("requery", { conv: this.id });
+      void this.run();
+    }
   }
 
   // Change the model for THIS conversation. The SDK's live setModel writes to the query's control
@@ -863,6 +872,7 @@ export class Conversation {
       },
     });
     if (first === undefined && !this.inited) this.setPhase("starting"); // a resume: the subprocess is coming up before any turn is queued
+    this.running = true;
     try {
       for await (const m of this.q) this.handle(m);
     } catch (e: any) {
@@ -871,6 +881,7 @@ export class Conversation {
     } finally {
       // Superseded by a refork -> stay silent; the new run owns the stream now.
       if (myGen === this.runGen) {
+        this.running = false;
         this.setPhase("idle"); // emits busy:false itself if it was busy
         tlog("closed", { conv: this.id, listeners: this.subs.size });
         this.emit({ t: "closed" });
