@@ -408,7 +408,7 @@ function untilStr(iso){
   if(m>=1) return "resets in "+m+"m";
   return "resets in <1m";
 }
-function subCell(label, win, windowSec){
+function subCell(label, win, windowSec, wide){
   const u = win && typeof win.utilization==="number" ? win.utilization : null;
   const pct = u==null ? 0 : Math.max(0,Math.min(100,u));
   const col = subColor(u);
@@ -420,7 +420,7 @@ function subCell(label, win, windowSec){
     const remain = (Date.parse(win.resets_at)-Date.now())/1000;
     if(isFinite(remain)) ghost = Math.max(0,Math.min(100,Math.round((1-remain/windowSec)*100)));
   }
-  return '<div class="u">'
+  return '<div class="u"'+(wide?' style="grid-column:1/-1"':'')+'>'
     + '<div class="ul"><span>'+label+'</span><b>'+(u==null?"–":Math.round(u)+"%")+'</b></div>'
     + '<div class="track"><span style="width:'+pct+'%;background:'+col+'"></span>'+(ghost!=null?'<i title="'+ghost+'% of the window elapsed" style="left:'+ghost+'%"></i>':'')+'</div>'
     + '<div class="ul" style="margin:8px 0 0"><span>'+left+'</span><span>'+untilStr(win&&win.resets_at)+'</span></div>'
@@ -433,8 +433,9 @@ function renderSubscription(d){
   if(!p || (!p.five_hour && !p.seven_day)){ panel.style.display="none"; return; }
   panel.style.display="";
   document.getElementById("subUtil").innerHTML =
-    subCell("Session (5h)", p.five_hour, 5*3600) + subCell("Weekly (7d)", p.seven_day, 7*86400)
-    + (p.fable ? subCell("Fable (7d)", p.fable, 7*86400) : "");
+    subCell("Session (5h)", p.five_hour, 5*3600)
+    + (p.fable ? subCell("Fable (7d)", p.fable, 7*86400) : "")
+    + subCell("Weekly (7d)", p.seven_day, 7*86400, true);
   const n = p.active_users, foot = document.getElementById("subFoot");
   if(typeof n==="number" && n>0){
     foot.style.display="";
