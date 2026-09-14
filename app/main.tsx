@@ -1307,7 +1307,8 @@ function App() {
   // truth from an actual 4s request heartbeat: false when requests are failing, which lets the banner
   // show "connection unstable" even while the browser insists it's online.
   const [reachable, setReachable] = useState(true);
-  const netMiss = useRef(0); // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
+  const netMiss = useRef(0);
+  const seenConvIds = useRef<Set<string>>(new Set()); // conv ids the status poll has already reacted to, so an unknown one triggers ONE list refresh (new chat from another device) // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
   const [queued, setQueued] = useState(0);
   const [artifact, setArtifact] = useState<Artifact | null>(null); // the artifact open in the split-screen / sheet viewer
   const [artifactW, setArtifactW] = useState<number>(() => { const v = Number(localStorage.getItem("ct-artifact-w")); return v >= 360 && v <= 1400 ? v : 560; }); // desktop split panel width (px), draggable + persisted
@@ -1557,12 +1558,23 @@ function App() {
   useEffect(() => {
     const pull = () => {
       if (navigator.onLine) api.statuses()
-        .then((d) => { setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); })   // a real response = link works
+        .then((d) => {
+          setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); // a real response = link works
+          // A conversation live on the server that this client's sidebar has never seen is a new chat
+          // started on another device. Pull the list ONCE so it appears without a manual refresh.
+          const known = new Set(convsRef.current.map((c) => c.sessionId));
+          let fresh = false;
+          for (const id of Object.keys(d?.statuses || {})) {
+            if (!/^[A-Za-z0-9-]{20,}$/.test(id) || known.has(id) || seenConvIds.current.has(id)) continue;
+            seenConvIds.current.add(id); fresh = true;
+          }
+          if (fresh) refreshConvs();
+        })
         .catch(() => { netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
       void refreshQueue();
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, [refreshQueue]);
+  }, [refreshQueue, refreshConvs]);
   // App-icon badge: how many agents are WAITING on you. Deliberately not "how many are busy" — the
   // badge answers "does anything need me", and a working agent does not. The service worker sets the
   // same badge from a status push while the app is closed, so the two agree.
