@@ -32,6 +32,15 @@ const saveFavPending = (m: Record<string, boolean>) => { try { localStorage.setI
 // shows an unread indicator. Only conversations you've opened get an entry, so the backlog doesn't
 // all light up as unread.
 const LASTREAD_LS = "ct-app-lastread";
+// #region theme (dark / light / system)
+type ThemePref = "dark" | "light" | "system";
+const THEME_LS = "ct-app-theme";
+const themeMql = typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+const resolvedTheme = (p: ThemePref): "dark" | "light" => (p === "system" ? (themeMql?.matches ? "light" : "dark") : p);
+function applyTheme(p: ThemePref) { try { document.body.classList.toggle("theme-light", resolvedTheme(p) === "light"); } catch { /* body not ready */ } }
+const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "light" || v === "system" ? v : "dark"; } catch { return "dark"; } };
+applyTheme(loadThemePref()); // apply before React paints so a returning light-theme user gets no dark flash
+// #endregion
 const loadLastRead = (): Record<string, number> => { try { const o = JSON.parse(localStorage.getItem(LASTREAD_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };
 const saveLastRead = (m: Record<string, number>) => { try { localStorage.setItem(LASTREAD_LS, JSON.stringify(m)); } catch { /* */ } };
 // Per-conversation composer drafts: an unsent message is kept under its conversation id (null = the new
@@ -1257,6 +1266,9 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [theme, setThemeState] = useState<ThemePref>(loadThemePref);
+  const setTheme = useCallback((t: ThemePref) => { setThemeState(t); try { localStorage.setItem(THEME_LS, t); } catch { /* */ } applyTheme(t); }, []);
+  useEffect(() => { applyTheme(theme); if (theme !== "system" || !themeMql) return; const on = () => applyTheme("system"); themeMql.addEventListener?.("change", on); return () => themeMql.removeEventListener?.("change", on); }, [theme]);
   const [connOpen, setConnOpen] = useState(false); // Connections: MCP servers, skills, memory, network
   // null = still checking, so the row shows a neutral state instead of flashing "off" then "on".
   const [pushOn, setPushOn] = useState<boolean | null>(null);
@@ -2517,6 +2529,18 @@ function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">Settings<button className="modal-x" onClick={() => setSettingsOpen(false)} aria-label="Close">×</button></div>
             <div className="settings-body">
+              <div className="settings-section">Appearance</div>
+              <label className="settings-row">
+                <span className="settings-row-main">
+                  <span className="settings-row-title">Theme</span>
+                  <span className="settings-row-desc">Dark, light, or follow your device. Saved per device.</span>
+                </span>
+                <select className="settings-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemePref)}>
+                  <option value="dark">Dark</option>
+                  <option value="light">Light</option>
+                  <option value="system">System</option>
+                </select>
+              </label>
               <div className="settings-section">Notifications</div>
               <label className="settings-row">
                 <span className="settings-row-main">
