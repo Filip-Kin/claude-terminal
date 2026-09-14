@@ -1410,7 +1410,16 @@ export async function resolveEditPoints(path: string, userIndex: number): Promis
 // list already excludes, so it never pollutes the sidebar. getSubscriptionUsage() is non-blocking:
 // it returns the cached snapshot immediately and refreshes it in the background when stale.
 export interface SubscriptionWindow { utilization: number | null; resetsAt: string | null }
-export interface SubscriptionUsage { available: boolean; subscription: string | null; fiveHour: SubscriptionWindow | null; sevenDay: SubscriptionWindow | null; fetchedAt: number }
+export interface ModelScopedWindow { displayName: string; utilization: number | null; resetsAt: string | null }
+export interface SubscriptionUsage {
+  available: boolean; subscription: string | null;
+  fiveHour: SubscriptionWindow | null; sevenDay: SubscriptionWindow | null;
+  // Additional windows the SDK exposes; captured so the collector can log them all. Present only
+  // when the account carries them, hence nullable/optional.
+  sevenDayOauthApps: SubscriptionWindow | null; sevenDayOpus: SubscriptionWindow | null; sevenDaySonnet: SubscriptionWindow | null;
+  modelScoped: ModelScopedWindow[]; // per-model weekly windows, labelled (e.g. "Fable")
+  fetchedAt: number;
+}
 
 const SUB_CWD = "/tmp/ct-usage"; // -tmp-ct-usage project -> excluded from the conversation list
 const SUB_TTL = 90_000; // a rate-limit window moves slowly; 90s is plenty fresh
@@ -1444,7 +1453,15 @@ async function refreshSubscriptionUsage(): Promise<void> {
     const u: any = await ctrlQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
     const rl = u?.rate_limits || {};
     const win = (w: any): SubscriptionWindow | null => (w ? { utilization: typeof w.utilization === "number" ? w.utilization : null, resetsAt: w.resets_at || null } : null);
-    subCache = { available: !!u?.rate_limits_available, subscription: u?.subscription_type || null, fiveHour: win(rl.five_hour), sevenDay: win(rl.seven_day), fetchedAt: Date.now() };
+    const modelScoped: ModelScopedWindow[] = Array.isArray(rl.model_scoped)
+      ? rl.model_scoped.map((m: any) => ({ displayName: String(m?.display_name || ""), utilization: typeof m?.utilization === "number" ? m.utilization : null, resetsAt: m?.resets_at || null }))
+      : [];
+    subCache = {
+      available: !!u?.rate_limits_available, subscription: u?.subscription_type || null,
+      fiveHour: win(rl.five_hour), sevenDay: win(rl.seven_day),
+      sevenDayOauthApps: win(rl.seven_day_oauth_apps), sevenDayOpus: win(rl.seven_day_opus), sevenDaySonnet: win(rl.seven_day_sonnet),
+      modelScoped, fetchedAt: Date.now(),
+    };
   } catch { /* keep the last snapshot */ }
   finally { subRefreshing = false; }
 }

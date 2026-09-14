@@ -191,10 +191,19 @@ function latestSubscription() {
   try {
     const r = qSub.get() as any;
     if (!r) return null;
+    // All windows are logged in subscription_samples, but the leaderboard surfaces only the Fable
+    // per-model window (opus/sonnet/oauth_apps stay in the DB for later analysis, not on the page).
+    let fable: { utilization: number | null; resets_at: string | null } | null = null;
+    try {
+      const ms = r.model_scoped ? JSON.parse(r.model_scoped) : [];
+      const f = Array.isArray(ms) ? ms.find((m: any) => /fable/i.test(String(m?.display_name || ""))) : null;
+      if (f) fable = { utilization: f.utilization ?? null, resets_at: f.resets_at ?? null };
+    } catch { /* malformed JSON -> no fable window */ }
     return {
       subscription: r.subscription ?? null,
       five_hour: { utilization: r.five_hour_util ?? null, resets_at: r.five_hour_reset ?? null },
       seven_day: { utilization: r.seven_day_util ?? null, resets_at: r.seven_day_reset ?? null },
+      fable,
       active_users: r.active_users ?? null,
       sampled_at: r.ts ?? null,
     };

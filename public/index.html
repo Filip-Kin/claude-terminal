@@ -414,21 +414,16 @@ function subCell(label, win, windowSec){
   const col = subColor(u);
   const left = u==null ? "" : Math.max(0,100-Math.round(u))+"% left";
   // Ghost bar: where we'd be if the window were used evenly over time. elapsed = windowLen - remaining.
-  let ghost = null, pace = "";
+  // The marker alone shows ahead/behind at a glance (fill left of the tick = ahead), no text needed.
+  let ghost = null;
   if(win && win.resets_at && windowSec){
     const remain = (Date.parse(win.resets_at)-Date.now())/1000;
-    if(isFinite(remain)){
-      ghost = Math.max(0,Math.min(100,Math.round((1-remain/windowSec)*100)));
-      if(u!=null){
-        const diff = ghost-Math.round(u); // + = using slower than the clock (ahead), - = burning faster
-        pace = diff>0 ? diff+"% ahead of pace" : diff<0 ? (-diff)+"% over pace" : "on pace";
-      }
-    }
+    if(isFinite(remain)) ghost = Math.max(0,Math.min(100,Math.round((1-remain/windowSec)*100)));
   }
   return '<div class="u">'
     + '<div class="ul"><span>'+label+'</span><b>'+(u==null?"–":Math.round(u)+"%")+'</b></div>'
     + '<div class="track"><span style="width:'+pct+'%;background:'+col+'"></span>'+(ghost!=null?'<i title="'+ghost+'% of the window elapsed" style="left:'+ghost+'%"></i>':'')+'</div>'
-    + '<div class="ul" style="margin:8px 0 0"><span>'+left+(pace?' · '+pace:'')+'</span><span>'+untilStr(win&&win.resets_at)+'</span></div>'
+    + '<div class="ul" style="margin:8px 0 0"><span>'+left+'</span><span>'+untilStr(win&&win.resets_at)+'</span></div>'
     + '</div>';
 }
 function renderSubscription(d){
@@ -438,7 +433,8 @@ function renderSubscription(d){
   if(!p || (!p.five_hour && !p.seven_day)){ panel.style.display="none"; return; }
   panel.style.display="";
   document.getElementById("subUtil").innerHTML =
-    subCell("Session (5h)", p.five_hour, 5*3600) + subCell("Weekly (7d)", p.seven_day, 7*86400);
+    subCell("Session (5h)", p.five_hour, 5*3600) + subCell("Weekly (7d)", p.seven_day, 7*86400)
+    + (p.fable ? subCell("Fable (7d)", p.fable, 7*86400) : "");
   const n = p.active_users, foot = document.getElementById("subFoot");
   if(typeof n==="number" && n>0){
     foot.style.display="";

@@ -65,6 +65,15 @@ const ADDED_COLUMNS: Record<string, string> = {
   cum_cache_read: "INTEGER",
   cum_cache_creation: "INTEGER",
   cum_input: "INTEGER",
+  // The remaining SDK rate-limit windows, tracked for completeness. model_scoped holds the
+  // per-model weekly buckets (e.g. Fable) as a JSON array of {display_name, utilization, resets_at}.
+  seven_day_oauth_apps_util: "REAL",
+  seven_day_oauth_apps_reset: "TEXT",
+  seven_day_opus_util: "REAL",
+  seven_day_opus_reset: "TEXT",
+  seven_day_sonnet_util: "REAL",
+  seven_day_sonnet_reset: "TEXT",
+  model_scoped: "TEXT",
 };
 
 function ensureColumns(db: any): void {
@@ -88,6 +97,10 @@ type SubUsage = {
   subscription?: string | null;
   fiveHour?: SubWindow;
   sevenDay?: SubWindow;
+  sevenDayOauthApps?: SubWindow;
+  sevenDayOpus?: SubWindow;
+  sevenDaySonnet?: SubWindow;
+  modelScoped?: { displayName: string; utilization: number | null; resetsAt: string | null }[];
   fetchedAt?: number;
 } | null;
 
@@ -170,13 +183,21 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
       if (isFinite(t) && t >= cutoff) active++;
     }
 
+    const oauthApps = sub.sevenDayOauthApps || null;
+    const opus = sub.sevenDayOpus || null;
+    const sonnet = sub.sevenDaySonnet || null;
+    const modelScoped = Array.isArray(sub.modelScoped) ? sub.modelScoped : [];
+
     db.query(
       `INSERT OR REPLACE INTO subscription_samples
        (ts, fetched_at, subscription, five_hour_util, five_hour_reset,
         seven_day_util, seven_day_reset, cum_output, cum_total, active_users, per_user_output,
         per_model_output, per_model_total, five_hour_window, seven_day_window, available,
-        cum_input, cum_cache_creation, cum_cache_read)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        cum_input, cum_cache_creation, cum_cache_read,
+        seven_day_oauth_apps_util, seven_day_oauth_apps_reset,
+        seven_day_opus_util, seven_day_opus_reset,
+        seven_day_sonnet_util, seven_day_sonnet_reset, model_scoped)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       Date.now(),
       typeof sub.fetchedAt === "number" ? sub.fetchedAt : null,
@@ -197,6 +218,13 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
       totals.input,
       totals.cacheCreation,
       totals.cacheRead,
+      oauthApps?.utilization ?? null,
+      oauthApps?.resetsAt ?? null,
+      opus?.utilization ?? null,
+      opus?.resetsAt ?? null,
+      sonnet?.utilization ?? null,
+      sonnet?.resetsAt ?? null,
+      modelScoped.length ? JSON.stringify(modelScoped.map((m) => ({ display_name: m.displayName, utilization: m.utilization, resets_at: m.resetsAt }))) : null,
     );
     console.log(
       `subscription sample: 5h=${five?.utilization ?? "?"}% 7d=${seven?.utilization ?? "?"}% ` +
