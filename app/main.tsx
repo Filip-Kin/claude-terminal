@@ -38,7 +38,7 @@ const THEME_LS = "ct-app-theme";
 const themeMql = typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
 const resolvedTheme = (p: ThemePref): "dark" | "light" => (p === "system" ? (themeMql?.matches ? "light" : "dark") : p);
 function applyTheme(p: ThemePref) { try { document.body.classList.toggle("theme-light", resolvedTheme(p) === "light"); } catch { /* body not ready */ } }
-const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "light" || v === "system" ? v : "dark"; } catch { return "dark"; } };
+const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "light" || v === "dark" ? v : "system"; } catch { return "system"; } }; // default: follow the device
 applyTheme(loadThemePref()); // apply before React paints so a returning light-theme user gets no dark flash
 // #endregion
 const loadLastRead = (): Record<string, number> => { try { const o = JSON.parse(localStorage.getItem(LASTREAD_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };

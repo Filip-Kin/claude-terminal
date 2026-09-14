@@ -598,6 +598,17 @@ function injectArtifactCss() {
   .hljs-attr,.hljs-property,.hljs-params{color:#c9a7e6}
   .hljs-tag,.hljs-punctuation{color:#b8afa5}
   .hljs-emphasis{font-style:italic}.hljs-strong{font-weight:700}
+  /* light theme: warm code card + a light syntax palette with enough contrast on the pale bg */
+  body.theme-light .ct-code,body.theme-light .ct-code pre{background:#f3eee7}
+  body.theme-light .hljs{color:#2a2420}
+  body.theme-light .hljs-comment,body.theme-light .hljs-quote{color:#a39a8f}
+  body.theme-light .hljs-keyword,body.theme-light .hljs-selector-tag,body.theme-light .hljs-literal,body.theme-light .hljs-doctag,body.theme-light .hljs-formula{color:#b0562f}
+  body.theme-light .hljs-string,body.theme-light .hljs-regexp,body.theme-light .hljs-addition,body.theme-light .hljs-attribute,body.theme-light .hljs-meta .hljs-string{color:#4c8a3a}
+  body.theme-light .hljs-number,body.theme-light .hljs-symbol,body.theme-light .hljs-bullet,body.theme-light .hljs-link,body.theme-light .hljs-selector-attr,body.theme-light .hljs-template-variable,body.theme-light .hljs-variable{color:#9a6a12}
+  body.theme-light .hljs-title,body.theme-light .hljs-section,body.theme-light .hljs-name,body.theme-light .hljs-selector-id,body.theme-light .hljs-selector-class{color:#2f6bb0}
+  body.theme-light .hljs-type,body.theme-light .hljs-class .hljs-title,body.theme-light .hljs-built_in,body.theme-light .hljs-builtin-name{color:#1f7a7a}
+  body.theme-light .hljs-attr,body.theme-light .hljs-property,body.theme-light .hljs-params{color:#7a4fb0}
+  body.theme-light .hljs-tag,body.theme-light .hljs-punctuation{color:#6b6259}
   @media (max-width:820px){.ct-av-head{gap:6px;padding:8px 8px calc(8px)}.ct-av-title{display:none}.ct-av-btn span{display:none}}
   `;
   const el = document.createElement("style"); el.id = "artifacts-css"; el.textContent = css; document.head.appendChild(el);
