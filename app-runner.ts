@@ -472,7 +472,11 @@ export class Conversation {
   phase: Phase = "idle";
   private phaseSince = 0;
   private phaseDetail?: string;
-  get busy(): boolean { return this.phase !== "idle"; }
+  // Live background tasks (SDK background_tasks_changed level signal), ambient ones excluded. These
+  // outlive the foreground turn that spawned them, so a conversation can be "idle" on phase yet still
+  // running work; fold them into busy so the list dot shows while they run.
+  private bgTasks = new Set<string>();
+  get busy(): boolean { return this.phase !== "idle" || this.bgTasks.size > 0; }
   get seq(): number { return this.seqCounter - 1; } // highest _seq handed out so far (-1 = none)
   private curMsgId = ""; // id of the assistant message being streamed: block ids are <msg>:<index>
   private ctxMax = 0;    // context window for this model, fetched once after init
@@ -945,6 +949,7 @@ export class Conversation {
       case "system":
         if (anyM.subtype === "init") {
           this.inited = true;
+          this.bgTasks.clear(); // the level is per-process: a (re)start resets it; the CLI re-sends a snapshot
           this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
           if (anyM.model) { this.model = anyM.model; this.emit({ t: "model", model: anyM.model }); }
           if (this.phase === "starting") this.setPhase("waiting");
@@ -978,6 +983,17 @@ export class Conversation {
         else if (anyM.subtype === "status" && (anyM.status === "compacting" || anyM.compact_result)) {
           if (anyM.status === "compacting") { this.emit({ t: "compacting", active: true }); this.setPhase("compacting"); }
           else if (anyM.compact_result === "failed") { this.emit({ t: "compacting", active: false }); this.emit({ t: "notice", kind: "info", text: "Compaction failed: " + (anyM.compact_error || "unknown") }); }
+        }
+        // Level signal: the full set of live background tasks after any membership change. REPLACE
+        // semantics (never pair the task_started/notification edges). Ambient = CLI housekeeping, not
+        // user work, so excluded from the busy indicator. A change here can flip busy without a phase
+        // change, so emit the busy edge ourselves.
+        else if (anyM.subtype === "background_tasks_changed") {
+          const next = new Set<string>();
+          for (const t of (anyM.tasks as any[]) || []) if (t && !t.ambient && t.task_id) next.add(String(t.task_id));
+          const wasBusy = this.busy;
+          this.bgTasks = next;
+          if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy });
         }
         // Background subagent activity + cross-session messages, surfaced inline so the thread
         // shows work spun off to other agents (Claude Code's task/notification stream).
