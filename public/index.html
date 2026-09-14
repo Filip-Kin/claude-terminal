@@ -320,7 +320,7 @@ function renderSplit(d, key){
     rows.appendChild(row);
   });
   document.getElementById("billFoot").innerHTML =
-    `<b>${fmt(m.weighted_total ?? m.total)}</b> weighted output tokens in ${m.label}, split into the ${money(d.subscription_usd)} above. `
+    `<b>${fmt(m.weighted_total ?? m.total)}</b> weighted output tokens in ${m.label}, split into the ${money(m.subscription_usd ?? d.subscription_usd)} above. `
     + `A rough gauge of the value each person got.`;
 }
 

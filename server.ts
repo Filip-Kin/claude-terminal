@@ -72,7 +72,23 @@ if (db) db.exec("PRAGMA busy_timeout = 5000;");
 // #region usage leaderboard (SQLite -> the leaderboard.json shape the page already consumes)
 const ROLLING_HOURS = 5, GAUGE_MAX = 5_000_000, HOURLY_HOURS = 168, SPARK_HOURS = 48;
 const ACTIVE_MS = 15 * 60 * 1000;
-const SUBSCRIPTION_USD = Number(cfg.subscriptionUsd || 0);
+// Subscription pot in USD, effective-dated by month so a mid-life price change only affects months
+// from its breakpoint onward (older months keep their old split). cfg.subscriptionUsd is either a
+// flat number, or an object of { "YYYY-MM": usd } breakpoints plus an optional "default" for months
+// before the first breakpoint, e.g. { "default": 100, "2026-09": 200 }.
+const SUB_SCHEDULE: { from: string; usd: number }[] = (() => {
+  const v = cfg.subscriptionUsd;
+  if (v == null) return [{ from: "0000-00", usd: 0 }];
+  if (typeof v === "number") return [{ from: "0000-00", usd: v }];
+  const pts = Object.entries(v).filter(([k]) => /^\d{4}-\d{2}$/.test(k)).map(([k, u]) => ({ from: k, usd: Number(u) }));
+  pts.push({ from: "0000-00", usd: Number((v as any).default ?? 0) });
+  return pts.sort((a, b) => (a.from < b.from ? -1 : 1));
+})();
+function subUsdFor(mk: string): number {
+  let val = SUB_SCHEDULE[0]?.usd ?? 0;
+  for (const p of SUB_SCHEDULE) { if (mk >= p.from) val = p.usd; else break; }
+  return val;
+}
 // "Weighted output tokens": each model's output tokens scaled by how much of the shared session
 // limit that model actually costs, so a heavy-model user is billed for the load they put on the
 // subscription rather than a flat per-token rate. Weight = the model's API output price relative to
@@ -309,7 +325,6 @@ function buildLeaderboard() {
 
   const allUsers = users.map((u) => u.user);
   const nameOf = Object.fromEntries(users.map((u) => [u.user, u.name]));
-  const pot = SUBSCRIPTION_USD * 100;
   const months: any[] = [];
   for (const mk of Object.keys(byMonth).sort()) {
     const outs: Record<string, number> = {};
@@ -319,20 +334,20 @@ function buildLeaderboard() {
     const wtotal = Object.values(wtd).reduce((a, b) => a + b, 0);
     // The subscription is split by WEIGHTED output, so a heavy-model user pays for the load they put
     // on the shared limit, not a flat per-token rate.
-    const cents = splitCents(wtd, pot);
+    const cents = splitCents(wtd, subUsdFor(mk) * 100);
     const rows = allUsers.map((u) => ({
       user: u, name: nameOf[u], output: outs[u], weighted: Math.round(wtd[u]),
       pct: wtotal ? Math.round((1000 * wtd[u]) / wtotal) / 10 : 0,
       share_usd: cents[u] / 100,
     }));
     rows.sort((a, b) => b.weighted - a.weighted);
-    months.push({ key: mk, label: monthLabel(mk), total, weighted_total: Math.round(wtotal), rows });
+    months.push({ key: mk, label: monthLabel(mk), total, weighted_total: Math.round(wtotal), subscription_usd: subUsdFor(mk), rows });
   }
 
   const cur: Record<string, number> = {};
   for (const u of allUsers) cur[u] = weightedFor(monthPrefix, u, byMonth[monthPrefix]?.[u] || 0);
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
-  const curCents = splitCents(cur, pot);
+  const curCents = splitCents(cur, subUsdFor(monthPrefix) * 100);
   for (const u of users) {
     u.share_usd = curCents[u.user] / 100;
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0; // share of WEIGHTED output
@@ -380,7 +395,7 @@ function buildLeaderboard() {
 
   return {
     generated_at: now.toISOString().replace(/\.\d+Z$/, "+00:00"),
-    window_hours: ROLLING_HOURS, gauge_max: GAUGE_MAX, subscription_usd: SUBSCRIPTION_USD,
+    window_hours: ROLLING_HOURS, gauge_max: GAUGE_MAX, subscription_usd: subUsdFor(monthPrefix),
     month_label: monthLabel(monthPrefix), current_month: monthPrefix,
     model_weights: MODEL_WEIGHTS,
     months, hour_ms, spark_hours: SPARK_HOURS, users,
