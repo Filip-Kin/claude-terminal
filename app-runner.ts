@@ -461,6 +461,10 @@ function limitNoticeText(resumeAt: number | null): string {
   return `Subscription limit reached. This turn will auto-resume around ${when} when the limit resets.`;
 }
 
+// How long a query may go silent after a send before we treat it as hung and recycle it. A live
+// query emits an init/stream event within seconds; only a dead subprocess produces nothing at all.
+const HUNG_QUERY_MS = 60_000;
+
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
   cwd: string;
@@ -521,6 +525,13 @@ export class Conversation {
   private titleScan = false;   // true during a new chat's first turn: withhold a leading <title> from the stream
   private running = false;     // the run() query loop is alive; a send while false means the subprocess died and must be re-run
   private titleBuf = "";
+  // Hung-query watchdog. `running` true only means the for-await loop is parked; if the SDK
+  // subprocess dies WITHOUT the iterator throwing, the loop hangs forever and sends pile up with no
+  // reply (the "keeps loading, never reaches waiting-for-model" failure). We arm a timer on each
+  // send and clear it on any message from the query; if nothing arrives, the query is dead -> recycle.
+  private lastMsgAt = 0;       // unix ms of the last message received from the live query
+  private hungWatch?: ReturnType<typeof setTimeout>;
+  private lastRecycleAt = 0;   // rate-limit the recycle so a genuinely unresumable session can't loop
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -646,6 +657,10 @@ export class Conversation {
     this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+    // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
+    // nor the queue, and its dead inputGen is parked exactly at the waiter below, so the healthy-path
+    // early return must be covered too. handle() clears this the instant any real message arrives.
+    this.armHungWatch();
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); return; }
     this.queue.push(msg);
     // If the query loop has ended (the subprocess crashed or was killed), inputGen already returned
@@ -656,6 +671,44 @@ export class Conversation {
       tlog("requery", { conv: this.id });
       void this.run();
     }
+  }
+
+  private armHungWatch() {
+    if (this.hungWatch) clearTimeout(this.hungWatch);
+    const armedAt = Date.now();
+    this.hungWatch = setTimeout(() => {
+      this.hungWatch = undefined;
+      if (this.closed || this.lastMsgAt >= armedAt) return; // answered -> healthy
+      tlog("hung-recycle", { conv: this.id, phase: this.phase });
+      this.recycleHungQuery();
+    }, HUNG_QUERY_MS);
+  }
+
+  // The query went silent after a send: tear down the hung query and start a fresh one resuming this
+  // session, re-injecting the pending turn. Rate-limited so a session that simply cannot resume can't
+  // spin in a recycle loop; after that it surfaces an error the user can act on.
+  private recycleHungQuery() {
+    const now = Date.now();
+    if (now - this.lastRecycleAt < 30_000) {
+      this.emit({ t: "error", message: "The session stopped responding and couldn't be revived automatically. Reload to retry." });
+      this.setPhase("idle");
+      return;
+    }
+    this.lastRecycleAt = now;
+    if (!this.resume && this.inited) this.resume = this.id;
+    const pending = this.currentTurnText;
+    this.runGen++;                 // supersede the hung run so its finally stays quiet
+    try { this.q?.close(); } catch { /* */ }
+    this.q = null;
+    this.running = false;
+    this.waiter = undefined;       // detach the orphaned inputGen's resolver
+    // The hung query usually swallowed the turn into its dead waiter, leaving the queue empty; only
+    // re-inject when nothing is queued, so a turn still sitting in the queue is never double-sent.
+    if (pending && this.queue.length === 0) {
+      this.queue.push({ type: "user", message: { role: "user", content: pending + "\n\n" + this.turnContext() }, parent_tool_use_id: null });
+    }
+    void this.run();
+    this.armHungWatch();           // the fresh query must answer too, or recycle again (now rate-limited)
   }
 
   // Change the model for THIS conversation. The SDK's live setModel writes to the query's control
@@ -814,6 +867,7 @@ export class Conversation {
     if (this.closed) return;
     this.closed = true;
     this.queue = [];
+    if (this.hungWatch) { clearTimeout(this.hungWatch); this.hungWatch = undefined; }
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); }
     for (const [, resolve] of this.pendingAsks) resolve("(the user did not answer)"); // unblock any pending ask
     this.pendingAsks.clear();
@@ -944,6 +998,9 @@ export class Conversation {
 
   private handle(m: SDKMessage) {
     const anyM = m as any;
+    // The query is alive: any message clears the hung-query watchdog until the next send arms it.
+    this.lastMsgAt = Date.now();
+    if (this.hungWatch) { clearTimeout(this.hungWatch); this.hungWatch = undefined; }
     if (anyM.session_id && anyM.session_id !== this.id) this.id = anyM.session_id;
     switch (m.type) {
       case "system":
