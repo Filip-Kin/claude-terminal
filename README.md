@@ -244,7 +244,9 @@ and owner-gates them):
   (~0.4s per short turn on a modern CPU; set `STT_MODEL=small.en` for more accuracy at ~3× latency).
 - `voice/tts` — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), voice `af_heart`
   (first-audio ~0.37s, ~5× faster than real time on CPU). [Piper](https://github.com/rhasspy/piper)
-  is a lighter alternative if you need one.
+  is a lighter alternative if you need one. The loaded model holds about 1 GB of RAM; on a small
+  box set `TTS_IDLE_UNLOAD_S=600` to load it on the first request and free it after 10 idle
+  minutes (the first sentence after an idle spell then waits for the reload, ~4-10s on 2 vCPUs).
 
 Set up and run each with `uv` (models download to `~/.cache/huggingface` on first start):
 
