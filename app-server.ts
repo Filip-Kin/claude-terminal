@@ -922,12 +922,21 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const f = Bun.file(target);
     if (!(await f.exists())) return jsonRes({ error: "not found" }, ctx, req, 404);
     const name = target.split("/").pop() || "download";
+    // Freshness: the path is stable, so when Claude overwrites a file at the same name (an edited
+    // chart/SVG) the browser would serve the cached copy and the change would never show. An ETag
+    // off mtime+size plus no-cache makes the browser revalidate every time: 304 when the bytes are
+    // unchanged (cheap), a fresh body the moment they change.
+    let etag = "";
+    try { const st = statSync(target); etag = `"${Math.round(st.mtimeMs).toString(36)}-${st.size.toString(36)}"`; } catch { /* */ }
+    if (etag && req.headers.get("if-none-match") === etag) {
+      return new Response(null, { status: 304, headers: { ...ctx.cors(req), ETag: etag, "Cache-Control": "no-cache" } });
+    }
     // Images are usually rendered inline in the chat rather than saved, and "attachment" makes
     // opening one in a new tab download it instead of showing it. Everything else stays an
     // attachment so a click on a file card is still a download.
     const inline = /^image\//.test(f.type || "");
     const safeName = name.replace(/[^A-Za-z0-9._-]/g, "_");
-    return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"` } });
+    return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"`, "Cache-Control": "no-cache", ...(etag ? { ETag: etag } : {}) } });
   }
 
   return new Response("Not Found", { status: 404, headers: ctx.cors(req) });
