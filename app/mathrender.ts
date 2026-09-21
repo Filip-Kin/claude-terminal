@@ -38,13 +38,21 @@ export function extractMath(md: string): { text: string; restore: (html: string)
     s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_m, tex) => tok(render(tex, true)));   // $$ ... $$
     s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_m, tex) => tok(render(tex, true)));   // \[ ... \]
     s = s.replace(/\\\(([\s\S]+?)\\\)/g, (_m, tex) => tok(render(tex, false)));  // \( ... \)
-    // $ ... $  — guarded: not \$, opener not followed by space/digit, closer not preceded by space.
-    s = s.replace(/(^|[^\\$])\$(?![\s\d$])([^\n$]*?[^\s\\])\$(?!\d)/g, (_m, pre, tex) => pre + tok(render(tex, false)));
+    // $ ... $  — guarded: not \$, opener not followed by a space, closer not preceded by a space or
+    // followed by a digit (so "$5 to $10" stays currency). A digit right after the opener usually
+    // means money too, so a digit-led span is math only when it looks like TeX: it carries a
+    // backslash command ("$2 \cdot 5 = 50$") or is a compact token with no internal spaces
+    // ("$2uv$", "$25/2$"). "$5 and you have $5" has a space and no backslash, so it stays literal.
+    s = s.replace(/(^|[^\\$])\$(?![\s$])([^\n$]*?[^\s\\])\$(?!\d)/g, (_m, pre, tex) =>
+      (/^\d/.test(tex) && /\s/.test(tex) && !tex.includes("\\")) ? _m : pre + tok(render(tex, false)));
     return s;
   }).join("");
 
   return {
     text: out,
-    restore: (html: string) => html.replace(/ MATH(\d+)MATH /g, (_m, i) => store[Number(i)] ?? ""),
+    // The placeholder is emitted with a space on each side, but marked strips leading/trailing
+    // whitespace at block boundaries (e.g. the start of a list item), which left a bare "MATH3MATH"
+    // in the output. Match the surrounding spaces optionally so a trimmed placeholder still restores.
+    restore: (html: string) => html.replace(/ ?MATH(\d+)MATH ?/g, (_m, i) => store[Number(i)] ?? ""),
   };
 }
