@@ -1177,6 +1177,37 @@ setInterval(() => {
   for (const c of [...sseClients]) { try { c.enqueue(enc.encode(": ping\n\n")); } catch { sseClients.delete(c); } }
 }, 25000);
 
+// #region stale tab reaper
+// Close terminal tabs nobody has touched in a week. Every tab keeps a Claude process alive, and on
+// 2026-09-14 eighteen of them held ~5 GB of RAM + swap on this 4 GB box and took it offline.
+// "Touched" is the later of session_activity (client input) and window_activity (pane output): an
+// idle Claude prompt prints nothing, while a working one keeps redrawing its spinner. Attached tabs
+// are left alone. Closing is the same kill-session as the tab bar's close button, so the transcript
+// stays on disk and the conversation can still be reopened from history.
+const TAB_MAX_IDLE_S = 7 * 24 * 3600;
+async function reapStaleTabs(maxIdleS = TAB_MAX_IDLE_S) {
+  let out = "";
+  try { out = await runTmux(["list-windows", "-a", "-F", "#{session_name}\t#{session_activity}\t#{window_activity}\t#{session_attached}"]); }
+  catch { return; }
+  const lastTouched = new Map<string, number>();
+  const attached = new Set<string>();
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue;
+    const [name, sAct, wAct, att] = line.split("\t");
+    lastTouched.set(name, Math.max(lastTouched.get(name) ?? 0, parseInt(sAct, 10) || 0, parseInt(wAct, 10) || 0));
+    if (att !== "0") attached.add(name);
+  }
+  const now = Math.floor(Date.now() / 1000);
+  for (const [name, t] of lastTouched) {
+    if (!t || attached.has(name) || now - t < maxIdleS) continue;
+    await runTmux(["kill-session", "-t", `=${name}`]); // '=' is an exact match; bare "1" would also hit "10"
+    console.log(`[tabs] closed ${name}: idle ${((now - t) / 86400).toFixed(1)} days`);
+  }
+}
+setTimeout(() => void reapStaleTabs(), 60_000);
+setInterval(() => void reapStaleTabs(), 60 * 60_000);
+// #endregion
+
 // Auto-resume /app turns that the shared subscription limit cut off: re-arm any persisted intents
 // (they survive a restart) and re-run each at its window reset. Non-fatal — a failure here must
 // never stop the server from serving.

@@ -21,7 +21,7 @@ import hljs from "highlight.js/lib/common";
 marked.setOptions({ gfm: true, breaks: true });
 
 // #region types
-export type ArtifactKind = "html" | "svg" | "react" | "js" | "mermaid";
+export type ArtifactKind = "html" | "svg" | "react" | "js" | "mermaid" | "markdown";
 
 export interface Artifact {
   id: string;          // stable-ish per message (index + content hash) so React keys/panels are stable
@@ -29,6 +29,11 @@ export interface Artifact {
   lang: string;        // the original fence info-string language token (lowercased)
   code: string;        // the raw fenced body
   title: string;       // detected title (html <title>/<h1>, component name) or a kind label
+  // Set only for "markdown" artifacts, which come from a .md file opened out of the chat rather
+  // than from a fence: the conversation whose download route serves the file, and the note's own
+  // directory so refs inside it resolve next to the note instead of in the chat's cwd.
+  convId?: string | null;
+  baseDir?: string | null;
 }
 
 export type Segment =
@@ -174,17 +179,28 @@ export function isLocalFileHref(href: string): boolean {
   return !/^(https?:|mailto:|tel:|#|data:|blob:|\/app\/api\/)/i.test(href);
 }
 
+// True when an href names a markdown file, which opens in the viewer instead of downloading.
+export function isMarkdownHref(href: string): boolean {
+  return /\.(md|markdown)(\?[^"]*)?$/i.test(href);
+}
+
 // Re-implemented locally (cannot import main.tsx). Same behaviour: local <img>/<a> point at the
 // download route; remote/data/blob refs are left alone. Keeps the parent markdown path as safe as today.
-function rewriteLocalRefs(html: string, convId: string | null): string {
-  const dl = (p: string) => downloadUrl(convId, p);
+// baseDir is set when rendering a .md file in the viewer: a relative ref inside a note means "next
+// to the note", not "in the chat's cwd".
+function rewriteLocalRefs(html: string, convId: string | null, baseDir?: string | null): string {
+  const abs = (p: string) => (baseDir && !/^[~/]/.test(p) ? baseDir.replace(/\/+$/, "") + "/" + p : p);
+  const dl = (p: string) => downloadUrl(convId, abs(p));
   return html
     .replace(/<img([^>]*?)\ssrc="([^"]+)"([^>]*)>/g, (m, pre, src, post) =>
       /^(https?:|data:|blob:|\/app\/api\/)/i.test(src) ? `<img${pre} src="${src}"${post} loading="lazy">` : `<img${pre} src="${dl(src)}"${post} loading="lazy">`)
     .replace(/<a([^>]*?)\shref="([^"]+)"([^>]*)>/g, (m, pre, href, post) => {
-      if (/^https?:/i.test(href)) return `<a${pre} href="${href}"${post} target="_blank" rel="noreferrer noopener">`; // external -> new tab, keep the chat open
-      if (/^(mailto:|tel:|#|\/app\/api\/)/i.test(href)) return m; // mail/anchor/download handled elsewhere
-      return `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`; // local file
+      if (/^(https?:|mailto:|#|\/app\/api\/)/i.test(href)) return m;
+      // A .md link opens in the in-app viewer (see Markdown's click handler). It keeps a real href
+      // so a long-press still offers "download", but no `download`/`target` attribute: on iOS both
+      // of those throw you out of the installed PWA into Files or Safari.
+      if (isMarkdownHref(href)) return `<a${pre} href="${dl(href)}" data-md="${abs(href).replace(/"/g, "&quot;")}"${post}>`;
+      return `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`;
     });
 }
 
@@ -363,6 +379,13 @@ window.addEventListener('error',function(ev){var b=document.getElementById('root
 <\/script></body></html>`;
 }
 
+// Standalone document for a viewed .md file. The in-app preview renders markdown with the app's
+// own styles; this is only what "open in a new tab" and a saved copy get.
+function mdDoc(code: string): string {
+  const body = marked.parse(code) as string;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${IFRAME_RESET}body{max-width:44rem;margin:0 auto;padding:24px 20px 60px;line-height:1.6}img{max-width:100%}pre{overflow-x:auto;background:#f6f6f4;padding:12px;border-radius:8px}code{font-family:ui-monospace,Menlo,Consolas,monospace}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 9px}</style></head><body>${body}</body></html>`;
+}
+
 async function buildArtifactDoc(a: Artifact): Promise<string> {
   switch (a.kind) {
     case "html": return htmlDoc(a.code);
@@ -370,10 +393,11 @@ async function buildArtifactDoc(a: Artifact): Promise<string> {
     case "js": return jsDoc(a.code);
     case "mermaid": return mermaidDoc(a.code);
     case "react": return reactDoc(a.code);
+    case "markdown": return mdDoc(a.code);
   }
 }
 
-const DOWNLOAD_EXT: Record<ArtifactKind, string> = { html: "html", svg: "svg", js: "js", mermaid: "mmd", react: "jsx" };
+const DOWNLOAD_EXT: Record<ArtifactKind, string> = { html: "html", svg: "svg", js: "js", mermaid: "mmd", react: "jsx", markdown: "md" };
 // #endregion
 
 // #region ArtifactCard
@@ -382,11 +406,12 @@ function KindIcon({ kind }: { kind: ArtifactKind }) {
   if (kind === "svg") return (<svg {...common}><path d="M3 3h18v18H3z" /><path d="M8 12l2.5 3L16 8" /></svg>);
   if (kind === "react") return (<svg {...common}><circle cx="12" cy="12" r="1.6" /><ellipse cx="12" cy="12" rx="10" ry="4" /><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(60 12 12)" /><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(120 12 12)" /></svg>);
   if (kind === "mermaid") return (<svg {...common}><rect x="3" y="4" width="7" height="5" rx="1" /><rect x="14" y="15" width="7" height="5" rx="1" /><path d="M6.5 9v3.5A2.5 2.5 0 0 0 9 15h5.5" /></svg>);
+  if (kind === "markdown") return (<svg {...common}><path d="M6 3h8l5 5v13H6z" /><path d="M14 3v5h5" /><path d="M9 13h6" /><path d="M9 17h4" /></svg>);
   // html / js
   return (<svg {...common}><path d="M8 3L3 12l5 9" /><path d="M16 3l5 9-5 9" /></svg>);
 }
 
-const KIND_LABEL: Record<ArtifactKind, string> = { html: "HTML", svg: "SVG", react: "React", js: "Script", mermaid: "Diagram" };
+const KIND_LABEL: Record<ArtifactKind, string> = { html: "HTML", svg: "SVG", react: "React", js: "Script", mermaid: "Diagram", markdown: "Markdown" };
 
 // Compact inline card. Tap "Open" (or the card) to launch the viewer.
 export function ArtifactCard({ artifact, onOpen }: { artifact: Artifact; onOpen: (a: Artifact) => void }) {
@@ -408,7 +433,7 @@ type Tab = "preview" | "source";
 
 // The live renderer. Works as an embedded right-hand panel (mode="panel", fills its container) or as
 // a full-screen sheet (mode="sheet"). main.tsx chooses which based on viewport width.
-export function ArtifactViewer({ artifact, mode, onClose }: { artifact: Artifact; mode: ArtifactViewerMode; onClose: () => void }) {
+export function ArtifactViewer({ artifact, mode, onClose, onOpen }: { artifact: Artifact; mode: ArtifactViewerMode; onClose: () => void; onOpen?: (a: Artifact) => void }) {
   const [tab, setTab] = useState<Tab>("preview");
   const [doc, setDoc] = useState<string>("");
   const [err, setErr] = useState<string | null>(null);
@@ -465,8 +490,12 @@ export function ArtifactViewer({ artifact, mode, onClose }: { artifact: Artifact
           </button>
         </div>
       </div>
-      <div className="ct-av-body">
-        {tab === "preview" ? (
+      <div className={"ct-av-body" + (artifact.kind === "markdown" && tab === "preview" ? " ct-av-mdbody" : "")}>
+        {tab === "preview" && artifact.kind === "markdown" ? (
+          // Rendered with the app's own markdown styles: dark theme, KaTeX, and .md links inside the
+          // note open the next note in this same viewer.
+          <div className="ct-av-md md-root"><Markdown text={artifact.code} convId={artifact.convId ?? null} baseDir={artifact.baseDir} onOpenArtifact={onOpen} /></div>
+        ) : tab === "preview" ? (
           err ? (
             <div className="ct-av-error"><b>Could not render this artifact</b><pre>{err}</pre></div>
           ) : building ? (
@@ -489,9 +518,34 @@ export function ArtifactViewer({ artifact, mode, onClose }: { artifact: Artifact
 // #endregion
 
 // #region AssistantContent (drop-in replacement for main.tsx's <Assistant>)
-function Markdown({ text, convId }: { text: string; convId: string | null }) {
-  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId); }, [text, convId]);
-  return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
+function Markdown({ text, convId, baseDir, onOpenArtifact }: { text: string; convId: string | null; baseDir?: string | null; onOpenArtifact?: (a: Artifact) => void }) {
+  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId, baseDir); }, [text, convId, baseDir]);
+  // Tapping a .md link fetches the file and opens it in the artifact viewer (split panel on a wide
+  // screen, full-screen sheet on a phone). Without this the link is a download, which on iOS leaves
+  // the PWA. fetch() ignores the route's Content-Disposition, so no server change is needed to read.
+  const onClick = useCallback((e: React.MouseEvent) => {
+    const a = (e.target as HTMLElement).closest?.("a[data-md]") as HTMLAnchorElement | null;
+    if (!a) return;
+    e.preventDefault(); // never navigate the PWA itself to the attachment response
+    // No viewer to open into (the spawned-work transcript renderer mounts this without one): a new
+    // tab is the old behaviour and keeps the chat where it is.
+    if (!onOpenArtifact) { window.open(a.href, "_blank", "noopener"); return; }
+    const path = a.getAttribute("data-md") || "";
+    const href = a.href;
+    fetch(href)
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((code) => onOpenArtifact({
+        id: `md-${shortHash(path)}`,
+        kind: "markdown",
+        lang: "markdown",
+        code,
+        title: path.split("/").pop() || "note.md",
+        convId,
+        baseDir: path.includes("/") ? path.replace(/\/[^/]*$/, "") : null,
+      }))
+      .catch(() => { window.open(href, "_blank", "noopener"); }); // unreadable path — fall back to the download
+  }, [onOpenArtifact, convId]);
+  return <div className="md" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 // Renders a whole assistant message: markdown runs, code cards, artifact cards, and an image
@@ -511,7 +565,7 @@ export function AssistantContent({ text, convId, onOpenArtifact }: { text: strin
   return (
     <div className="md-root" onClick={onImgClick}>
       {segs.map((s, i) => {
-        if (s.type === "markdown") return <Markdown key={i} text={s.text} convId={cid} />;
+        if (s.type === "markdown") return <Markdown key={i} text={s.text} convId={cid} onOpenArtifact={onOpenArtifact} />;
         if (s.type === "code") return <CodeBlock key={i} code={s.code} lang={s.lang} />;
         return <ArtifactCard key={s.artifact.id} artifact={s.artifact} onOpen={(a) => onOpenArtifact?.(a)} />;
       })}
@@ -576,6 +630,9 @@ function injectArtifactCss() {
   .ct-av-body{flex:1;min-height:0;position:relative;display:flex;background:#fff}
   .ct-av-frame{flex:1;width:100%;height:100%;border:none;background:#fff}
   .ct-av-source{flex:1;min-height:0;overflow:auto;background:var(--panel);padding:12px}
+  /* viewer — markdown file preview (app theme, not the white iframe) */
+  .ct-av-mdbody{background:var(--panel);display:block;overflow:auto;-webkit-overflow-scrolling:touch}
+  .ct-av-md{max-width:46rem;margin:0 auto;padding:16px 18px calc(40px + env(safe-area-inset-bottom,0px))}
   .ct-av-source .ct-code{margin:0}
   .ct-av-loading{flex:1;display:flex;align-items:center;justify-content:center;gap:9px;color:var(--text-3);font-size:13px;background:var(--panel)}
   .ct-av-spin{width:14px;height:14px;border-radius:50%;border:2px solid var(--line);border-top-color:var(--accent);animation:spin .8s linear infinite}

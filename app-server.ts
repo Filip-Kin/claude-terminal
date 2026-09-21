@@ -6,6 +6,7 @@
 // or null to let server.ts keep matching its own routes.
 
 import { join, resolve } from "path";
+import { homedir } from "os";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
@@ -913,7 +914,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // image previews in the chat log still resolve.
     if (!base && /^[A-Za-z0-9-]{6,}$/.test(id)) { const t = findTranscript(ctx, id); if (t) base = (await convMeta(t.path)).cwd || undefined; }
     base = base || ctx.defaultCwd;
-    const target = resolve(rel.startsWith("/") ? rel : join(base, rel)); // resolve() so a ".." in the path cannot walk out of a root
+    // "~/vault/note.md" is how Claude routinely writes a path; expand it before resolving, or it
+    // lands under the chat's cwd and 404s. The traversal guard below still applies.
+    const relPath = /^~(\/|$)/.test(rel) ? join(process.env.HOME || homedir(), rel.slice(1)) : rel;
+    const target = resolve(relPath.startsWith("/") ? relPath : join(base, relPath)); // resolve() so a ".." in the path cannot walk out of a root
     // Traversal guard. The chat's own cwd always counts; the configured roots cover the rest of the
     // owner's filesystem, so a file Claude wrote outside the directory the chat happens to sit in
     // still resolves. A guest container ships no roots, so it keeps the old cwd-only behaviour.

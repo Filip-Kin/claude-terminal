@@ -167,6 +167,11 @@ function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
 const pushSupported = (): boolean =>
   typeof navigator !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 const isIOSDevice = (): boolean => /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+// Installed to the home screen (iOS uses navigator.standalone, everyone else display-mode). That
+// window has no address bar, so controls the browser chrome would normally provide, reload above
+// all, have to be drawn by the app.
+const isStandalone = (): boolean =>
+  (typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || (navigator as any).standalone === true;
 
 // Backed by an explicit ArrayBuffer (not the default ArrayBufferLike), because applicationServerKey
 // requires a BufferSource over a real ArrayBuffer.
@@ -1263,6 +1268,7 @@ function App() {
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [updateAvail, setUpdateAvail] = useState(false);
+  const [installed] = useState(isStandalone); // home-screen launch: no browser reload button, so we draw one
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1735,7 +1741,7 @@ function App() {
   useEffect(() => {
     try {
       const sp = new URLSearchParams(location.search);
-      const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || (navigator as any).standalone === true;
+      const standalone = isStandalone();
       const navType = (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.type || "";
       const cold = sp.get("home") === "1" || (standalone && !document.referrer && navType !== "reload");
       if (cold && localStorage.getItem("ct-last-surface") === "/terminal") { location.replace("/terminal"); return; }
@@ -2684,6 +2690,16 @@ function App() {
               )}
             </div>
           )}
+          {installed && (
+            // location.reload() rather than hardRefresh(): a manual tap can happen offline, where
+            // wiping Cache Storage would leave a home-screen window with no shell and no address bar
+            // to recover from. A reload re-runs the service worker's stale-while-revalidate shell
+            // fetch, and a new build still arrives via the version poll's reload toast.
+            // reload() also reports navType "reload", which the cold-launch redirect above ignores.
+            <button className="refresh-btn" onClick={() => location.reload()} title="Refresh" aria-label="Refresh">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
+            </button>
+          )}
         </div>
         {loadingConv && <div className="load-bar" aria-label="Loading conversation" />}
 
@@ -2814,10 +2830,10 @@ function App() {
       </main>
       {artifact && (
         window.matchMedia("(max-width: 820px)").matches
-          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={() => setArtifact(null)} />
+          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={() => setArtifact(null)} onOpen={setArtifact} />
           : <div className="artifact-panel" style={{ flex: `0 0 ${artifactW}px` }}>
               <div className="artifact-resizer" onPointerDown={onArtifactResizeDown} onPointerMove={onArtifactResizeMove} onPointerUp={onArtifactResizeUp} onPointerCancel={onArtifactResizeUp} title="Drag to resize" aria-label="Resize artifact panel" />
-              <ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} />
+              <ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} onOpen={setArtifact} />
             </div>
       )}
       {msgMenu && (
