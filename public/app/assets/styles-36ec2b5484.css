@@ -158,6 +158,14 @@ a { color: var(--accent-2); }
   background: transparent; border: none; color: var(--text-2); border-radius: 9px;
 }
 .icon-btn:hover { background: var(--bg-3); color: var(--text); }
+/* Reload for home-screen installs. Same look as .icon-btn but always shown: .icon-btn is
+   display:none above 820px, and an installed iPad window is wider than that. */
+.refresh-btn {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px;
+  background: transparent; border: none; color: var(--text-2); border-radius: 9px;
+}
+.refresh-btn:hover { background: var(--bg-3); color: var(--text); }
+.refresh-btn:active { background: var(--bg-3); color: var(--text); }
 .topbar-title { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 500; color: var(--text-2); }
 .topbar-title .tt-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .rename-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: none; background: transparent; color: var(--text-3); border-radius: 7px; opacity: 0; transition: opacity .12s, color .12s, background .12s; }
