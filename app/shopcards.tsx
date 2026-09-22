@@ -82,7 +82,10 @@ function Card({ c }: { c: ShopCard }) {
           <div className="sc-noimg" aria-hidden="true" />
         )}
         <span className={"sc-src sc-src-" + c.source}>{c.source === "amazon" ? "Amazon" : "eBay"}</span>
-        {c.rejected && <span className="sc-x" aria-label="Ruled out">✗</span>}
+        {/* A status label, not a control. This started as a red ✗ in the
+            top-right corner, which is where a close button lives, so it read as
+            something to press and did nothing when pressed. */}
+        {c.rejected && <span className="sc-flag">Ruled out</span>}
       </div>
 
       <div className="sc-body">
