@@ -468,6 +468,16 @@ function limitNoticeText(resumeAt: number | null): string {
 // query emits an init/stream event within seconds; only a dead subprocess produces nothing at all.
 const HUNG_QUERY_MS = 60_000;
 
+// Built-in MCP servers every /app conversation gets. Injected here rather than through the editable
+// MCP panel, so the owner and guests always have them and can neither remove nor edit them. They must
+// be included on BOTH paths that set the server set (run() and applyMcpServers), because the SDK's
+// setMcpServers replaces the whole dynamic set (the same reason app-ui is re-included every time).
+const CT_PROJECTS = "/media/nas/filip/ncdata/filip/files/Projects";
+const BUILTIN_MCP: Record<string, McpServerConfig> = {
+  google: { type: "stdio", command: "/usr/local/bin/bun", args: ["run", `${CT_PROJECTS}/google-mcp/src/index.ts`], env: { GOOGLE_MCP_TOKENS: "/home/filip/.claude/google-access.json" } },
+  shop: { type: "stdio", command: "/usr/local/bin/bun", args: ["run", `${CT_PROJECTS}/shop-mcp/src/stdio.ts`], env: { SHOP_MCP_DATA_DIR: "/var/lib/shop-mcp" } },
+};
+
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
   cwd: string;
@@ -748,7 +758,7 @@ export class Conversation {
   // Returns which servers were added/removed and any connection errors (or null if not running).
   async applyMcpServers(stored: Record<string, McpServerConfig>) {
     if (!this.q?.setMcpServers) return null;
-    const payload = { ...stored, ...(this.askServer ? { "app-ui": this.askServer } : {}) };
+    const payload = { ...BUILTIN_MCP, ...stored, ...(this.askServer ? { "app-ui": this.askServer } : {}) };
     try { return await this.q.setMcpServers(payload); }
     catch (e: any) { this.emit({ t: "error", message: "setMcpServers: " + (e?.message || e) }); return null; }
   }
@@ -929,7 +939,7 @@ export class Conversation {
         autoCompactEnabled: true, // compact automatically before the context window fills (default, set explicit)
         enableFileCheckpointing: true, // back up files before edits so an edit-and-rerun can roll them back (Query.rewindFiles)
         systemPrompt: { type: "preset", preset: "claude_code", append: APP_UI_SYSTEM_APPEND }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
-        mcpServers: { ...stored, "app-ui": this.askServer }, // ask_user + any managed MCP servers
+        mcpServers: { ...BUILTIN_MCP, ...stored, "app-ui": this.askServer }, // built-ins + ask_user + any managed servers
       },
     });
     if (first === undefined && !this.inited) this.setPhase("starting"); // a resume: the subprocess is coming up before any turn is queued
