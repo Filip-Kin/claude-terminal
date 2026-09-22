@@ -1011,6 +1011,14 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
   // condition a stale block at the end of a dead turn ticked from its start time forever.
   const live = isLast && it.elapsed == null && busy;
   const [now, setNow] = useState(() => Date.now());
+  // Live: capped at 4 lines and scrolling. Done: a collapsed "Thought for Xs" row that opens.
+  const [open, setOpen] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    if (live) el.scrollTop = el.scrollHeight; // streaming: keep the newest line in view
+  }, [it.text, open, live]);
   useEffect(() => {
     if (!live) return; // only the live block ticks
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -1018,7 +1026,19 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
   }, [live]);
   if (!live) {
     // finished: only worth showing if the reasoning text is exposed (usually redacted on subscription auth)
-    return it.text ? (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>) : null;
+    if (!it.text) return null;
+    // Done: fold into a tool-style row, "Thought for 12s", that opens to the whole reasoning.
+    const secsDone = it.elapsed != null ? Math.max(1, Math.round(it.elapsed / 1000)) : null;
+    return (
+      <div className={"tool-group think-group" + (open ? " open" : "")}>
+        <button className="tool-group-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+          <svg className="chev" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+          <span className="tg-label">{secsDone != null ? `Thought for ${fmtDur(secsDone)}` : "Thought"}</span>
+          {it.tokens ? <span className="tg-tok">~{fmtTokens(it.tokens)} tokens</span> : null}
+        </button>
+        {open && <div className="tool-group-body think-full">{it.text}</div>}
+      </div>
+    );
   }
   const secs = it.elapsed != null ? Math.round(it.elapsed / 1000) : it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
   const meta = [secs == null ? "" : fmtDur(secs), it.tokens ? `~${it.tokens} tokens` : ""].filter(Boolean).join(" · ");
@@ -1027,7 +1047,7 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
       <span className="think-dots"><span></span><span></span><span></span></span>
       <span className="think-label">Thinking</span>
       {meta && <span className="think-tok">{meta}</span>}
-      {it.text && <div className="think-text">{it.text}</div>}
+      {it.text && <div ref={bodyRef} className="think-text think-body">{it.text}</div>}
     </div>
   );
 }

@@ -265,6 +265,8 @@ body.theme-light .md pre { background: #f3eee7; }
 .tool-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-top: 10px; }
 
 .thinking { color: var(--text-3); font-style: italic; font-size: 13.5px; margin: 0 0 12px; white-space: pre-wrap; }
+.think-group .think-full { padding: 4px 14px 12px; color: var(--text-3); font-style: italic; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; }
+.think-text.think-body { line-height: 1.5; max-height: calc(1.5em * 4); overflow-y: auto; overscroll-behavior: contain; }
 .think-label { font-style: normal; font-size: 12px; letter-spacing: 0; color: var(--text-3); font-weight: 600; margin-bottom: 3px; opacity: .9; }
 .think-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-style: normal; }
 .think-text { flex-basis: 100%; font-style: italic; font-size: 13px; margin-top: 4px; white-space: pre-wrap; color: var(--text-3); }
