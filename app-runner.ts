@@ -472,10 +472,22 @@ const HUNG_QUERY_MS = 60_000;
 // MCP panel, so the owner and guests always have them and can neither remove nor edit them. They must
 // be included on BOTH paths that set the server set (run() and applyMcpServers), because the SDK's
 // setMcpServers replaces the whole dynamic set (the same reason app-ui is re-included every time).
+// The same module runs on the host (as filip) and inside every guest container (a copy synced by
+// guest-claude/update-guests.sh), where the servers are read-only mounts under /opt and each guest's
+// state lives in /config. Resolve per environment so a guest sync never points at host paths.
+const IN_GUEST = existsSync("/opt/google-mcp/src/index.ts");
 const CT_PROJECTS = "/media/nas/filip/ncdata/filip/files/Projects";
 const BUILTIN_MCP: Record<string, McpServerConfig> = {
-  google: { type: "stdio", command: "/usr/local/bin/bun", args: ["run", `${CT_PROJECTS}/google-mcp/src/index.ts`], env: { GOOGLE_MCP_TOKENS: "/home/filip/.claude/google-access.json" } },
-  shop: { type: "stdio", command: "/usr/local/bin/bun", args: ["run", `${CT_PROJECTS}/shop-mcp/src/stdio.ts`], env: { SHOP_MCP_DATA_DIR: "/var/lib/shop-mcp" } },
+  google: {
+    type: "stdio", command: "/usr/local/bin/bun",
+    args: ["run", IN_GUEST ? "/opt/google-mcp/src/index.ts" : `${CT_PROJECTS}/google-mcp/src/index.ts`],
+    env: { GOOGLE_MCP_TOKENS: IN_GUEST ? "/config/google/access.json" : join(process.env.HOME || "/home/filip", ".claude", "google-access.json") },
+  },
+  shop: {
+    type: "stdio", command: "/usr/local/bin/bun",
+    args: ["run", IN_GUEST ? "/opt/shop-mcp/src/stdio.ts" : `${CT_PROJECTS}/shop-mcp/src/stdio.ts`],
+    env: { SHOP_MCP_DATA_DIR: IN_GUEST ? "/config/.shop-mcp" : "/var/lib/shop-mcp" },
+  },
 };
 
 export const BUILTIN_MCP_NAMES = Object.keys(BUILTIN_MCP);
