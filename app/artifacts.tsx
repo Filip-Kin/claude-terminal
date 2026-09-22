@@ -515,12 +515,113 @@ export function AssistantContent({ text, convId, onOpenArtifact }: { text: strin
         if (s.type === "code") return <CodeBlock key={i} code={s.code} lang={s.lang} />;
         return <ArtifactCard key={s.artifact.id} artifact={s.artifact} onOpen={(a) => onOpenArtifact?.(a)} />;
       })}
-      {light && (
-        <div className="ct-lightbox" onClick={() => setLight(null)} role="dialog" aria-modal>
-          <img src={light} alt="" />
-          <button className="ct-lightbox-x" onClick={() => setLight(null)} aria-label="Close">×</button>
-        </div>
-      )}
+      {light && <Lightbox src={light} onClose={() => setLight(null)} />}
+    </div>
+  );
+}
+
+// Full-screen image viewer with its own pinch-zoom + pan (never the page's), and Android-back-to-close.
+// touch-action:none stops the browser from turning a pinch on the image into a page zoom; the gesture
+// math drives a CSS transform on the image instead. On open it pushes a history entry so the phone's
+// back button (a popstate) closes the viewer rather than navigating the SPA away.
+function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const st = useRef({ s: 1, tx: 0, ty: 0 });
+  const pts = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<{ dist: number; s: number; mx: number; my: number } | null>(null);
+  const tap = useRef<{ x: number; y: number; img: boolean; moved: boolean } | null>(null);
+  const lastTap = useRef(0);
+  const [zoomed, setZoomed] = useState(false);
+
+  // Back button / history: closing via UI pops our pushed entry; a real back-press pops it for us.
+  const popped = useRef(false);
+  useEffect(() => {
+    history.pushState({ ctLightbox: true }, "");
+    const onPop = () => { popped.current = true; onClose(); };
+    window.addEventListener("popstate", onPop);
+    return () => { window.removeEventListener("popstate", onPop); if (!popped.current) history.back(); };
+  }, [onClose]);
+  // Escape to close on desktop.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const apply = () => { const el = imgRef.current; if (el) el.style.transform = `translate(${st.current.tx}px,${st.current.ty}px) scale(${st.current.s})`; };
+  const clampT = () => {
+    const r = wrapRef.current?.getBoundingClientRect(); if (!r) return;
+    const mx = (r.width * (st.current.s - 1)) / 2, my = (r.height * (st.current.s - 1)) / 2;
+    st.current.tx = Math.max(-mx, Math.min(mx, st.current.tx));
+    st.current.ty = Math.max(-my, Math.min(my, st.current.ty));
+  };
+  // Zoom to `s2` keeping the focal screen point (fx,fy) fixed. transform-origin is the element centre.
+  const zoomAt = (fx: number, fy: number, s2: number) => {
+    const r = wrapRef.current?.getBoundingClientRect(); if (!r) return;
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const s1 = st.current.s; s2 = Math.max(1, Math.min(6, s2));
+    st.current.tx = st.current.tx * (s2 / s1) + (fx - cx) * (1 - s2 / s1);
+    st.current.ty = st.current.ty * (s2 / s1) + (fy - cy) * (1 - s2 / s1);
+    st.current.s = s2;
+    if (s2 === 1) { st.current.tx = 0; st.current.ty = 0; }
+    clampT(); apply(); setZoomed(s2 > 1);
+  };
+
+  const onDown = (e: React.PointerEvent) => {
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    pts.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.current.size === 1) tap.current = { x: e.clientX, y: e.clientY, img: e.target === imgRef.current, moved: false };
+    if (pts.current.size === 2) pinch.current = null; // re-seed on the next move
+  };
+  const onMove = (e: React.PointerEvent) => {
+    const p = pts.current.get(e.pointerId); if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.current.size >= 2) {
+      const [a, b] = [...pts.current.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      if (!pinch.current) { pinch.current = { dist, s: st.current.s, mx, my }; return; }
+      st.current.tx += mx - pinch.current.mx; st.current.ty += my - pinch.current.my; // follow the fingers
+      pinch.current.mx = mx; pinch.current.my = my;
+      if (tap.current) tap.current.moved = true;
+      zoomAt(mx, my, pinch.current.s * (dist / pinch.current.dist));
+    } else if (st.current.s > 1) {
+      st.current.tx += dx; st.current.ty += dy; clampT(); apply();
+      if (tap.current && Math.hypot(e.clientX - tap.current.x, e.clientY - tap.current.y) > 8) tap.current.moved = true;
+    } else if (tap.current && Math.hypot(e.clientX - tap.current.x, e.clientY - tap.current.y) > 8) {
+      tap.current.moved = true;
+    }
+  };
+  const onUp = (e: React.PointerEvent) => {
+    pts.current.delete(e.pointerId);
+    if (pts.current.size < 2) pinch.current = null;
+    const t = tap.current;
+    if (t && !t.moved && pts.current.size === 0) {
+      const now = performance.now(), dbl = now - lastTap.current < 300;
+      lastTap.current = dbl ? 0 : now;
+      if (dbl && t.img) zoomAt(t.x, t.y, st.current.s > 1 ? 1 : 2.5);
+      else if (!t.img && st.current.s === 1) onClose();          // tap the backdrop -> close
+      else if (!t.img && st.current.s > 1) zoomAt(t.x, t.y, 1);  // backdrop while zoomed -> reset
+    }
+    tap.current = null;
+  };
+  const onWheel = (e: React.WheelEvent) => { e.preventDefault(); zoomAt(e.clientX, e.clientY, st.current.s * (e.deltaY < 0 ? 1.15 : 1 / 1.15)); };
+
+  return (
+    <div
+      ref={wrapRef}
+      className={"ct-lightbox" + (zoomed ? " zoomed" : "")}
+      role="dialog"
+      aria-modal
+      onPointerDown={onDown}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      onPointerCancel={onUp}
+      onWheel={onWheel}
+    >
+      <img ref={imgRef} src={src} alt="" draggable={false} />
+      <button className="ct-lightbox-x" onClick={onClose} aria-label="Close">×</button>
     </div>
   );
 }
@@ -583,8 +684,9 @@ function injectArtifactCss() {
   .ct-av-error b{display:block;margin-bottom:8px;color:var(--danger,#e0685f)}
   .ct-av-error pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;background:var(--bg-2);border:1px solid var(--line-2);border-radius:8px;padding:12px}
   /* image lightbox */
-  .ct-lightbox{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:24px;cursor:zoom-out}
-  .ct-lightbox img{max-width:100%;max-height:100%;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  .ct-lightbox{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:24px;cursor:zoom-out;touch-action:none;overscroll-behavior:contain;overflow:hidden}
+  .ct-lightbox.zoomed{cursor:grab}
+  .ct-lightbox img{max-width:100%;max-height:100%;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6);transform-origin:center center;will-change:transform;user-select:none;-webkit-user-select:none;-webkit-user-drag:none;touch-action:none}
   .ct-lightbox-x{position:fixed;top:14px;right:16px;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:26px;line-height:1}
   .ct-lightbox-x:hover{background:rgba(255,255,255,.22)}
   /* highlight.js — warm dark theme tuned to the app palette */
