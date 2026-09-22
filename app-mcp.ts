@@ -27,7 +27,7 @@ export type StoredMcpMap = Record<string, StoredMcpServer>;
 // Names must be simple so they compose cleanly into the mcp__<server>__<tool> tool ids.
 const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 // The in-process ask_user server name is reserved — a stored server may never shadow it.
-const RESERVED = new Set(["app-ui"]);
+const RESERVED = new Set(["app-ui", "google", "shop"]); // app-ui is in-process; google + shop are built-ins (app-runner BUILTIN_MCP)
 
 // #region persistence (single in-process cache, mirrors loadFavs/loadTitles in app-server.ts)
 let cache: StoredMcpMap | null = null;

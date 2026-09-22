@@ -149,10 +149,109 @@ function toolCountOf(s: McpStatus | undefined): number | null {
   return null;
 }
 
+// #region Google account (powers the `google` MCP server)
+// Lives in the MCP tab because that is what it is: the credential half of a tool
+// server. The tokens are held by google-broker (a host-side service at /_google/*,
+// see Projects/google-mcp), NOT by this app, so these are plain same-origin fetches
+// rather than /app/api calls.
+type GoogleAcct = { email: string; label?: string; primary: boolean; healthy: boolean; error: string | null };
+
+export function GoogleAccounts({ st, live }: { st?: McpStatus; live: boolean }) {
+  const [accounts, setAccounts] = useState<GoogleAcct[] | null>(null);
+  const [configured, setConfigured] = useState(true);
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await fetch("/_google/api/status", { credentials: "same-origin", cache: "no-store" });
+      if (!r.ok) { setAccounts([]); return; }
+      const d = await r.json();
+      setAccounts(d.accounts || []);
+      setConfigured(d.configured !== false);
+    } catch { setAccounts([]); }
+  }, []);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const mutate = async (action: "primary" | "disconnect", email: string) => {
+    setBusy(true); setErr("");
+    try {
+      const r = await fetch("/_google/api/" + action, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      if (!r.ok) setErr((await r.json().catch(() => ({}))).error || "That did not work.");
+      await refresh();
+    } finally { setBusy(false); }
+  };
+
+  const connect = () => {
+    const url = "/_google/start?popup=1" + (label.trim() ? "&label=" + encodeURIComponent(label.trim()) : "");
+    const w = window.open(url, "ct-google", "width=520,height=700");
+    if (!w) { setErr("Your browser blocked the popup. Allow popups for this site and try again."); return; }
+    setLabel("");
+    // The popup posts back on success; the closed-poll covers a blocked message and
+    // the case where the window is simply closed.
+    const onMsg = (e: MessageEvent) => {
+      if ((e.data as any)?.type === "google-connections-changed") { window.removeEventListener("message", onMsg); void refresh(); }
+    };
+    window.addEventListener("message", onMsg);
+    const iv = setInterval(() => {
+      if (w.closed) { clearInterval(iv); window.removeEventListener("message", onMsg); void refresh(); }
+    }, 800);
+  };
+
+  const n = accounts?.length ?? 0;
+  return (
+    <div className="ms-row">
+      <div className="ms-row-top">
+        <span className="ms-dot" style={{ background: n ? "#10B981" : "#8a8078" }} />
+        <span className="ms-name">google</span>
+        <span className="ms-badge">built-in</span>
+        <span className="ms-state">
+          {accounts === null ? "checking…" : n ? n + (n === 1 ? " account" : " accounts") : "no account"}
+          {" · "}{st?.status || (live ? "not connected" : "no chat open")}
+          {toolCountOf(st) !== null ? " · " + toolCountOf(st) + " tools" : ""}
+        </span>
+      </div>
+      <div className="ms-sub">Calendar, Gmail, Drive, Sheets, Docs, Tasks, Contacts</div>
+      {!configured && <div className="ms-rowerr">This server has no Google OAuth client configured yet, so connecting will fail.</div>}
+      {err && <div className="ms-rowerr">{err}</div>}
+      {(accounts || []).map((a) => (
+        <div className="ms-acct" key={a.email}>
+          <span className="ms-acct-who">
+            {a.email}
+            {a.label ? <span className="ms-badge">{a.label}</span> : null}
+            {a.primary ? <span className="ms-badge">default</span> : null}
+          </span>
+          <span className="ms-row-acts">
+            {!a.primary && <button className="ms-ic" disabled={busy} onClick={() => { void mutate("primary", a.email); }}>make default</button>}
+            <button className="ms-ic ms-danger" disabled={busy} onClick={() => { void mutate("disconnect", a.email); }}>disconnect</button>
+          </span>
+          {!a.healthy && <div className="ms-rowerr">{a.error || "Needs reconnecting."}</div>}
+        </div>
+      ))}
+      <div className="ms-acct-add">
+        <input
+          className="ms-acct-in" value={label} maxLength={24} placeholder="label, e.g. work or personal"
+          onChange={(e) => setLabel(e.target.value)} autoCapitalize="none" autoCorrect="off"
+        />
+        <button className="ms-acct-btn" onClick={connect}>{n ? "Connect another" : "Connect Google"}</button>
+      </div>
+    </div>
+  );
+}
+// #endregion
+
 export function McpSection({ activeId }: { activeId: string | null }) {
   const [servers, setServers] = useState<Record<string, McpEntry>>({});
   const [status, setStatus] = useState<Record<string, McpStatus>>({});
   const [live, setLive] = useState(false);
+  const [builtins, setBuiltins] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [dead, setDead] = useState("");
   const [err, setErr] = useState("");
@@ -174,6 +273,7 @@ export function McpSection({ activeId }: { activeId: string | null }) {
     try {
       const r = await getJson("/app/api/mcp" + (activeId ? "?id=" + encodeURIComponent(activeId) : ""));
       setServers((r.servers || {}) as Record<string, McpEntry>);
+      setBuiltins(Array.isArray(r.builtins) ? (r.builtins as string[]) : []);
       const map: Record<string, McpStatus> = {};
       for (const s of (r.status || []) as McpStatus[]) if (s && s.name) map[s.name] = s;
       setStatus(map);
@@ -322,10 +422,29 @@ export function McpSection({ activeId }: { activeId: string | null }) {
       {ok && <div className="ms-ok">{ok}</div>}
 
       <div className="ms-list">
+        {builtins.includes("google") && <GoogleAccounts st={status.google} live={live} />}
+        {builtins.filter((b) => b !== "google").map((b) => {
+          const st = status[b];
+          const tools = toolCountOf(st);
+          return (
+            <div className="ms-row" key={b}>
+              <div className="ms-row-top">
+                <span className="ms-dot" style={{ background: st ? MCP_DOT[st.status || ""] || "#8a8078" : "#8a8078" }} title={st?.status || "not connected in this chat"} />
+                <span className="ms-name">{b}</span>
+                <span className="ms-badge">built-in</span>
+                <span className="ms-state">
+                  {st?.status || (live ? "not connected" : "no chat open")}
+                  {tools !== null ? " · " + tools + (tools === 1 ? " tool" : " tools") : ""}
+                </span>
+              </div>
+              {st?.error && <div className="ms-rowerr">{st.error}</div>}
+            </div>
+          );
+        })}
         {loading && !names.length ? (
           <div className="ms-empty">Loading…</div>
         ) : !names.length ? (
-          <div className="ms-empty">No MCP servers yet. The built-in ask_user tool is always available.</div>
+          <div className="ms-empty">No added servers</div>
         ) : (
           names.map((n) => {
             const s = servers[n] || {};
@@ -629,6 +748,13 @@ export function injectManageCss() {
   .ms-ic:hover{color:var(--text,#ece7e1);background:var(--bg-3,#2a2420)}
   .ms-ic-x{font-size:17px;line-height:1}
   .ms-ic.ms-danger{color:#EF4444;font-weight:600}
+  .ms-acct{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding:8px 10px;border:1px solid var(--line,#3a322c);border-radius:9px}
+  .ms-acct-who{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:13px;word-break:break-all}
+  .ms-acct-add{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .ms-acct-in{flex:0 1 200px;min-width:0;padding:6px 9px;border-radius:8px;border:1px solid var(--line,#3a322c);background:var(--bg-2,#221d1a);color:var(--text,#ece7e1);font:inherit;font-size:12.5px}
+  .ms-acct-in::placeholder{color:var(--text-3,#8a8078)}
+  .ms-acct-btn{flex:0 0 auto;padding:6px 12px;border-radius:8px;border:1px solid var(--line,#3a322c);background:var(--bg-3,#2a2420);color:var(--text,#ece7e1);font-size:12.5px;font-weight:500;white-space:nowrap}
+  .ms-acct-btn:hover{border-color:var(--text-3,#8a8078)}
   .ms-sub{margin-top:8px;font-size:12px;line-height:1.5;color:var(--text-3,#8a8078);word-break:break-word}
   .ms-clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
   .ms-rowerr{margin-top:8px;font-size:12px;line-height:1.5;color:#EF4444;word-break:break-word}

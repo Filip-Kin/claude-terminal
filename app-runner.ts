@@ -478,6 +478,13 @@ const BUILTIN_MCP: Record<string, McpServerConfig> = {
   shop: { type: "stdio", command: "/usr/local/bin/bun", args: ["run", `${CT_PROJECTS}/shop-mcp/src/stdio.ts`], env: { SHOP_MCP_DATA_DIR: "/var/lib/shop-mcp" } },
 };
 
+export const BUILTIN_MCP_NAMES = Object.keys(BUILTIN_MCP);
+
+// Persists each conversation's chosen model (app-server owns the file). The transcript only records
+// the concrete model every turn ran on, so without this a reopened chat could only show that.
+let modelChoiceHook: ((id: string, model: string) => void) | null = null;
+export function onModelChoice(fn: (id: string, model: string) => void) { modelChoiceHook = fn; }
+
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
   cwd: string;
@@ -733,6 +740,7 @@ export class Conversation {
     this.model = model;
     this.pendingModel = model;
     this.emit({ t: "model", model }); // every device watching this chat shows the switch right away
+    if (!this.id.startsWith("new-")) modelChoiceHook?.(this.id, model); // a new chat persists at init
     if (!this.busy) await this.applyPendingModel();
   }
   // Push a queued model change to the live query. Only safe when the query is up and idle. On the
@@ -1023,8 +1031,15 @@ export class Conversation {
         if (anyM.subtype === "init") {
           this.inited = true;
           this.bgTasks.clear(); // the level is per-process: a (re)start resets it; the CLI re-sends a snapshot
-          this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
-          if (anyM.model) { this.model = anyM.model; this.emit({ t: "model", model: anyM.model }); }
+          // The model the user CHOSE (an alias like "default" or "opus[1m]", or a pinned id) is what drives
+          // the query and what the selector shows. anyM.model is only what that choice resolved to
+          // today. Overwriting the choice with it pinned every chat to the concrete model of the moment,
+          // so when "default" moved from Opus 4.8 to 5.5 old chats stayed on 4.8 and the selector
+          // showed 4.8. A resume that passed no model runs the CLI default, i.e. "default".
+          const chosen = this.model || "default";
+          this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: chosen, cwd: anyM.cwd });
+          this.emit({ t: "model", model: chosen });
+          if (this.model && anyM.session_id) modelChoiceHook?.(anyM.session_id, this.model);
           if (this.phase === "starting") this.setPhase("waiting");
           // An MCP server that failed to connect is the classic silent pre-model stall. Say so.
           for (const m of (anyM.mcp_servers as { name: string; status: string }[] | undefined) || []) if (m.status && m.status !== "connected") this.emit({ t: "notice", kind: "info", text: `MCP server "${m.name}" ${m.status}.` });

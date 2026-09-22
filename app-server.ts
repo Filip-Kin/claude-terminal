@@ -5,12 +5,12 @@
 // to this sidecar, and /_ct/app* strips to the same). Returns a Response for an app route,
 // or null to let server.ts keep matching its own routes.
 
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -68,6 +68,32 @@ function dedupSeen(cid: unknown): { id: string } | null {
   return hit ? { id: hit.id } : null;
 }
 function dedupRecord(cid: unknown, id: string) { if (typeof cid === "string" && cid) seenSends.set(cid, { at: Date.now(), id }); }
+// #endregion
+
+// #region chosen model per conversation — what the selector shows and what a resume runs on.
+// The transcript only records the concrete model each turn ran on ("claude-opus-4-8"), never the
+// alias the user picked ("default"), so a reopened chat used to show and re-pin the concrete one.
+let modelChoices: Record<string, string> | null = null;
+let modelChoicesFile = "";
+async function loadModelChoices(file: string): Promise<Record<string, string>> {
+  if (modelChoices && modelChoicesFile === file) return modelChoices;
+  modelChoicesFile = file;
+  try { const o = JSON.parse(await Bun.file(file).text()); modelChoices = o && typeof o === "object" ? o : {}; }
+  catch { modelChoices = {}; }
+  return modelChoices!;
+}
+function ensureModelChoices(ctx: AppCtx) {
+  if (modelChoicesFile) return;
+  const file = join(dirname(ctx.mcpFile), "claude-app-models.json"); // beside the other claude-app-* state
+  modelChoicesFile = file;
+  onModelChoice((id, model) => {
+    void loadModelChoices(file).then((m) => {
+      if (m[id] === model) return;
+      m[id] = model;
+      return Bun.write(file, JSON.stringify(m));
+    }).catch(() => {});
+  });
+}
 // #endregion
 
 // #region favorites (starred conversations) — server-side, shared across the owner's devices
@@ -336,6 +362,7 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".map": "application/json", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".png": "image/png", ".woff2": "font/woff2" };
 
 export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promise<Response | null> {
+  ensureModelChoices(ctx);
   // normalize: allow both /app* (router, no strip) and a stray /_ct/app* (prefix strip)
   if (path.startsWith("/_ct/app")) path = path.slice(4);
   if (path !== "/app" && !path.startsWith("/app/")) return null;
@@ -393,7 +420,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const id = new URL(req.url).searchParams.get("id") || "";
     const live = id ? get(id) : undefined;
     const status = live ? await live.mcpStatus() : [];
-    return jsonRes({ servers, status, live: !!live }, ctx, req);
+    return jsonRes({ servers, builtins: BUILTIN_MCP_NAMES, status, live: !!live }, ctx, req);
   }
   // Add or update a server: { name, config, applyTo? }. Takes effect on the next new chat; pass
   // applyTo=<id> to also push it live into that running conversation via setMcpServers.
@@ -750,6 +777,13 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const events = await replayTranscript(found.path);
     const meta = await convMeta(found.path);
     const live = get(id);
+    const chosen = (await loadModelChoices(modelChoicesFile))[id];
+    if (chosen && !live) {
+      // Swap the trailing concrete-model event for the user's choice (same index, so delta cursors hold).
+      let i = events.length - 1;
+      while (i >= 0 && events[i].t !== "model") i--;
+      if (i >= 0) events[i] = { t: "model", model: chosen } as AppEvent; else events.push({ t: "model", model: chosen } as AppEvent);
+    }
     // Delta fetch: `?since=N` returns only the events after the caller's cursor. The transcript is
     // append-only, so events[0..N] are stable and folding the tail onto the caller's already-reduced
     // items gives the same result as reducing the whole thing (it is a plain fold). Reopening a long
@@ -771,7 +805,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       events: delta ? events.slice(since) : events,
       delta, evTotal: events.length,
       live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [],
-      epoch: live?.epoch ?? null, seq: live?.seq ?? -1, phase: live?.phase ?? "idle", model: live?.model ?? null,
+      epoch: live?.epoch ?? null, seq: live?.seq ?? -1, phase: live?.phase ?? "idle", model: live?.model ?? chosen ?? null,
     }, ctx, req);
   }
 
