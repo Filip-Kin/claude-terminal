@@ -11,6 +11,7 @@ import { AskCard } from "./askcard";
 import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
+import { extractShopCards, ShopGallery } from "./shopcards";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { ConnectionsModal } from "./connections";
 
@@ -804,6 +805,28 @@ function estToolTokens(it: Extract<Item, { kind: "tool" }>): number {
   return Math.round(n / 4);
 }
 
+/**
+ * Render a shop tool's result as a gallery, or null if it has no cards.
+ *
+ * The tool card is still reachable underneath: a gallery shows the listings,
+ * and anyone wanting the raw text can open the collapsed original.
+ */
+function shopGalleries(it: Extract<Item, { kind: "tool" }>) {
+  if (it.result === undefined || it.isError) return null;
+  if (!/^mcp__shop__|^shop__/.test(it.name)) return null;
+  let raw = "";
+  try { raw = contentToText(it.result) || ""; } catch { return null; }
+  if (!raw.includes("```shop-cards")) return null;
+  const { payloads } = extractShopCards(raw);
+  if (!payloads.length) return null;
+  return (
+    <>
+      {payloads.map((p, k) => <ShopGallery key={k} payload={p} />)}
+      <ToolCard it={it} />
+    </>
+  );
+}
+
 function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
   const [open, setOpen] = useState(false);
   const summary = useMemo(() => {
@@ -1161,7 +1184,15 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   }
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} busy={!!busy} />;
-  if (it.kind === "tool") return isAgentTool(it.name, it.input) ? <div data-agent-id={it.id}><AgentToolCard it={it} /></div> : <ToolCard it={it} />;
+  if (it.kind === "tool") {
+    if (isAgentTool(it.name, it.input)) return <div data-agent-id={it.id}><AgentToolCard it={it} /></div>;
+    // A shopping result draws as a browsable gallery rather than a collapsed
+    // accordion of JSON. Falls through to the ordinary card when the result has
+    // no cards in it (an error, or a tool that returns prose only).
+    const gal = shopGalleries(it);
+    if (gal) return gal;
+    return <ToolCard it={it} />;
+  }
   if (it.kind === "notice") {
     if (it.noticeKind === "skill") {
       return (

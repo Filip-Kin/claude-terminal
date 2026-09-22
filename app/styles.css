@@ -509,3 +509,110 @@ body.theme-light .md pre { background: #f3eee7; }
 /* KaTeX math: let a wide display equation scroll instead of overflowing the bubble; flag render errors. */
 .md .katex-display{overflow-x:auto;overflow-y:hidden;padding:2px 0;max-width:100%}
 .md .math-err{color:var(--danger,#f87171);font-family:ui-monospace,monospace;font-size:.9em}
+
+/* ---------------------------------------------------------------------------
+   Shopping result gallery (app/shopcards.tsx).
+
+   A horizontal strip of product cards, drawn in place of the collapsed tool
+   accordion when the shop MCP returns listings. Uses the theme variables only,
+   so it inherits light and dark without a second set of colours.
+
+   Horizontal scroll is the point on a phone: the strip scrolls, the page does
+   not, and the cards keep a fixed width so they never squeeze. `min-width: 0`
+   on the flex parents is what stops a long product title from pushing the whole
+   document wider than the viewport.
+   --------------------------------------------------------------------------- */
+.sc-wrap { margin: 10px 0 14px; min-width: 0; }
+
+.sc-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 0 2px 6px; min-width: 0;
+}
+.sc-h-title {
+  font-size: 13px; font-weight: 600; color: var(--text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sc-h-count { font-size: 12px; color: var(--text-3); margin-left: auto; flex: none; }
+
+.sc-strip-wrap { position: relative; min-width: 0; }
+
+.sc-strip {
+  display: flex; gap: 10px; overflow-x: auto; overflow-y: hidden;
+  scroll-snap-type: x proximity; padding: 2px 2px 8px;
+  scrollbar-width: thin; -webkit-overflow-scrolling: touch;
+}
+.sc-strip::-webkit-scrollbar { height: 6px; }
+.sc-strip::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+.sc-card {
+  flex: 0 0 210px; width: 210px; scroll-snap-align: start;
+  display: flex; flex-direction: column;
+  background: var(--bg-2); border: 1px solid var(--line-2);
+  border-radius: var(--radius); overflow: hidden;
+}
+/* Ruled out: still readable, visibly not a candidate. */
+.sc-card.sc-out { opacity: 0.55; }
+.sc-card.sc-out .sc-thumb img { filter: grayscale(1); }
+
+.sc-thumb {
+  position: relative; height: 130px; background: #fff;
+  display: flex; align-items: center; justify-content: center; flex: none;
+}
+.sc-thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.sc-noimg { width: 100%; height: 100%; background: var(--bg-3); }
+
+.sc-src {
+  position: absolute; top: 6px; left: 6px;
+  font-size: 10px; font-weight: 600; letter-spacing: .02em;
+  padding: 2px 6px; border-radius: 6px; color: #fff; background: rgba(0,0,0,.62);
+}
+.sc-x {
+  position: absolute; top: 6px; right: 6px;
+  font-size: 12px; line-height: 1; padding: 3px 6px; border-radius: 6px;
+  color: #fff; background: var(--danger);
+}
+
+.sc-body { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 5px; flex: 1 1 auto; min-width: 0; }
+
+.sc-title {
+  margin: 0; font-size: 12px; font-weight: 600; line-height: 1.35; color: var(--text);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.sc-price { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.sc-price strong { font-size: 15px; color: var(--text); }
+.sc-price s { font-size: 11px; color: var(--text-3); }
+.sc-total { font-size: 11px; color: var(--accent); }
+
+.sc-meta { display: flex; gap: 6px; flex-wrap: wrap; font-size: 11px; color: var(--text-3); }
+.sc-ad { color: var(--text-3); font-style: italic; }
+.sc-ship { font-size: 11px; color: var(--text-2); }
+.sc-seller {
+  font-size: 11px; color: var(--text-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* The verdict. Given its own weight because it is the reason to look at this
+   rather than the raw search output. */
+.sc-note {
+  margin: 2px 0 0; font-size: 11.5px; line-height: 1.4; color: var(--text-2);
+  border-left: 2px solid var(--accent); padding-left: 7px;
+}
+
+.sc-go {
+  display: block; text-align: center; text-decoration: none;
+  margin: 0 10px 10px; padding: 7px 10px; border-radius: 9px;
+  font-size: 12px; font-weight: 600;
+  background: var(--accent); color: #fff;
+}
+.sc-go:hover { background: var(--accent-2); }
+
+.sc-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+  width: 30px; height: 30px; border-radius: 50%; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  font-size: 17px; line-height: 1; display: flex; align-items: center; justify-content: center;
+}
+.sc-left { left: -6px; }
+.sc-right { right: -6px; }
+/* Touch scrolls; the arrows would only cover a card. */
+@media (hover: none) { .sc-arrow { display: none; } }
