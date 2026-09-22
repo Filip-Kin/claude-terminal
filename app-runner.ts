@@ -935,7 +935,10 @@ export class Conversation {
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
-        thinking: { type: "adaptive" }, // let Claude think; we render it streaming
+        // Opus 5.5 returns the short notes it writes between tool calls as progress-update thinking
+        // blocks, empty at the default display:"omitted" — so the chat would go quiet between tools.
+        // display:"summarized" asks for that text back; we already render thinking deltas streaming.
+        thinking: { type: "adaptive", display: "summarized" }, // let Claude think; we render it streaming
         autoCompactEnabled: true, // compact automatically before the context window fills (default, set explicit)
         enableFileCheckpointing: true, // back up files before edits so an edit-and-rerun can roll them back (Query.rewindFiles)
         systemPrompt: { type: "preset", preset: "claude_code", append: APP_UI_SYSTEM_APPEND }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
