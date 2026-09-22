@@ -409,7 +409,12 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     try { const dyn = await getSupportedModels(); if (dyn.length) models = dyn; } catch { /* keep config quick-picks */ }
     const quick = new Set(models.map((m) => m.id.replace(/\[[^\]]*\]$/, "")));
     const moreModels = ctx.moreModels.filter((m) => !quick.has(m.id.replace(/\[[^\]]*\]$/, "")));
-    return jsonRes({ models, moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
+    // The default model a NEW chat starts on, on a device that has not picked one: the user's CLI
+    // default from ~/.claude/settings.json, so one setting drives the terminal and the app. The
+    // probe's "Default" entry is the account default, which for guests is Sonnet.
+    let defaultModel: string | undefined;
+    try { const st = JSON.parse(await Bun.file(join(ctx.claudeDir, "settings.json")).text()); if (typeof st?.model === "string" && st.model) defaultModel = st.model; } catch { /* no settings */ }
+    return jsonRes({ models, moreModels, defaultModel, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
   }
 
   // --- MCP server management (the tools the LLM can call in /app chats) ---

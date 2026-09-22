@@ -1547,7 +1547,7 @@ function App() {
     // or flaky link shows your chats immediately instead of an empty sidebar until the network answers.
     // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
     void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id); }).catch(() => {});
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); { const def = d.defaultModel || d.models?.[0]?.id; if (!localStorage.getItem("ct-app-model") && def) setDefaultModel(def); } }).catch(() => {});
     refreshConvs();
     refreshFavs();
     syncReads();
