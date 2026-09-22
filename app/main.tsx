@@ -11,6 +11,7 @@ import { AskCard } from "./askcard";
 import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
+import { toolDisplay } from "./toollabels";
 import { extractShopCards, ShopGallery } from "./shopcards";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { ConnectionsModal } from "./connections";
@@ -831,6 +832,8 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
   const [open, setOpen] = useState(false);
   const summary = useMemo(() => {
     const inp: any = it.input || {};
+    const pretty = toolDisplay(it.name, inp);
+    if (pretty) return pretty.summary;
     if (it.name === "Bash") return inp.command || "";
     if (inp.file_path) return inp.file_path;
     if (inp.path) return inp.path;
@@ -842,7 +845,7 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
     <div className="tool">
       <button className={"tool-head" + (open ? " open" : "")} onClick={() => setOpen((o) => !o)}>
         <svg className="chev" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-        <span className="tname">{it.name}</span>
+        {(() => { const d = toolDisplay(it.name, it.input); return <span className={"tname" + (d ? " tname-pretty" : "")}>{d?.label ?? it.name}</span>; })()}
         <span className={"tsum" + (it.isError ? " terr" : "")}>{summary}</span>
         {est > 0 && <span className="tool-tok" title="Estimated tokens (call + result)">~{fmtTokens(est)} tokens</span>}
         {it.result === undefined && <span className="typing"><span></span><span></span><span></span></span>}

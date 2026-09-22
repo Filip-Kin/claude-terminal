@@ -258,6 +258,7 @@ body.theme-light .md pre { background: #f3eee7; }
 .tool-head .tname { font-family: var(--mono); font-weight: 600; color: var(--text); }
 .tool-head .tsum { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .tool-head .terr { color: var(--danger); }
+.tname.tname-pretty { font-family: inherit; font-weight: 600; }
 .tool-head .chev { transition: transform .15s; color: var(--text-3); }
 .tool-head.open .chev { transform: rotate(90deg); }
 .tool-body { padding: 0 12px 12px; }
