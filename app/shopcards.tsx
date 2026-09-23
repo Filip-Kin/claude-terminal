@@ -33,6 +33,8 @@ export interface ShopCard {
   seller?: string;
   sponsored?: boolean;
   note?: string;
+  deal?: string;
+  dealKind?: "low" | "high" | "mid" | "thin";
   rejected?: boolean;
 }
 
@@ -103,6 +105,10 @@ function Card({ c }: { c: ShopCard }) {
           {c.sponsored && <span className="sc-ad">Sponsored</span>}
         </div>
 
+        {/* Price verdict, kept visually separate from the note: "is this a good
+            price" and "is this the right product" are different questions and
+            the answer to one should not hide inside the other. */}
+        {c.deal && <div className={"sc-deal sc-deal-" + (c.dealKind ?? "mid")}>{c.deal}</div>}
         {c.shipping && <div className="sc-ship">{c.shipping}</div>}
         {c.seller && <div className="sc-seller">{c.seller}</div>}
         {c.note && <p className="sc-note">{c.note}</p>}

@@ -621,3 +621,18 @@ body.theme-light .md pre { background: #f3eee7; }
 .sc-right { right: -6px; }
 /* Touch scrolls; the arrows would only cover a card. */
 @media (hover: none) { .sc-arrow { display: none; } }
+
+/* Price verdict badge on a shop card. Colour carries the same meaning as the
+   words so the strip is scannable without reading every card: green near the
+   floor, red near the peak, neutral otherwise. */
+.sc-deal {
+  font-size: 11px; font-weight: 600; line-height: 1.35;
+  padding: 3px 7px; border-radius: 7px; align-self: flex-start;
+  max-width: 100%;
+}
+.sc-deal-low  { background: rgba(58, 160, 90, .17); color: #4caf78; }
+.sc-deal-high { background: rgba(224, 104, 95, .15); color: var(--danger); }
+.sc-deal-mid  { background: var(--bg-3); color: var(--text-2); }
+.sc-deal-thin { background: var(--bg-3); color: var(--text-3); font-weight: 500; font-style: italic; }
+body.theme-light .sc-deal-low  { background: rgba(38, 130, 70, .14); color: #237a4a; }
+body.theme-light .sc-deal-high { background: rgba(192, 57, 43, .12); color: var(--danger); }
