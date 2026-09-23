@@ -39,6 +39,7 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
   );
 
   const num = (v: any) => (typeof v === "number" && isFinite(v) ? Math.max(0, Math.trunc(v)) : 0);
+  const MAX_MODEL_MONTH_OUTPUT = 1e11; // sanity ceiling for one model's output in one month
 
   for (const p of peers) {
     if (!p?.url) continue;
@@ -79,6 +80,13 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
           // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
           for (const mm of Array.isArray(u.models) ? u.models : []) {
             if (!mm?.mk || !mm?.model) continue;
+            // A peer's number is still input from another box. One export carried a model named
+            // "unmetered" with 9.96e22 output tokens, which made that peer's weighted total absurd on
+            // the leaderboard. No real model does 100 billion output tokens in a month: drop and log.
+            if (typeof mm.output === "number" && mm.output > MAX_MODEL_MONTH_OUTPUT) {
+              console.error(`external peer ${peerName}: dropped ${user} ${mm.mk} ${mm.model} output=${mm.output} (implausible)`);
+              continue;
+            }
             insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output));
           }
         }
