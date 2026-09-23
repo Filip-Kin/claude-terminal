@@ -40,6 +40,8 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
 
   const num = (v: any) => (typeof v === "number" && isFinite(v) ? Math.max(0, Math.trunc(v)) : 0);
   const MAX_MODEL_MONTH_OUTPUT = 1e11; // sanity ceiling for one model's output in one month
+  const MAX_HOUR_OUTPUT = 1e9;   // ...and for one hour: output, and total incl. cache reads
+  const MAX_HOUR_TOTAL = 1e11;
 
   for (const p of peers) {
     if (!p?.url) continue;
@@ -75,6 +77,12 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
           insMeta.run(peerName, user, num(m.sessions), models, m.last_activity || null, fetchedAt);
           for (const h of Array.isArray(u.hourly) ? u.hourly : []) {
             if (!h?.hour_utc) continue;
+            // Same sanity ceiling as the per-model rows: the "unmetered" 9.96e22 also landed in one
+            // hour's totals and spiked the hourly chart. No real hour is a billion output tokens.
+            if ((typeof h.output === "number" && h.output > MAX_HOUR_OUTPUT) || (typeof h.total === "number" && h.total > MAX_HOUR_TOTAL)) {
+              console.error(`external peer ${peerName}: dropped ${user} ${h.hour_utc} output=${h.output} total=${h.total} (implausible)`);
+              continue;
+            }
             insHours.run(peerName, user, String(h.hour_utc), num(h.total), num(h.output));
           }
           // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
