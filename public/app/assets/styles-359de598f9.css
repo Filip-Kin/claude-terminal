@@ -258,6 +258,7 @@ body.theme-light .md pre { background: #f3eee7; }
 .tool-head .tname { font-family: var(--mono); font-weight: 600; color: var(--text); }
 .tool-head .tsum { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .tool-head .terr { color: var(--danger); }
+.tname.tname-pretty { font-family: inherit; font-weight: 600; }
 .tool-head .chev { transition: transform .15s; color: var(--text-3); }
 .tool-head.open .chev { transform: rotate(90deg); }
 .tool-body { padding: 0 12px 12px; }
@@ -265,6 +266,9 @@ body.theme-light .md pre { background: #f3eee7; }
 .tool-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-top: 10px; }
 
 .thinking { color: var(--text-3); font-style: italic; font-size: 13.5px; margin: 0 0 12px; white-space: pre-wrap; }
+.think-group .think-preview { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-style: italic; font-size: 12.5px; }
+.think-group.live .think-dots { flex: 0 0 auto; }
+.think-group.live.open .think-full { max-height: 40vh; overflow-y: auto; }
 .think-group .think-full { padding: 4px 14px 12px; color: var(--text-3); font-style: italic; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; }
 .think-text.think-body { line-height: 1.5; max-height: calc(1.5em * 4); overflow-y: auto; overscroll-behavior: contain; }
 .think-label { font-style: normal; font-size: 12px; letter-spacing: 0; color: var(--text-3); font-weight: 600; margin-bottom: 3px; opacity: .9; }
@@ -566,10 +570,14 @@ body.theme-light .md pre { background: #f3eee7; }
   font-size: 10px; font-weight: 600; letter-spacing: .02em;
   padding: 2px 6px; border-radius: 6px; color: #fff; background: rgba(0,0,0,.62);
 }
-.sc-x {
-  position: absolute; top: 6px; right: 6px;
-  font-size: 12px; line-height: 1; padding: 3px 6px; border-radius: 6px;
-  color: #fff; background: var(--danger);
+/* Ruled-out marker. Sits along the BOTTOM of the thumbnail, not the top-right
+   corner: a red glyph in the corner is where a close button goes, so it invited
+   a click that does nothing. A full-width label reads as state. */
+.sc-flag {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 3px 8px; font-size: 10px; font-weight: 600; letter-spacing: .03em;
+  text-transform: uppercase; text-align: center;
+  color: #fff; background: rgba(0,0,0,.66); cursor: default;
 }
 
 .sc-body { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 5px; flex: 1 1 auto; min-width: 0; }
@@ -616,3 +624,18 @@ body.theme-light .md pre { background: #f3eee7; }
 .sc-right { right: -6px; }
 /* Touch scrolls; the arrows would only cover a card. */
 @media (hover: none) { .sc-arrow { display: none; } }
+
+/* Price verdict badge on a shop card. Colour carries the same meaning as the
+   words so the strip is scannable without reading every card: green near the
+   floor, red near the peak, neutral otherwise. */
+.sc-deal {
+  font-size: 11px; font-weight: 600; line-height: 1.35;
+  padding: 3px 7px; border-radius: 7px; align-self: flex-start;
+  max-width: 100%;
+}
+.sc-deal-low  { background: rgba(58, 160, 90, .17); color: #4caf78; }
+.sc-deal-high { background: rgba(224, 104, 95, .15); color: var(--danger); }
+.sc-deal-mid  { background: var(--bg-3); color: var(--text-2); }
+.sc-deal-thin { background: var(--bg-3); color: var(--text-3); font-weight: 500; font-style: italic; }
+body.theme-light .sc-deal-low  { background: rgba(38, 130, 70, .14); color: #237a4a; }
+body.theme-light .sc-deal-high { background: rgba(192, 57, 43, .12); color: var(--danger); }

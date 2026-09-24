@@ -1037,13 +1037,13 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
   // condition a stale block at the end of a dead turn ticked from its start time forever.
   const live = isLast && it.elapsed == null && busy;
   const [now, setNow] = useState(() => Date.now());
-  // Live: capped at 4 lines and scrolling. Done: a collapsed "Thought for Xs" row that opens.
+  // One row in both states (see the live branch); open shows the full text.
   const [open, setOpen] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
-    if (live) el.scrollTop = el.scrollHeight; // streaming: keep the newest line in view
+    if (live) el.scrollTop = el.scrollHeight; // open while streaming: keep the newest line in view
   }, [it.text, open, live]);
   useEffect(() => {
     if (!live) return; // only the live block ticks
@@ -1067,13 +1067,21 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
     );
   }
   const secs = it.elapsed != null ? Math.round(it.elapsed / 1000) : it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
-  const meta = [secs == null ? "" : fmtDur(secs), it.tokens ? `~${it.tokens} tokens` : ""].filter(Boolean).join(" · ");
+  // Live uses the SAME single-height row as the finished state: Opus 5.5 writes a short thinking
+  // block before almost every tool call, and a live box that grew then collapsed into the row each
+  // second made the thread flash. Only the label and a one-line preview of the latest thought change.
+  const lines = (it.text || "").trim().split("\n").filter((l) => l.trim());
+  const preview = lines.length ? lines[lines.length - 1].trim() : "";
   return (
-    <div className="thinking-live">
-      <span className="think-dots"><span></span><span></span><span></span></span>
-      <span className="think-label">Thinking</span>
-      {meta && <span className="think-tok">{meta}</span>}
-      {it.text && <div ref={bodyRef} className="think-text think-body">{it.text}</div>}
+    <div className={"tool-group think-group live" + (open ? " open" : "")}>
+      <button className="tool-group-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+        <svg className="chev" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+        <span className="think-dots"><span></span><span></span><span></span></span>
+        <span className="tg-label">{secs != null ? `Thinking ${fmtDur(secs)}` : "Thinking"}</span>
+        {preview && <span className="think-preview">{preview}</span>}
+        {it.tokens ? <span className="tg-tok">~{fmtTokens(it.tokens)} tokens</span> : null}
+      </button>
+      {open && it.text && <div ref={bodyRef} className="tool-group-body think-full">{it.text}</div>}
     </div>
   );
 }
