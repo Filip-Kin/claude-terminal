@@ -1040,6 +1040,18 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
   // Live: capped at 4 lines and scrolling. Done: a collapsed "Thought for Xs" row that opens.
   const [open, setOpen] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
+  // Summarized thinking does not stream: a block sits empty, then all its text lands in one burst
+  // just before the block ends. Showing that text at once meant a four-line box that appeared and
+  // collapsed into the "Thought for Xs" row a moment later, before almost every tool call, so the
+  // thread flashed. Only reveal live text that has been there 600 ms; a short block goes straight
+  // to its row, a long one still shows its capped text while it runs.
+  const [showLiveText, setShowLiveText] = useState(false);
+  const hasText = !!it.text;
+  useEffect(() => {
+    if (!live || !hasText || showLiveText) return;
+    const t = setTimeout(() => setShowLiveText(true), 600);
+    return () => clearTimeout(t);
+  }, [live, hasText, showLiveText]);
   useLayoutEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
@@ -1073,7 +1085,7 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
       <span className="think-dots"><span></span><span></span><span></span></span>
       <span className="think-label">Thinking</span>
       {meta && <span className="think-tok">{meta}</span>}
-      {it.text && <div ref={bodyRef} className="think-text think-body">{it.text}</div>}
+      {it.text && showLiveText && <div ref={bodyRef} className="think-text think-body">{it.text}</div>}
     </div>
   );
 }
