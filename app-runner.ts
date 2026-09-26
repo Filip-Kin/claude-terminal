@@ -679,7 +679,17 @@ export class Conversation {
   }
 
   send(text: string, cid?: string) {
-    if (this.closed) return;
+    // A closed conversation can still be in the map: the reaper skips one that has a watcher, and a
+    // client tab reconnects to it. Dropping the turn here meant messages were "accepted" and then
+    // silently never ran (a chat closed overnight would not start in the morning). Reopen instead:
+    // supersede the old run, resume this session, and let the normal path below run the turn.
+    if (this.closed) {
+      this.closed = false;
+      this.runGen++;
+      this.running = false;
+      if (!this.resume && this.inited) this.resume = this.id;
+      tlog("reopen", { conv: this.id });
+    }
     this.lastActivity = Date.now();
     this.currentTurnText = text; // remember it so a subscription-limit rejection can re-run this turn
     // The user is actively driving this conversation, so any auto-resume we had queued for it is
