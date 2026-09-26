@@ -585,7 +585,7 @@ export class Conversation {
     // the earlier turns from the transcript, and _seq dedupe covers mid-turn reconnects.
     const from = fromNow ? this.log.length : this.runStart;
     for (let i = from; i < this.log.length; i++) fn(this.log[i]);
-    return () => this.subs.delete(fn);
+    return () => { this.subs.delete(fn); this.lastWatchedAt = Date.now(); };
   }
 
   // Resume after a dropped SSE socket: replay everything newer than the last event the client
@@ -596,7 +596,7 @@ export class Conversation {
   subscribeSince(fn: Sub, sinceSeq: number, evict?: () => void): () => void {
     this.addSub(fn, evict);
     for (const e of this.log) { const s = (e as any)._seq; if (typeof s === "number" && s > sinceSeq) fn(e); }
-    return () => this.subs.delete(fn);
+    return () => { this.subs.delete(fn); this.lastWatchedAt = Date.now(); };
   }
 
   // Register a subscriber and, if this conversation now has more than SUBS_CAP, evict the OLDEST.
@@ -604,6 +604,7 @@ export class Conversation {
   // reconnections a proxy never told us had closed; dropping the oldest reclaims them without
   // touching anyone actually watching (their stream reconnects and resumes from its cursor anyway).
   private addSub(fn: Sub, evict?: () => void) {
+    this.lastWatchedAt = Date.now();
     this.subs.set(fn, { at: Date.now(), evict });
     if (this.subs.size <= SUBS_CAP) return;
     const oldest = [...this.subs.entries()].sort((a, b) => a[1].at - b[1].at);
@@ -652,6 +653,10 @@ export class Conversation {
   statusEvent(): AppEvent { return { t: "status", phase: this.phase, since: this.phaseSince, ...(this.phaseDetail ? { detail: this.phaseDetail } : {}) }; }
 
   hasSubscribers(): boolean { return this.subs.size > 0; }
+  // A client's stream expires every few minutes and reconnects a few seconds later, so "no
+  // subscriber right now" is not "nobody is watching". Last time a stream attached or detached:
+  lastWatchedAt = Date.now();
+  watchedWithin(ms: number): boolean { return this.hasSubscribers() || Date.now() - this.lastWatchedAt < ms; }
   // Monotonic "has anything happened" counter. The status coalescer polls it to decide whether a
   // conversation actually advanced since the last push, so a long-running turn that is quiet does not
   // spend a push (and a radio wake) every cycle just for being busy.
@@ -1358,7 +1363,10 @@ setInterval(() => {
     // would throw away a real turn just because the phone dropped its stream.
     const s = c.statusInfo();
     if (s.busy || s.waiting) continue;
-    if (!c.hasSubscribers() && now - c.lastActivity > 30 * 60_000) c.close();
+    // watchedWithin, not hasSubscribers: the sweep once landed in the ~3 s gap between a tab's
+    // stream expiring and reconnecting, closed a chat that was open on screen, and the next
+    // morning's messages were dropped (3b4a0dc1, 2026-09-25 17:26).
+    if (!c.watchedWithin(10 * 60_000) && now - c.lastActivity > 30 * 60_000) c.close();
   }
 }, 5 * 60_000);
 // #endregion
