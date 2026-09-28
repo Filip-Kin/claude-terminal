@@ -15,6 +15,7 @@ const LABELS: Record<string, string> = {
   "shop:ebay_item": "eBay listing",
   "shop:amazon_cart_link": "Amazon cart link",
   "shop:present_results": "Shopping results",
+  "shop:price_check": "Price check",
   // app-ui
   "app-ui:ask_user": "Question",
   // google
