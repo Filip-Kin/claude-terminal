@@ -112,12 +112,17 @@ a { color: var(--accent-2); }
    the whole row height, so the dot centred against the row instead of the title line and read
    as vertically off inside the button. */
 .conv-status { flex: 0 0 15px; width: 15px; height: 15px; align-self: center; display: inline-flex; align-items: center; justify-content: center; line-height: 0; }
+/* margin:0 matters: the status classes reuse names from the chat (".thinking" is also the thought-text
+   block, margin 0 0 12px), and that bottom margin lifted the dot 6px above the title. */
+.conv-item .conv-status { margin: 0; font-style: normal; }
 .conv-status::after { content: ""; width: 8px; height: 8px; border-radius: 50%; }
 .conv-status.thinking::after { background: var(--accent); animation: ctdot 1.4s ease-in-out infinite; }
 /* Driven from a terminal tab, not the app: the terminal's violet (#7C3AED). */
 .conv-status.thinking.terminal::after, .conv-status.terminal::after { background: #7C3AED; }
 @keyframes ctdot { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
-.conv-status.waiting::after { background: var(--warning, #F59E0B); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning, #F59E0B) 25%, transparent); }
+/* Waiting on the user (an unanswered question): purple with a halo, so it reads apart from the plain
+   violet of a terminal-driven chat and from the pulsing thinking dot. */
+.conv-status.waiting::after, .conv-status.waiting.terminal::after { background: #A855F7; box-shadow: 0 0 0 3px color-mix(in srgb, #A855F7 30%, transparent); animation: none; }
 .conv-status.unread::after { background: var(--accent); }
 .conv-status.queued::after { background: transparent; width: 9px; height: 9px; border: 2px solid var(--warning, #F59E0B); }
 .conv-title.unread { font-weight: 600; color: var(--text); }

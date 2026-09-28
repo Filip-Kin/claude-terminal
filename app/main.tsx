@@ -2498,8 +2498,10 @@ function App() {
   const convStatus = (c: Conv): "queued" | "thinking" | "waiting" | "unread" | null => {
     if (c.pending || queuedIds.has(c.sessionId)) return "queued";
     const st = statuses[c.sessionId];
-    if (st?.busy) return "thinking";
+    // Waiting first: a pending ask_user question keeps the turn "busy" (the tool is still open), so
+    // checking busy first showed the thinking dot and never said the chat was waiting on the user.
     if (st?.waiting) return "waiting";
+    if (st?.busy) return "thinking";
     void readTick; // re-read lastRead when it bumps
     const lr = lastReadRef.current[c.sessionId];
     if (c.sessionId !== activeId && lr != null && c.mtime > lr) return "unread";
