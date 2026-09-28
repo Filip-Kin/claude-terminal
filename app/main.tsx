@@ -2261,9 +2261,13 @@ function App() {
     // a normal send only reaches the runner's input queue, which is not drained until the turn ends.
     // That reads as double grey ticks and no reply, forever. Typing an answer is the obvious thing
     // to do when the last thing on screen is a question, so route the text to the card instead.
+    // Only when the draft was started AFTER the question appeared, though: text the user was already
+    // typing when a question popped up is the mid-turn message they meant, not an answer. That goes
+    // out as a normal (queued) message and the card stays open for them to answer.
     const askStore = activeStoreRef.current;
     const openAsk = attachments.length ? undefined : (askStore?.items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined);
-    if (askStore && openAsk) {
+    const typedForAsk = !!openAsk && draftStartRef.current >= (askSeenRef.current[openAsk.askId] ?? 0);
+    if (askStore && openAsk && typedForAsk) {
       askStore.answerAsk(openAsk.askId, raw);
       void deliverAsk(askStore, openAsk.askId, raw);
       return;
@@ -2407,6 +2411,12 @@ function App() {
   // The first unanswered ask — surfaced on top of voice mode (a tappable card can't be used
   // hands-free, but at least it's visible and answerable instead of hidden behind the overlay).
   const pendingAsk = useMemo(() => items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined, [items]);
+  // When each question first appeared, and when the current draft was started (first character after
+  // an empty composer, from typing, paste or dictation). send() compares the two: see the ask routing.
+  const askSeenRef = useRef<Record<string, number>>({});
+  useEffect(() => { if (pendingAsk && askSeenRef.current[pendingAsk.askId] == null) askSeenRef.current[pendingAsk.askId] = Date.now(); }, [pendingAsk]);
+  const draftStartRef = useRef(0);
+  useEffect(() => { if (!input.trim()) draftStartRef.current = 0; else if (!draftStartRef.current) draftStartRef.current = Date.now(); }, [input]);
 
   const onPickModel = async (m: string) => {
     setMenuOpen(false); setOtherOpen(false);
