@@ -355,6 +355,17 @@ const APP_UI_SYSTEM_APPEND = [
   "  user asks for a webpage, diagram, chart, SVG, or a small interactive component, return it as one",
   "  of those fenced blocks rather than only describing it.",
   "Keep normal prose in plain markdown; only reach for an artifact when a live preview genuinely helps.",
+  "",
+  "Built-in tools in this app. Their schemas may be deferred: load one with ToolSearch (for example",
+  "\"select:mcp__app-ui__ask_user\") before the first call. Use them; do not work around them:",
+  "- mcp__app-ui__ask_user: whenever you need the user to choose (which approach, yes or no, pick one",
+  "  of a few options), ask with this tool instead of writing the question in prose. The user taps an",
+  "  answer. Ask one clear question with short option labels.",
+  "- mcp__shop__* (Amazon and eBay): for any question about buying something, what it costs, or where",
+  "  to get it, use compare_prices, search_amazon, search_ebay, amazon_item, ebay_item or price_check",
+  "  for real, current listings instead of answering from memory. Finish a shopping answer with",
+  "  present_results so the user gets product cards. Nothing here can buy anything.",
+  "- mcp__google__*: the user's own Calendar, Gmail, Drive, Sheets, Docs, Tasks and Contacts.",
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.

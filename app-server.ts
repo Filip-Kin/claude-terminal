@@ -973,7 +973,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // Images are usually rendered inline in the chat rather than saved, and "attachment" makes
     // opening one in a new tab download it instead of showing it. Everything else stays an
     // attachment so a click on a file card is still a download.
-    const inline = /^image\//.test(f.type || "");
+    // A file card's preview opens the file in a new tab, so PDFs and plain text render inline too.
+    // HTML never does: served inline it would run script on this origin with the owner's session.
+    const t = f.type || "";
+    const inline = /^image\//.test(t) || t === "application/pdf" || t === "application/json" || (/^text\//.test(t) && !/html/.test(t));
     const safeName = name.replace(/[^A-Za-z0-9._-]/g, "_");
     return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"`, "Cache-Control": "no-cache", ...(etag ? { ETag: etag } : {}) } });
   }

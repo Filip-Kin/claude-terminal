@@ -9,7 +9,7 @@ import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
-import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
+import { AssistantContent, ArtifactViewer, FileCard, Lightbox, downloadUrl, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
 import { toolDisplay } from "./toollabels";
 import { extractShopCards, ShopGallery } from "./shopcards";
@@ -1013,7 +1013,7 @@ function PhaseLine({ phase, since, detail }: { phase: Phase; since: number; deta
   const secs = since ? Math.max(0, Math.round((now - since) / 1000)) : 0;
   const label = phase === "starting" ? "Starting the session"
     : phase === "waiting" ? "Waiting for the model"
-    : phase === "tool" ? `Running ${detail || "a tool"}`
+    : phase === "tool" ? `Running ${detail ? (toolDisplay(detail, {})?.label ?? detail) : "a tool"}`
     : phase === "retrying" ? `API error, retrying${detail ? ` (${detail})` : ""}`
     : phase === "limited" ? "Rate limited, waiting for the window to reset"
     : phase === "compacting" ? "Compacting"
@@ -1133,6 +1133,23 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
   );
 }
 
+// Images and files the user attached: a photo opens in the full-screen viewer, a file is a download
+// card. Its own component so the viewer's open state lives here, not in the memoized message block.
+function UserAttachments({ images, files, convId }: { images: string[]; files: string[]; convId: string | null }) {
+  const [light, setLight] = useState<string | null>(null);
+  if (!images.length && !files.length) return null;
+  return (
+    <>
+      {images.map((p, k) => {
+        const src = downloadUrl(convId, p);
+        return <img key={k} className="msg-img msg-img-zoom" loading="lazy" src={src} alt="attachment" onClick={(e) => { e.stopPropagation(); setLight(src); }} />;
+      })}
+      {files.map((p, k) => <FileCard key={k} href={downloadUrl(convId, p)} name={p.split("/").pop() || p} />)}
+      {light && <Lightbox src={light} onClose={() => setLight(null)} />}
+    </>
+  );
+}
+
 function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy }: { items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
   // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
@@ -1176,8 +1193,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
     return (
       <div className="msg">
         <div className="bubble-user" {...menuBind(body || it.text, "user")}>
-          {images.map((p, k) => <img key={k} className="msg-img" loading="lazy" src={`/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`} alt="attachment" />)}
-          {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
+          <UserAttachments images={images} files={files} convId={convId} />
           {body && <div className="bubble-user-text">{body}</div>}
         </div>
         {raPill}

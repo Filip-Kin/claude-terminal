@@ -205,22 +205,47 @@ function fmtBytes(n?: number): string | null {
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
 }
 
-// A download card for a local file Claude saved. href is the ALREADY-rewritten download URL (or use
-// downloadUrl()); name/size are display-only.
-export function FileCard({ href, name, size }: { href: string; name: string; size?: number }) {
+// A file card: a thumbnail (images) or type icon, the name and type, and a Download button. The
+// body previews: images open in the full-screen viewer (onPreview), anything else opens in a new tab
+// (the download route serves PDFs, text and images inline). href is the download URL (downloadUrl()).
+const IMG_EXT = /^(png|jpe?g|gif|webp|svg|avif|bmp)$/;
+export function FileCard({ href, name, size, onPreview }: { href: string; name: string; size?: number; onPreview?: (src: string) => void }) {
   const ext = extOf(name);
+  const isImg = IMG_EXT.test(ext);
   const icon = EXT_ICON[ext] || "📎";
   const sz = fmtBytes(size);
   return (
-    <a className="ct-file-card" href={href} target="_blank" rel="noreferrer" download title={`Download ${name}`}>
-      <span className="ct-file-ic" aria-hidden>{icon}</span>
-      <span className="ct-file-meta">
-        <span className="ct-file-name">{name}</span>
-        <span className="ct-file-sub">{ext ? ext.toUpperCase() : "FILE"}{sz ? ` · ${sz}` : ""}</span>
-      </span>
-      <svg className="ct-file-dl" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>
-    </a>
+    <div className="ct-file-card">
+      <a
+        className="ct-file-open" href={href} target="_blank" rel="noreferrer" title={name}
+        onClick={isImg && onPreview ? (e) => { e.preventDefault(); e.stopPropagation(); onPreview(href); } : undefined}
+      >
+        {isImg ? <img className="ct-file-thumb" src={href} alt="" loading="lazy" /> : <span className="ct-file-ic" aria-hidden>{icon}</span>}
+        <span className="ct-file-meta">
+          <span className="ct-file-name">{name}</span>
+          <span className="ct-file-sub">{ext ? ext.toUpperCase() : "FILE"}{sz ? ` · ${sz}` : ""}</span>
+        </span>
+      </a>
+      <a className="ct-file-btn" href={href} download={name} title={`Download ${name}`}>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>
+        Download
+      </a>
+    </div>
   );
+}
+
+// Local files a reply links to ([name](path), not ![image](path) embeds and not web links), deduped
+// in order. Each gets a FileCard under the message; the inline link stays in the prose.
+const MD_LINK = /(^|[^!])\[([^\]\n]+)\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)/g;
+function localFileLinks(md: string): string[] {
+  const out: string[] = [];
+  for (const m of md.matchAll(MD_LINK)) {
+    const href = m[3];
+    if (/^(https?:|mailto:|tel:|#|data:|blob:|\/app\/api\/|\/\/)/i.test(href)) continue;
+    if (!/\.[A-Za-z0-9]{1,6}$/.test(href)) continue; // a file has an extension; skips bare dirs and anchors
+    if (!out.includes(href)) out.push(href);
+  }
+  return out;
 }
 // #endregion
 
@@ -501,6 +526,7 @@ export function AssistantContent({ text, convId, onOpenArtifact }: { text: strin
   const segs = useMemo(() => parseAssistant(text), [text]);
   const cid = convId ?? null;
   const [light, setLight] = useState<string | null>(null);
+  const files = useMemo(() => localFileLinks(segs.filter((x) => x.type === "markdown").map((x: any) => x.text).join("\n")), [segs]);
 
   // Tap an inline image to open a lightbox (images already resolve via rewriteLocalRefs).
   const onImgClick = useCallback((e: React.MouseEvent) => {
@@ -515,6 +541,11 @@ export function AssistantContent({ text, convId, onOpenArtifact }: { text: strin
         if (s.type === "code") return <CodeBlock key={i} code={s.code} lang={s.lang} />;
         return <ArtifactCard key={s.artifact.id} artifact={s.artifact} onOpen={(a) => onOpenArtifact?.(a)} />;
       })}
+      {files.length > 0 && (
+        <div className="ct-file-row">
+          {files.map((f) => <FileCard key={f} href={downloadUrl(cid, f)} name={f.split("/").pop() || f} onPreview={setLight} />)}
+        </div>
+      )}
       {light && <Lightbox src={light} onClose={() => setLight(null)} />}
     </div>
   );
@@ -524,7 +555,7 @@ export function AssistantContent({ text, convId, onOpenArtifact }: { text: strin
 // touch-action:none stops the browser from turning a pinch on the image into a page zoom; the gesture
 // math drives a CSS transform on the image instead. On open it pushes a history entry so the phone's
 // back button (a popstate) closes the viewer rather than navigating the SPA away.
-function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+export function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const st = useRef({ s: 1, tx: 0, ty: 0 });
@@ -614,10 +645,19 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
       className={"ct-lightbox" + (zoomed ? " zoomed" : "")}
       role="dialog"
       aria-modal
-      onPointerDown={onDown}
-      onPointerMove={onMove}
-      onPointerUp={onUp}
-      onPointerCancel={onUp}
+      onPointerDown={(e) => { e.stopPropagation(); onDown(e); }}
+      onPointerMove={(e) => { e.stopPropagation(); onMove(e); }}
+      onPointerUp={(e) => { e.stopPropagation(); onUp(e); }}
+      onPointerCancel={(e) => { e.stopPropagation(); onUp(e); }}
+      // The viewer can sit inside a message bubble (a user's photo); keep taps, long-presses and the
+      // context menu from reaching the bubble's own handlers underneath it.
+      onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.stopPropagation()}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchMove={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onMouseUp={(e) => e.stopPropagation()}
       onWheel={onWheel}
     >
       <img ref={imgRef} src={src} alt="" draggable={false} />
@@ -642,14 +682,17 @@ function injectArtifactCss() {
   .ct-code pre{margin:0;padding:12px 14px;overflow-x:auto;background:#120f0c}
   .ct-code pre code{font-family:var(--mono);font-size:12.5px;line-height:1.55;background:none;padding:0}
   /* file card */
-  .ct-file-card{display:inline-flex;align-items:center;gap:11px;max-width:100%;margin:4px 0;padding:9px 13px;background:var(--bg-2);border:1px solid var(--line);border-radius:11px;color:var(--text);text-decoration:none;transition:border-color .12s,background .12s}
-  .ct-file-card:hover{border-color:var(--accent);background:var(--bg-3)}
-  .ct-file-ic{font-size:20px;line-height:1;flex:0 0 auto}
-  .ct-file-meta{display:flex;flex-direction:column;min-width:0;gap:1px}
+  .ct-file-row{display:flex;flex-direction:column;gap:8px;margin:6px 0 12px}
+  .ct-file-card{display:flex;align-items:center;gap:10px;max-width:520px;padding:8px 8px 8px 10px;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;transition:border-color .12s}
+  .ct-file-card:hover{border-color:color-mix(in srgb,var(--accent) 55%,var(--line))}
+  .ct-file-open{display:flex;align-items:center;gap:11px;flex:1 1 auto;min-width:0;color:var(--text);text-decoration:none;cursor:pointer}
+  .ct-file-thumb{width:44px;height:44px;object-fit:cover;border-radius:8px;flex:0 0 auto;background:var(--bg-3)}
+  .ct-file-ic{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:8px;background:var(--bg-3);font-size:21px;line-height:1;flex:0 0 auto}
+  .ct-file-meta{display:flex;flex-direction:column;min-width:0;gap:2px}
   .ct-file-name{font-size:13.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .ct-file-sub{font-size:11px;color:var(--text-3);letter-spacing:.03em}
-  .ct-file-dl{flex:0 0 auto;color:var(--text-3)}
-  .ct-file-card:hover .ct-file-dl{color:var(--accent)}
+  .ct-file-btn{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;padding:7px 12px;border-radius:9px;background:var(--accent);color:#fff;font-size:12.5px;font-weight:600;text-decoration:none;transition:filter .12s}
+  .ct-file-btn:hover{filter:brightness(1.08)}
   /* artifact card */
   .ct-art-card{display:flex;align-items:center;gap:12px;width:100%;text-align:left;margin:2px 0 12px;padding:12px 14px;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;color:var(--text);transition:border-color .12s,background .12s}
   .ct-art-card:hover{border-color:var(--accent);background:var(--bg-3)}

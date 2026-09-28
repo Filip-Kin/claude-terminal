@@ -636,3 +636,5 @@ body.theme-light .md pre { background: #f3eee7; }
 .sc-deal-thin { background: var(--bg-3); color: var(--text-3); font-weight: 500; font-style: italic; }
 body.theme-light .sc-deal-low  { background: rgba(38, 130, 70, .14); color: #237a4a; }
 body.theme-light .sc-deal-high { background: rgba(192, 57, 43, .12); color: var(--danger); }
+.msg-img-zoom { cursor: zoom-in; }
+.bubble-user .ct-file-card { margin: 4px 0; }
