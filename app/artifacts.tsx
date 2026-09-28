@@ -165,8 +165,12 @@ export function parseAssistant(text: string): Segment[] {
 
 // #region local-ref rewriting + file helpers
 // Download URL for a local path Claude wrote, via the /app proxy route (mirrors main.tsx).
-export function downloadUrl(convId: string | null | undefined, path: string): string {
-  return `/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(path)}`;
+// `v` makes the URL unique per message. Chrome keeps every image a page has shown in an in-memory cache
+// keyed by URL and reuses it without asking the server (Cache-Control/ETag never get a say), so a
+// second message showing a file Claude overwrote at the same path displayed the old picture. The
+// message's position in the thread is stable while it streams and differs from message to message.
+export function downloadUrl(convId: string | null | undefined, path: string, v?: string | number): string {
+  return `/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(path)}${v != null && v !== "" ? `&v=${encodeURIComponent(String(v))}` : ""}`;
 }
 
 // True when an href points at a local file Claude produced (not a remote/anchor/data URL).
@@ -176,8 +180,8 @@ export function isLocalFileHref(href: string): boolean {
 
 // Re-implemented locally (cannot import main.tsx). Same behaviour: local <img>/<a> point at the
 // download route; remote/data/blob refs are left alone. Keeps the parent markdown path as safe as today.
-function rewriteLocalRefs(html: string, convId: string | null): string {
-  const dl = (p: string) => downloadUrl(convId, p);
+function rewriteLocalRefs(html: string, convId: string | null, v?: string | number): string {
+  const dl = (p: string) => downloadUrl(convId, p, v);
   return html
     .replace(/<img([^>]*?)\ssrc="([^"]+)"([^>]*)>/g, (m, pre, src, post) =>
       /^(https?:|data:|blob:|\/app\/api\/)/i.test(src) ? `<img${pre} src="${src}"${post} loading="lazy">` : `<img${pre} src="${dl(src)}"${post} loading="lazy">`)
@@ -514,15 +518,15 @@ export function ArtifactViewer({ artifact, mode, onClose }: { artifact: Artifact
 // #endregion
 
 // #region AssistantContent (drop-in replacement for main.tsx's <Assistant>)
-function Markdown({ text, convId }: { text: string; convId: string | null }) {
-  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId); }, [text, convId]);
+function Markdown({ text, convId, v }: { text: string; convId: string | null; v?: string | number }) {
+  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId, v); }, [text, convId, v]);
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 // Renders a whole assistant message: markdown runs, code cards, artifact cards, and an image
 // lightbox. onOpenArtifact is called when a card is opened — main.tsx owns where <ArtifactViewer>
 // goes (split-screen panel on desktop, full-screen sheet on mobile).
-export function AssistantContent({ text, convId, onOpenArtifact }: { text: string; convId?: string | null; onOpenArtifact?: (a: Artifact) => void }) {
+export function AssistantContent({ text, convId, onOpenArtifact, v }: { text: string; convId?: string | null; onOpenArtifact?: (a: Artifact) => void; v?: string | number }) {
   const segs = useMemo(() => parseAssistant(text), [text]);
   const cid = convId ?? null;
   const [light, setLight] = useState<string | null>(null);
@@ -537,13 +541,13 @@ export function AssistantContent({ text, convId, onOpenArtifact }: { text: strin
   return (
     <div className="md-root" onClick={onImgClick}>
       {segs.map((s, i) => {
-        if (s.type === "markdown") return <Markdown key={i} text={s.text} convId={cid} />;
+        if (s.type === "markdown") return <Markdown key={i} text={s.text} convId={cid} v={v} />;
         if (s.type === "code") return <CodeBlock key={i} code={s.code} lang={s.lang} />;
         return <ArtifactCard key={s.artifact.id} artifact={s.artifact} onOpen={(a) => onOpenArtifact?.(a)} />;
       })}
       {files.length > 0 && (
         <div className="ct-file-row">
-          {files.map((f) => <FileCard key={f} href={downloadUrl(cid, f)} name={f.split("/").pop() || f} onPreview={setLight} />)}
+          {files.map((f) => <FileCard key={f} href={downloadUrl(cid, f, v)} name={f.split("/").pop() || f} onPreview={setLight} />)}
         </div>
       )}
       {light && <Lightbox src={light} onClose={() => setLight(null)} />}

@@ -1183,7 +1183,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M17 8l4 4-4 4" /><path d="M7 8l-4 4 4 4" /><path d="M14 4l-4 16" /></svg>
               <span>{agent.from}</span>
             </div>
-            <AssistantContent text={agent.body} convId={convId} onOpenArtifact={onOpenArtifact} />
+            <AssistantContent text={agent.body} convId={convId} onOpenArtifact={onOpenArtifact} v={i} />
           </div>
           {raPill}
         </div>
@@ -1264,7 +1264,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   return (
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
       {showRole && <div className="role">Claude</div>}
-      <AssistantContent text={it.text} convId={convId} onOpenArtifact={onOpenArtifact} />
+      <AssistantContent text={it.text} convId={convId} onOpenArtifact={onOpenArtifact} v={i} />
       {raPill}
       {summary && <div className="turn-think" title={tip}>{summary}</div>}
     </div>
