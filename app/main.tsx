@@ -634,6 +634,20 @@ class ConvStore {
   // Put an ask card back to unanswered: the optimistic mark is a lie if the answer never reached the
   // server, and a card that looks answered while the turn is still parked in the tool call is the
   // worst of both worlds (see deliverAsk).
+  // Make this chat's open questions match the server's pending ones (the only ones that can unblock
+  // the turn): add any we never received, and close any the server no longer has (answered on another
+  // device, or a transcript copy of an ask that the live runner replaced). A closed one keeps its
+  // place in the thread but can no longer be answered or be the target of the composer.
+  mergeAsks(pending: { askId: string; question: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean }[]) {
+    const ids = new Set(pending.map((a) => a.askId));
+    let items = this.items.map((it) => (it.kind === "ask" && it.answered === undefined && !ids.has(it.askId) ? { ...it, answered: "" } : it));
+    for (const a of pending) {
+      if (!items.some((it) => it.kind === "ask" && it.askId === a.askId)) {
+        items = [...items, { kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText }];
+      }
+    }
+    this.items = items; this.touch();
+  }
   unanswerAsk(askId: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: undefined } : it)); this.touch(); }
   setBusy(b: boolean) { if (this.busy === b) return; this.busy = b; this.signal(); }
   beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
@@ -1669,6 +1683,30 @@ function App() {
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
   }, [refreshQueue, refreshConvs]);
+  // Self-heal the open question. The thread can miss an ask_user card (seen on a phone: its live
+  // stream stalled mid-turn, it resumed from a transcript copy, and the question that arrived in the
+  // gap never showed), or hold a stale one that the composer then "answers". The status poll knows
+  // the truth about waiting; whenever it, or the set of questions open on screen, changes, fetch the
+  // server's pending asks once and merge them. One fetch per change, at most every 8 s.
+  const askSyncKey = useRef("");
+  const askSyncAt = useRef(0);
+  useEffect(() => {
+    const s = activeStoreRef.current, id = activeIdRef.current;
+    if (!s || !id || id.startsWith("new-")) return;
+    const open = s.items.filter((it) => it.kind === "ask" && it.answered === undefined).map((it) => (it as Extract<Item, { kind: "ask" }>).askId).sort();
+    const waiting = !!statuses[id]?.waiting;
+    const key = `${id}|${waiting ? 1 : 0}|${open.join(",")}`;
+    if (key === askSyncKey.current) return;
+    if (!waiting && !open.length) { askSyncKey.current = key; return; } // nothing open anywhere: agreed
+    if (Date.now() - askSyncAt.current < 8000) return;
+    askSyncAt.current = Date.now();
+    void api.conversation(id, s.evCount).then((d: any) => {
+      if (activeStoreRef.current !== s) return;
+      s.mergeAsks(d?.live && Array.isArray(d.pendingAsks) ? d.pendingAsks : []);
+      const after = s.items.filter((it) => it.kind === "ask" && it.answered === undefined).map((it) => (it as Extract<Item, { kind: "ask" }>).askId).sort();
+      askSyncKey.current = `${id}|${waiting ? 1 : 0}|${after.join(",")}`;
+    }).catch(() => { /* next poll retries */ });
+  }, [statuses]);
   // App-icon badge: how many agents are WAITING on you. Deliberately not "how many are busy" — the
   // badge answers "does anything need me", and a working agent does not. The service worker sets the
   // same badge from a status push while the app is closed, so the two agree.
