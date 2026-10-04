@@ -8,7 +8,7 @@
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
 import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
-import { mkdirSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -1393,13 +1393,52 @@ setInterval(() => {
   // climbing conv count is retained conversations, a climbing heap with a flat count is elsewhere.
   const m = process.memoryUsage();
   const mb = (n: number) => Math.round(n / 1048576);
-  console.log(`[mem] rss=${mb(m.rss)}M heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}M ext=${mb(m.external)}M convs=${new Set(conversations.values()).size} keys=${conversations.size} reaped=${reaped}`);
+  console.log(`[mem] rss=${mb(m.rss)}M heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}M ext=${mb(m.external)}M convs=${new Set(conversations.values()).size} keys=${conversations.size} reaped=${reaped} replayCache=${replayCache.size}/${Math.round(replayCacheBytes / 1048576)}M`);
 }, 5 * 60_000);
 // #endregion
 
 // #region historical transcript -> the same AppEvent stream (for opening a past chat)
-// Parses a session .jsonl into the normalized events the front-end already renders.
+// Parsed-events cache, keyed on the file's size+mtime. replayTranscript() used to read and parse the
+// whole .jsonl on every call, and it is called on a timer: the service worker refetches up to 8
+// conversations on every status push (15 s while anything is working, sw.js:202) and the app prewarms
+// 12 on load. Two 30-40 MB transcripts in that set cost about half a GB of short-lived allocation per
+// push, and Bun's allocator kept the pages: measured 2026-10-04, rss 1.3 GB (peak 2.3 GB) five
+// minutes after a restart with a 17 MB JS heap, and 64 GB after a week, which took the box down.
+// An unchanged transcript is now parsed once. Bounded by source bytes, LRU beyond that; files over
+// the per-file cap are parsed on demand and not kept.
+const REPLAY_CACHE_MAX_FILE = 64 * 1048576;
+const REPLAY_CACHE_MAX_TOTAL = 160 * 1048576;
+const replayCache = new Map<string, { size: number; mtimeMs: number; events: AppEvent[] }>();
+let replayCacheBytes = 0;
+function replayCacheRemember(path: string, size: number, mtimeMs: number, events: AppEvent[]) {
+  if (size > REPLAY_CACHE_MAX_FILE) return;
+  const prev = replayCache.get(path);
+  if (prev) { replayCache.delete(path); replayCacheBytes -= prev.size; }
+  replayCache.set(path, { size, mtimeMs, events });
+  replayCacheBytes += size;
+  for (const [k, v] of replayCache) {
+    if (replayCacheBytes <= REPLAY_CACHE_MAX_TOTAL) break;
+    replayCache.delete(k); replayCacheBytes -= v.size;
+  }
+}
+
+// Parses a session .jsonl into the normalized events the front-end already renders. Callers get
+// their own array (the conversation route rewrites the trailing model event in place).
 export async function replayTranscript(path: string): Promise<AppEvent[]> {
+  let size = -1, mtimeMs = -1;
+  try { const st = statSync(path); size = st.size; mtimeMs = st.mtimeMs; } catch {}
+  const hit = replayCache.get(path);
+  if (hit && hit.size === size && hit.mtimeMs === mtimeMs) {
+    replayCache.delete(path); replayCache.set(path, hit); // LRU touch
+    return hit.events.slice();
+  }
+  const out = await parseTranscript(path);
+  // An empty result from a non-empty file is a failed or racing read, not a parse: do not pin it.
+  if (size >= 0 && (out.length > 0 || size === 0)) replayCacheRemember(path, size, mtimeMs, out);
+  return out.slice();
+}
+
+async function parseTranscript(path: string): Promise<AppEvent[]> {
   const out: AppEvent[] = [];
   const askToolIds = new Set<string>(); // tool_use ids of ask_user calls -> render as ask cards, not raw tool cards
   // Per-turn accumulators so the reloaded footer matches the live one: a turn can span several

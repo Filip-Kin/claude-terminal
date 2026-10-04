@@ -226,8 +226,22 @@ async function listConversations(ctx: AppCtx): Promise<{ path: string; sessionId
   return rows;
 }
 
-// Pull a title + cwd from the head/tail of a transcript (cheap: reads once).
-async function convMeta(path: string): Promise<{ title: string | null; cwd: string | null; first?: string | null; aiTitle?: string | null }> {
+// Pull a title + cwd from a transcript. Cached on size+mtime: the conversations list calls this
+// for up to 40 files on every refresh and the conversation route on every delta fetch, and each
+// call read and JSON-parsed the whole file (see the replay cache note in app-runner.ts for what
+// that churn did to the process). One small object per file, so no bound is needed.
+type ConvMeta = { title: string | null; cwd: string | null; first?: string | null; aiTitle?: string | null };
+const metaCache = new Map<string, { size: number; mtimeMs: number; meta: ConvMeta }>();
+async function convMeta(path: string): Promise<ConvMeta> {
+  let size = -1, mtimeMs = -1;
+  try { const st = statSync(path); size = st.size; mtimeMs = st.mtimeMs; } catch {}
+  const hit = metaCache.get(path);
+  if (hit && hit.size === size && hit.mtimeMs === mtimeMs) return { ...hit.meta };
+  const meta = await readConvMeta(path);
+  if (size >= 0) metaCache.set(path, { size, mtimeMs, meta });
+  return { ...meta };
+}
+async function readConvMeta(path: string): Promise<ConvMeta> {
   let title: string | null = null;
   let cwd: string | null = null;
   let first: string | null = null;      // stripped first user text, for the fallback title + AI-title seed
