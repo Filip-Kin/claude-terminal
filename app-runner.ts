@@ -664,6 +664,7 @@ export class Conversation {
   statusEvent(): AppEvent { return { t: "status", phase: this.phase, since: this.phaseSince, ...(this.phaseDetail ? { detail: this.phaseDetail } : {}) }; }
 
   hasSubscribers(): boolean { return this.subs.size > 0; }
+  isClosed(): boolean { return this.closed; }
   // A client's stream expires every few minutes and reconnects a few seconds later, so "no
   // subscriber right now" is not "nobody is watching". Last time a stream attached or detached:
   lastWatchedAt = Date.now();
@@ -1368,7 +1369,15 @@ function reapIfIdle(c: Conversation) {
 // Idle sweeper: close conversations no client has watched for a while.
 setInterval(() => {
   const now = Date.now();
+  let reaped = 0;
   for (const c of new Set(conversations.values())) {
+    // A closed conversation is finished with: once no client is attached, drop it from the map so
+    // its event log (up to 5000 events, tool results and pasted images included) can be collected.
+    // The one-shot reapIfIdle 60 s after close() gives up if a stream is still attached at that
+    // moment, and until 2026-10-04 nothing ever retried, so every such chat stayed resident for the
+    // life of the process. That retention is the best candidate for the sidecar reaching 64 GB
+    // (13 GB resident + 51 GB swapped) and taking the whole box down that day.
+    if (c.isClosed()) { if (!c.hasSubscribers()) { reapIfIdle(c); reaped++; } continue; }
     // Never collect a conversation that is still working, or one parked on an unanswered question:
     // close() kills the SDK query and answers pending asks with "(the user did not answer)", which
     // would throw away a real turn just because the phone dropped its stream.
@@ -1379,6 +1388,12 @@ setInterval(() => {
     // morning's messages were dropped (3b4a0dc1, 2026-09-25 17:26).
     if (!c.watchedWithin(10 * 60_000) && now - c.lastActivity > 30 * 60_000) c.close();
   }
+  // Memory telemetry, one journal line per sweep. Reading this over hours is how a slow leak gets
+  // attributed: rss climbing with a flat heap is native (Bun/SDK buffers), a climbing heap with a
+  // climbing conv count is retained conversations, a climbing heap with a flat count is elsewhere.
+  const m = process.memoryUsage();
+  const mb = (n: number) => Math.round(n / 1048576);
+  console.log(`[mem] rss=${mb(m.rss)}M heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}M ext=${mb(m.external)}M convs=${new Set(conversations.values()).size} keys=${conversations.size} reaped=${reaped}`);
 }, 5 * 60_000);
 // #endregion
 
