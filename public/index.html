@@ -58,7 +58,14 @@
   .big { grid-column:3; grid-row:1/3; text-align:right; }
   .big b { font-size:24px; font-weight:750; font-variant-numeric:tabular-nums; letter-spacing:-.02em; display:block; line-height:1.1; }
   .big span { color:var(--muted); font-size:11px; }
-  .spark { grid-column:2; grid-row:2; height:46px; margin:-2px -4px; min-width:0; overflow:hidden; }
+  /* overflow must stay visible so the hover tooltip can escape the 46px sparkline box
+     instead of being cropped inside it. */
+  .spark { grid-column:2; grid-row:2; height:46px; margin:-2px -4px; min-width:0; overflow:visible; }
+  .spark .apexcharts-canvas { overflow:visible !important; }
+  /* keep tooltip values (e.g. "1,234,567 output tokens") on one line — no ugly wrapping at 7 digits. */
+  .apexcharts-tooltip, .apexcharts-tooltip-series-group,
+  .apexcharts-tooltip-text, .apexcharts-tooltip-y-group,
+  .apexcharts-tooltip-text-y-value { white-space:nowrap !important; }
   .meta { grid-column:1/4; grid-row:3; display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:12.5px; padding-top:4px; border-top:1px dashed var(--line); margin-top:4px; }
   .meta b { color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums; }
 
@@ -226,7 +233,10 @@ const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); return u
 function sparkOpts(user, data){
   const c = colorFor(user);
   return {
-    chart:{ type:"area", height:46, sparkline:{enabled:true}, animations:{enabled:true, easing:"easeinout", speed:700} },
+    // Animations OFF: on a 46px sparkline the entrance tween buys nothing, and with it enabled the
+    // hover marker re-animates the series, which makes ApexCharts clear the tooltip the moment the
+    // animation finishes (~700ms) — the tooltip flashed then vanished until the cursor moved again.
+    chart:{ type:"area", height:46, sparkline:{enabled:true}, animations:{enabled:false} },
     stroke:{ curve:"smooth", width:2 },
     fill:{ type:"gradient", gradient:{ shadeIntensity:1, opacityFrom:.45, opacityTo:0, stops:[0,100] } },
     colors:[c],
@@ -265,20 +275,25 @@ function mainOpts(d){
 // External peers are excluded here: this chart pairs with the money split, and peers
 // are not in the split. Their activity still shows on the hourly chart and their card.
 const splitUsers = (d) => d.users.filter(u => !u.external);
+// The early months (Dec 2025 through May 2026) are sparse and gappy, so drop them from this
+// chart. Keys are "YYYY-MM", so a plain string compare is enough. June 2026 onward only.
+const MONTH_CUTOFF = "2026-06";
+const chartMonths = (d) => d.months.filter(m => m.key >= MONTH_CUTOFF);
 const monthlySeries = (d) => splitUsers(d).map(u => ({ name:u.name,
   data: chartMonths(d).map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? (r.weighted ?? r.output) : 0; }) }));
 function monthlyOpts(d){
+  const mm = chartMonths(d);
   return {
     chart:{ type:"bar", height:300, stacked:true, fontFamily:"inherit", background:"transparent",
       toolbar:{show:false}, animations:{ enabled:true, easing:"easeinout", speed:800 } },
     theme:{ mode: isDark()?"dark":"light" },
     colors: splitUsers(d).map(u=>colorFor(u.user)),
     series: monthlySeries(d),
-    plotOptions:{ bar:{ columnWidth: d.months.length<=2 ? "42%" : "62%",
+    plotOptions:{ bar:{ columnWidth: mm.length<=2 ? "42%" : "62%",
       borderRadius:4, borderRadiusApplication:"end", borderRadiusWhenStacked:"last" } },
     dataLabels:{ enabled:false },
     grid:{ borderColor:"color-mix(in srgb, "+muted()+" 22%, transparent)", strokeDashArray:4 },
-    xaxis:{ categories: d.months.map(m=>m.label), labels:{style:{colors:muted()}},
+    xaxis:{ categories: mm.map(m=>m.label), labels:{style:{colors:muted()}},
       axisBorder:{show:false}, axisTicks:{show:false} },
     yaxis:{ labels:{ style:{colors:muted()}, formatter:v=>fmt(v) } },
     legend:{ position:"top", horizontalAlign:"left", labels:{colors:ink()}, markers:{radius:4}, fontWeight:600 },
@@ -327,6 +342,36 @@ function renderSplit(d, key){
 let DATA=null, mainChart=null, monthlyChart=null; const sparks={}; let lastSig="";
 const sig = d => d.users.map(u=>u.user).join(",")+"|"+d.months.map(m=>m.key).join(",");
 
+// Create each chart once, then update in place. Destroying + re-rendering on every poll/stream
+// tick (which fires whenever the ranking reshuffles) restarted the grow-from-zero animation each
+// time, so the bars flickered and often showed as empty. updateSeries/updateOptions tween smoothly
+// (animate=false on background ticks) with no teardown.
+function syncMonthly(d, animate){
+  if(!monthlyChart){
+    monthlyChart = new ApexCharts(document.getElementById("monthlyChart"), monthlyOpts(d));
+    monthlyChart.render(); return;
+  }
+  const mm = chartMonths(d);
+  monthlyChart.updateOptions({
+    theme:{ mode: isDark()?"dark":"light" },
+    colors: splitUsers(d).map(u=>colorFor(u.user)),
+    xaxis:{ categories: mm.map(m=>m.label) },
+    plotOptions:{ bar:{ columnWidth: mm.length<=2 ? "42%" : "62%" } }
+  }, false, false);
+  monthlyChart.updateSeries(monthlySeries(d), !!animate);
+}
+function syncMain(d, animate){
+  if(!mainChart){
+    mainChart = new ApexCharts(document.getElementById("mainChart"), mainOpts(d));
+    mainChart.render(); return;
+  }
+  mainChart.updateOptions({
+    theme:{ mode: isDark()?"dark":"light" },
+    colors: d.users.map(u=>colorFor(u.user))
+  }, false, false);
+  mainChart.updateSeries(mainSeries(d), !!animate);
+}
+
 function build(d){
   const cards = document.getElementById("cards"); cards.innerHTML="";
   d.users.forEach((u,i) => {
@@ -366,23 +411,35 @@ function build(d){
   document.getElementById("monthSel").onchange = e => renderSplit(DATA, e.target.value);
   renderSplit(d, document.getElementById("monthSel").value);
 
-  if(monthlyChart) monthlyChart.destroy();
-  monthlyChart = new ApexCharts(document.getElementById("monthlyChart"), monthlyOpts(d));
-  monthlyChart.render();
-
-  if(mainChart) mainChart.destroy();
-  mainChart = new ApexCharts(document.getElementById("mainChart"), mainOpts(d));
-  mainChart.render();
+  syncMonthly(d, true);
+  syncMain(d, true);
 
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
   document.getElementById("foot").textContent =
     "Ranked by weighted output this calendar month. Sparklines cover the last "+d.spark_hours+" hours. This page refreshes every 30 seconds.";
 }
 
+// The SSE feed fires several times a second (usage.db is in WAL mode, so its file changes
+// continuously while any session is active). Each tick rebuilds every chart's SVG via updateSeries,
+// which yanks an open tooltip out from under the cursor — the tooltip flashed for one debounce
+// window (~0.5s) then vanished until you moved the pointer. So while the pointer is over any chart
+// (or its tooltip, which now escapes the sparkline box), hold the latest payload and apply it on the
+// way out. The `updated` stamp still ticks; only the redraw is deferred.
+let onChart = false, pendingData = null;
+const CHART_SEL = ".spark, #mainChart, #monthlyChart, .apexcharts-tooltip";
+document.addEventListener("pointerover", e => { if(e.target.closest?.(CHART_SEL)) onChart = true; });
+document.addEventListener("pointerout", e => {
+  if(e.target.closest?.(CHART_SEL) && !e.relatedTarget?.closest?.(CHART_SEL)){
+    onChart = false;
+    if(pendingData){ const d = pendingData; pendingData = null; refresh(d); }
+  }
+});
+
 function refresh(d){
   // Periodic refresh: update data in place with animation OFF. Re-tweening every chart on each 30s
   // poll / live tick is pure CPU/GPU churn that piles up when the board is left open. The one-time
   // entrance animation still runs in build().
+  if(onChart){ pendingData = d; return; }   // don't redraw a chart the cursor is hovering — see note above
   d.users.forEach(u => {
     if(sparks[u.user]) sparks[u.user].updateSeries([{name:"output", data:sparkData(d,u)}], false);
     const vals = { mo:u.month_weighted ?? u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total }; // weighted, to match the card label + ranking
@@ -390,8 +447,8 @@ function refresh(d){
   });
   populateMonths(d);
   renderSplit(d, document.getElementById("monthSel").value);
-  if(monthlyChart) monthlyChart.updateSeries(monthlySeries(d), false);
-  if(mainChart) mainChart.updateSeries(mainSeries(d), false);
+  syncMonthly(d, false);
+  syncMain(d, false);
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
 }
 
