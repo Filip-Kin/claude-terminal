@@ -40,7 +40,7 @@
 //   We key off that, and fall back to file mtime freshness when no notification exists yet.
 
 import { join, resolve, sep, dirname, basename } from "path";
-import { readdirSync, statSync, existsSync, realpathSync, readFileSync } from "fs";
+import { readdirSync, statSync, existsSync, realpathSync, readFileSync, openSync, readSync, closeSync } from "fs";
 import { replayTranscript, type AppEvent } from "./app-runner";
 
 // #region path guard
@@ -427,6 +427,40 @@ function findSessionByName(recs: SessionRec[], name: string): SessionRec | null 
   }
   return best;
 }
+// Once a tab's Claude exits, its ~/.claude/sessions entry is deleted and the name lookup above
+// finds nothing. The transcript survives, and its head carries an `agent-name` record with the tab
+// name (claude-spawn passes --name). Search the tab's project dir for a transcript written after the
+// spawn call whose head names this tab; the earliest such start wins, so a later reuse of the same
+// name does not steal an older tab's link.
+function findTranscriptByName(ctx: SpawnedCtx, name: string, project: string | null, sinceMs: number): string | null {
+  if (!project || !RE_PROJECT.test(project)) return null;
+  const dir = join(ctx.dataDir, project);
+  let files: string[] = [];
+  try { files = readdirSync(dir); } catch { return null; }
+  let best: { id: string; start: number } | null = null;
+  const buf = Buffer.alloc(8192);
+  for (const f of files) {
+    if (!f.endsWith(".jsonl")) continue;
+    const id = f.slice(0, -6);
+    if (!RE_SESSION.test(id)) continue;
+    const p = join(dir, f);
+    const st = statOr(p);
+    if (!st || st.mtimeMs < sinceMs - 60_000) continue;
+    let head = "";
+    try { const fd = openSync(guarded(ctx.dataDir, p), "r"); try { head = buf.toString("utf8", 0, readSync(fd, buf, 0, buf.length, 0)); } finally { closeSync(fd); } } catch { continue; }
+    let named = false, start = 0;
+    for (const line of head.split("\n")) {
+      let o: any; try { o = JSON.parse(line); } catch { continue; }
+      if (o?.type === "agent-name" && o.agentName === name) named = true;
+      if (!start && typeof o?.timestamp === "string") start = Date.parse(o.timestamp) || 0;
+      if (!start && typeof o?.snapshot?.timestamp === "string") start = Date.parse(o.snapshot.timestamp) || 0;
+    }
+    if (!named || (start && start < sinceMs - 60_000)) continue;
+    if (!best || (start || st.mtimeMs) < best.start) best = { id, start: start || st.mtimeMs };
+  }
+  return best?.id ?? null;
+}
+const encodeProject = (cwd: string | null) => (cwd ? cwd.replace(/[^A-Za-z0-9]/g, "-") : null);
 const pidAlive = (pid: number) => pid > 0 && existsSync(`/proc/${pid}`);
 // #endregion
 
@@ -521,30 +555,34 @@ export async function listSpawned(ctx: SpawnedCtx, sessionId: string): Promise<S
     seenTabs.add(name);
     const rec = findSessionByName(recs, name);
     const alive = rec ? pidAlive(rec.pid) : false;
+    const pastId = rec ? null : findTranscriptByName(ctx, name, call.cwd ? encodeProject(call.cwd) : loc.project, call.ts);
+    const tabSessionId = rec?.sessionId ?? pastId;
     let bytes = 0, mtime = call.ts;
-    if (rec) { const t = locate(ctx, rec.sessionId); const st = t ? statOr(t.transcript) : null; if (st) { bytes = st.size; mtime = st.mtimeMs; } }
+    if (tabSessionId) { const t = locate(ctx, tabSessionId); const st = t ? statOr(t.transcript) : null; if (st) { bytes = st.size; mtime = st.mtimeMs; } }
     items.push({
       key: `tab:${name}`,
       kind: "tab",
       label: name,
       detail: rec?.cwd || call.cwd || null,
       toolUseId: call.toolUseId,
-      status: rec ? (alive ? "running" : "finished") : "unknown",
+      status: rec ? (alive ? "running" : "finished") : pastId ? "finished" : "unknown",
       statusFrom: rec
         ? alive
           ? `~/.claude/sessions/${rec.pid}.json exists and /proc/${rec.pid} is alive${rec.status ? ` (session status=${rec.status})` : ""}`
           : `~/.claude/sessions/${rec.pid}.json exists but the process is gone (tab exited or was closed)`
-        : "no ~/.claude/sessions entry matches this tab name, so it is no longer running and its session id could not be recovered",
+        : pastId
+          ? `no ~/.claude/sessions entry (tab exited); transcript ${pastId}.jsonl names this tab in its agent-name record`
+          : "no ~/.claude/sessions entry matches this tab name and no transcript names it, so its session id could not be recovered",
       startedAt: rec?.startedAt ?? call.ts ?? null,
       endedAt: null,
       durationMs: null,
       mtime,
       bytes,
-      hasTranscript: !!rec,
+      hasTranscript: !!tabSessionId,
       resultPreview: null,
       tab: {
         name,
-        sessionId: rec?.sessionId ?? null,
+        sessionId: tabSessionId ?? null,
         tmuxSession: rec?.tmux ? rec.tmux.split(":")[0] : name,
         cwd: rec?.cwd || call.cwd || null,
         pid: rec?.pid ?? null,
@@ -828,13 +866,20 @@ export async function getSpawnedTranscript(ctx: SpawnedCtx, sessionId: string, k
     // tab: resolve the name to a live session record, then replay its ORDINARY transcript.
     const rec = findSessionByName(readSessions(ctx), parsed.name!);
     label = parsed.name!;
-    if (!rec) return { error: `no running session named "${parsed.name}"; a spawned tab is only linkable while its ~/.claude/sessions entry exists, and nothing on disk records which chat spawned it`, status: 404 };
-    linkedSessionId = rec.sessionId;
-    cwd = rec.cwd; detail = rec.cwd;
-    const t = locate(ctx, rec.sessionId);
+    let tabId = rec?.sessionId ?? null;
+    if (!rec) {
+      // exited tab: the list resolves it from the transcript head (findTranscriptByName)
+      const list = await listSpawned(ctx, sessionId);
+      const item = "error" in list ? null : list.items.find((i) => i.key === key);
+      tabId = item?.tab?.sessionId ?? null;
+      cwd = item?.tab?.cwd ?? null; detail = cwd;
+    } else { cwd = rec.cwd; detail = rec.cwd; }
+    if (!tabId) return { error: `no session found for tab "${parsed.name}"`, status: 404 };
+    linkedSessionId = tabId;
+    const t = locate(ctx, tabId);
     if (!t) return { error: "the tab's session has no transcript yet", status: 404 };
     const r = await readJsonl(t.transcript); events = r.events; bytes = r.bytes;
-    note = "This is an ordinary conversation; it also appears in the normal conversation list under session id " + rec.sessionId + ".";
+    note = "This is an ordinary conversation; it also appears in the normal conversation list under session id " + tabId + ".";
   }
 
   const capped = capEvents(events);

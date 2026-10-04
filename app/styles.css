@@ -270,6 +270,12 @@ body.theme-light .md pre { background: #f3eee7; }
 .tool-body pre { background: #120f0c; border: 1px solid var(--line-2); border-radius: 9px; padding: 10px 12px; overflow-x: auto; font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; }
 .tool-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-top: 10px; }
 
+.spawn-tab-btn { display: flex; align-items: center; gap: 10px; width: 100%; margin: -4px 0 12px; padding: 10px 14px; border: 1px solid var(--accent); border-radius: 11px; background: transparent; color: var(--text); font-size: 13.5px; text-align: left; cursor: pointer; }
+.spawn-tab-btn:hover { background: var(--bg-3); }
+.spawn-tab-btn:disabled { opacity: .6; cursor: default; }
+.spawn-tab-btn .stb-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.spawn-tab-btn .stb-state { color: var(--accent-2); font-size: 12.5px; }
+
 .thinking { color: var(--text-3); font-style: italic; font-size: 13.5px; margin: 0 0 12px; white-space: pre-wrap; }
 .think-group .think-full { padding: 4px 14px 12px; color: var(--text-3); font-style: italic; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; }
 .think-text.think-body { line-height: 1.5; max-height: calc(1.5em * 4); overflow-y: auto; overscroll-behavior: contain; }

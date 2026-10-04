@@ -10,7 +10,7 @@ import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, FileCard, Lightbox, downloadUrl, type Artifact } from "./artifacts";
-import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
+import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer, isSpawnTabTool, SpawnTabButton, setOpenConversation } from "./agents";
 import { toolDisplay } from "./toollabels";
 import { extractShopCards, ShopGallery } from "./shopcards";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
@@ -1236,6 +1236,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
     // no cards in it (an error, or a tool that returns prose only).
     const gal = shopGalleries(it);
     if (gal) return gal;
+    if (isSpawnTabTool(it.name, it.input)) return <><ToolCard it={it} /><SpawnTabButton it={it} convId={convId} /></>;
     return <ToolCard it={it} />;
   }
   if (it.kind === "notice") {
@@ -2124,6 +2125,7 @@ function App() {
   }, [defaultCwd]);
 
   loadConvRef.current = loadConv;
+  useEffect(() => { setOpenConversation((id) => { void loadConv(id); }); return () => setOpenConversation(null); }, [loadConv]);
   const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setEditing(null); setEditError(null); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
   // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
@@ -2597,7 +2599,7 @@ function App() {
     const nodes: React.ReactNode[] = [];
     // Plain tools collapse into an accordion; subagent/workflow (Task) tools stay standalone
     // (rich activity card); TodoWrite is hidden here (the pinned checklist replaces it).
-    const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name);
+    const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name) && !isSpawnTabTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input); // a spawn call stays standalone so its tab button shows
     let lastUserIdx = -1; for (let k = items.length - 1; k >= 0; k--) if (items[k].kind === "user") { lastUserIdx = k; break; }
     // Only the tail is mounted. Blocks still read their neighbours out of the FULL items array, so
     // the role label and turn-final footer stay correct at the window edge.

@@ -25,6 +25,7 @@ import { marked } from "marked";
 import {
   SpawnSheet, useSpawnedList, KindIcon, KIND_LABEL, spawnMeta, normPhases,
   registerTranscriptRenderer,
+  fetchSpawnedList,
   type SpawnedEntry, type SpawnKind, type SpawnPhase, type TranscriptRenderer, type TranscriptBlockProps,
 } from "./spawnview";
 
@@ -452,6 +453,40 @@ function parseSpawnTab(it: MergedToolItem): SpawnedEntry | null {
     brief: prompt ? prompt[1] || prompt[2] || undefined : undefined,
     local: true,
   };
+}
+
+// The Bash card for a `claude-spawn` call gets a button that switches to the spawned tab's
+// conversation. App registers its loadConv here so the memoised message blocks need no new prop.
+// The tab's session id comes from stdout when it is a UUID, otherwise from /app/api/spawned, which
+// matches the tab by name (live sessions file, or the exited tab's transcript head).
+let OPEN_CONV: ((id: string) => void) | null = null;
+export function setOpenConversation(fn: ((id: string) => void) | null): void { OPEN_CONV = fn; }
+export function isSpawnTabTool(name: string, input: unknown): boolean {
+  return name === "Bash" && CLAUDE_SPAWN_RE.test(str(asRecord(input).command));
+}
+export function SpawnTabButton({ it, convId }: { it: MergedToolItem; convId: string | null }): React.JSX.Element | null {
+  const tab = useMemo(() => parseSpawnTab(it), [it]);
+  const [state, setState] = useState<"idle" | "loading" | "missing">("idle");
+  const open = useCallback(async () => {
+    if (!tab || !OPEN_CONV) return;
+    if (tab.sessionId) { OPEN_CONV(tab.sessionId); return; }
+    if (!convId) { setState("missing"); return; }
+    setState("loading");
+    try {
+      const list = await fetchSpawnedList(convId);
+      const hit = list.find((e) => e.kind === "tab" && e.toolUseId === it.id && e.sessionId);
+      if (hit?.sessionId) { setState("idle"); OPEN_CONV(hit.sessionId); }
+      else setState("missing");
+    } catch { setState("missing"); }
+  }, [tab, convId, it.id]);
+  if (!tab || it.result === undefined || it.isError) return null;
+  return (
+    <button className="spawn-tab-btn" onClick={open} disabled={state === "loading"}>
+      <span className="stb-label">{tab.label}</span>
+      <span className="stb-state">{state === "loading" ? "…" : state === "missing" ? "Not found" : "Open tab"}</span>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+    </button>
+  );
 }
 
 // One SpawnedEntry per piece of spawned work in `items`, finished ones included, in the order they
