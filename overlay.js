@@ -535,7 +535,7 @@
   hamBtn.innerHTML = SVG_HAM;
   const netBtn = document.createElement("div"); // Connections: Google accounts, VPN, Tailscale
   netBtn.className = "ctab-btn ctab-net";
-  netBtn.title = "Connections (Google account, VPN, Tailscale)";
+  netBtn.title = "Connections";
   netBtn.innerHTML = SVG_NET;
   // Always shown now: connecting a Google account is available to everyone, while the
   // VPN/Tailscale half only renders when the host has the network helper configured.
@@ -1147,7 +1147,7 @@
     const accounts = (data && data.accounts) || [];
     if (data && data.configured === false) {
       const warn = document.createElement("div"); warn.className = "ct-tun-sub";
-      warn.textContent = "This server has no Google OAuth client configured yet, so connecting will fail.";
+      warn.textContent = "No OAuth client on this server";
       host.appendChild(warn);
     }
     for (const a of accounts) {
@@ -1158,48 +1158,48 @@
       top.appendChild(name);
       if (a.primary) {
         const tag = document.createElement("span"); tag.className = "ct-tun-sub"; tag.style.marginTop = "0";
-        tag.textContent = "default"; top.appendChild(tag);
+        tag.textContent = "Default"; top.appendChild(tag);
       } else {
         const mk = document.createElement("button"); mk.className = "ct-btn"; mk.textContent = "Make default";
         mk.addEventListener("click", async () => {
           mk.disabled = true;
           try { await googleMutate("primary", a.email); await refresh(); }
-          catch (e) { showToast("Could not change the default: " + e.message, "error"); mk.disabled = false; }
+          catch (e) { showToast("Default not changed: " + e.message, "error"); mk.disabled = false; }
         });
         top.appendChild(mk);
       }
       const del = document.createElement("button"); del.className = "ct-btn"; del.textContent = "Disconnect";
       del.addEventListener("click", async () => {
-        if (!confirm("Disconnect " + a.email + "? This also revokes it at Google.")) return;
+        if (!confirm("Disconnect " + a.email + " and revoke access at Google?")) return;
         del.disabled = true;
         try { await googleMutate("disconnect", a.email); await refresh(); }
-        catch (e) { showToast("Could not disconnect: " + e.message, "error"); del.disabled = false; }
+        catch (e) { showToast("Not disconnected: " + e.message, "error"); del.disabled = false; }
       });
       top.appendChild(del);
       row.appendChild(top);
       if (!a.healthy) {
         const bad = document.createElement("div"); bad.className = "ct-tun-sub";
-        bad.textContent = a.error || "Needs reconnecting.";
+        bad.textContent = a.error || "Reconnect needed";
         row.appendChild(bad);
       }
       host.appendChild(row);
     }
     if (!accounts.length) {
       const empty = document.createElement("div"); empty.className = "ct-tun-sub";
-      empty.textContent = "No Google account connected yet.";
+      empty.textContent = "No account connected";
       host.appendChild(empty);
     }
     // connect row: a label plus a button that opens Google's consent in a popup
     const add = document.createElement("div"); add.className = "ct-add-row";
     const label = document.createElement("input");
-    label.className = "ct-g-label"; label.placeholder = "label, e.g. work or personal"; label.maxLength = 24;
+    label.className = "ct-g-label"; label.placeholder = "Label (work, personal)"; label.maxLength = 24;
     label.style.cssText = "flex:1;min-width:0;padding:7px 9px;border-radius:7px;border:1px solid #3a3a3a;background:#1c1c1c;color:#e6e6e6;font:13px system-ui,sans-serif";
     const btn = document.createElement("button"); btn.className = "ct-btn primary";
     btn.textContent = accounts.length ? "Connect another" : "Connect Google";
     btn.addEventListener("click", () => {
       const url = "/_google/start?popup=1" + (label.value.trim() ? "&label=" + encodeURIComponent(label.value.trim()) : "");
       const w = window.open(url, "ct-google", "width=520,height=700");
-      if (!w) { showToast("Allow popups for this site, or use the Google page directly", "error"); return; }
+      if (!w) { showToast("Popup blocked", "error"); return; }
       // The popup posts back when consent finishes; poll as a fallback for browsers
       // that block the message (and for a popup the user simply closes).
       const done = (e) => {
@@ -1299,12 +1299,9 @@
     const gHead = document.createElement("div"); gHead.className = "ct-conn-head";
     gHead.style.cssText = "border:0;padding:2px 0 6px;font-size:13px";
     gHead.textContent = "Google account";
-    const gNote = document.createElement("div"); gNote.className = "ct-conn-note";
-    gNote.textContent = "Give Claude your calendar, mail, Drive, tasks and contacts. Yours alone: nobody else on this server can see it. Connect more than one and label them to tell work from personal.";
     const gList = document.createElement("div");
     const gRefresh = async () => renderGoogle(gList, await googleStatus(), gRefresh);
     body.appendChild(gHead);
-    body.appendChild(gNote);
     body.appendChild(gList);
     void gRefresh();
 
