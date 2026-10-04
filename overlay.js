@@ -423,7 +423,7 @@
     "#ct-connmodal .ct-conn-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
     "#ct-connmodal .ct-conn-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
     "#ct-connmodal .ct-conn-close:hover{opacity:1}",
-    "#ct-connmodal .ct-conn-body{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 12px}",
+    "#ct-connmodal .ct-conn-body{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 12px}",
     "#ct-connmodal .ct-conn-note{font-size:11px;color:#9a9a9a;margin:0 0 8px}",
     "#ct-connmodal .ct-tun{border:1px solid #333;border-radius:8px;padding:9px 10px;margin-bottom:8px}",
     "#ct-connmodal .ct-tun-top{display:flex;align-items:center;gap:8px}",
@@ -533,11 +533,12 @@
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
   hamBtn.innerHTML = SVG_HAM;
-  const netBtn = document.createElement("div"); // external networks (VPN / Tailscale)
+  const netBtn = document.createElement("div"); // Connections: Google accounts, VPN, Tailscale
   netBtn.className = "ctab-btn ctab-net";
-  netBtn.title = "External networks (VPN / Tailscale)";
+  netBtn.title = "Connections (Google account, VPN, Tailscale)";
   netBtn.innerHTML = SVG_NET;
-  netBtn.style.display = "none"; // shown only if the server reports the feature enabled
+  // Always shown now: connecting a Google account is available to everyone, while the
+  // VPN/Tailscale half only renders when the host has the network helper configured.
   const bellBtn = document.createElement("div"); // desktop only (mobile uses the drawer)
   bellBtn.className = "ctab-btn ctab-bell";
   bellBtn.title = "Enable notifications";
@@ -1052,7 +1053,6 @@
     const st = {};
     for (const s of (data.status && data.status.tunnels) || []) st[s.id] = s;
     listEl.innerHTML = "";
-    const tuns = data.tunnels || [];
     // A whole-apply failure (the hub or a tunnel didn't come up) is reported here so it is impossible
     // to miss: the applier restores the session and writes this so the user sees WHAT failed, not a
     // dead page. Per-tunnel reasons still show on each row below. // ct-connerr
@@ -1060,6 +1060,7 @@
       const err = document.createElement("div"); err.className = "ct-conn-err"; err.textContent = data.status.error;
       listEl.appendChild(err);
     }
+    const tuns = data.tunnels || [];
     if (!tuns.length) {
       const e = document.createElement("div");
       e.className = "ct-conn-note";
@@ -1119,18 +1120,114 @@
     }
   }
   let connListEl = null;
+
+  // #region google accounts
+  // Talks to google-broker through /_google/* (NOT /_ct/*): the broker is a single
+  // host-side service shared by every user, routed by path, so it does not sit behind
+  // this per-user sidecar. See Projects/google-mcp.
+  async function googleStatus() {
+    try {
+      const r = await fetch("/_google/api/status", { credentials: "same-origin" });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }
+  async function googleMutate(action, email) {
+    const r = await fetch("/_google/api/" + action, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email }),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "failed");
+    return r.json();
+  }
+  function renderGoogle(host, data, refresh) {
+    host.innerHTML = "";
+    const accounts = (data && data.accounts) || [];
+    if (data && data.configured === false) {
+      const warn = document.createElement("div"); warn.className = "ct-tun-sub";
+      warn.textContent = "This server has no Google OAuth client configured yet, so connecting will fail.";
+      host.appendChild(warn);
+    }
+    for (const a of accounts) {
+      const row = document.createElement("div"); row.className = "ct-tun";
+      const top = document.createElement("div"); top.className = "ct-tun-top";
+      const name = document.createElement("div"); name.className = "ct-tun-name";
+      name.textContent = a.email + (a.label ? " (" + a.label + ")" : "");
+      top.appendChild(name);
+      if (a.primary) {
+        const tag = document.createElement("span"); tag.className = "ct-tun-sub"; tag.style.marginTop = "0";
+        tag.textContent = "default"; top.appendChild(tag);
+      } else {
+        const mk = document.createElement("button"); mk.className = "ct-btn"; mk.textContent = "Make default";
+        mk.addEventListener("click", async () => {
+          mk.disabled = true;
+          try { await googleMutate("primary", a.email); await refresh(); }
+          catch (e) { showToast("Could not change the default: " + e.message, "error"); mk.disabled = false; }
+        });
+        top.appendChild(mk);
+      }
+      const del = document.createElement("button"); del.className = "ct-btn"; del.textContent = "Disconnect";
+      del.addEventListener("click", async () => {
+        if (!confirm("Disconnect " + a.email + "? This also revokes it at Google.")) return;
+        del.disabled = true;
+        try { await googleMutate("disconnect", a.email); await refresh(); }
+        catch (e) { showToast("Could not disconnect: " + e.message, "error"); del.disabled = false; }
+      });
+      top.appendChild(del);
+      row.appendChild(top);
+      if (!a.healthy) {
+        const bad = document.createElement("div"); bad.className = "ct-tun-sub";
+        bad.textContent = a.error || "Needs reconnecting.";
+        row.appendChild(bad);
+      }
+      host.appendChild(row);
+    }
+    if (!accounts.length) {
+      const empty = document.createElement("div"); empty.className = "ct-tun-sub";
+      empty.textContent = "No Google account connected yet.";
+      host.appendChild(empty);
+    }
+    // connect row: a label plus a button that opens Google's consent in a popup
+    const add = document.createElement("div"); add.className = "ct-add-row";
+    const label = document.createElement("input");
+    label.className = "ct-g-label"; label.placeholder = "label, e.g. work or personal"; label.maxLength = 24;
+    label.style.cssText = "flex:1;min-width:0;padding:7px 9px;border-radius:7px;border:1px solid #3a3a3a;background:#1c1c1c;color:#e6e6e6;font:13px system-ui,sans-serif";
+    const btn = document.createElement("button"); btn.className = "ct-btn primary";
+    btn.textContent = accounts.length ? "Connect another" : "Connect Google";
+    btn.addEventListener("click", () => {
+      const url = "/_google/start?popup=1" + (label.value.trim() ? "&label=" + encodeURIComponent(label.value.trim()) : "");
+      const w = window.open(url, "ct-google", "width=520,height=700");
+      if (!w) { showToast("Allow popups for this site, or use the Google page directly", "error"); return; }
+      // The popup posts back when consent finishes; poll as a fallback for browsers
+      // that block the message (and for a popup the user simply closes).
+      const done = (e) => {
+        if (e.data && e.data.type === "google-connections-changed") {
+          window.removeEventListener("message", done); refresh();
+        }
+      };
+      window.addEventListener("message", done);
+      const iv = setInterval(() => {
+        if (w.closed) { clearInterval(iv); window.removeEventListener("message", done); refresh(); }
+      }, 800);
+    });
+    add.appendChild(label); add.appendChild(btn);
+    host.appendChild(add);
+  }
+  // #endregion
+
   async function openConnections() {
     if (connEl) { closeConn(); return; }
     try {
       const r = await api("connections");
       connData = await r.json();
-      if (!connData.enabled) { showToast("Network connections are not enabled here", "error"); return; }
-    } catch (e) { showToast("Could not load connections", "error"); return; }
+    } catch (e) { connData = { enabled: false, tunnels: [] }; }
 
     connEl = document.createElement("div"); connEl.id = "ct-connmodal";
     const panel = document.createElement("div"); panel.className = "ct-conn";
     const head = document.createElement("div"); head.className = "ct-conn-head";
-    const h = document.createElement("span"); h.textContent = "External networks";
+    const h = document.createElement("span"); h.textContent = "Connections";
     const x = document.createElement("span"); x.className = "ct-conn-close"; x.textContent = "×"; x.addEventListener("click", closeConn);
     head.appendChild(h); head.appendChild(x);
     // spinner overlay shown while a change applies (terminal reconnects behind the blur)
@@ -1198,11 +1295,30 @@
     addVpn.addEventListener("click", () => { tf.classList.remove("open"); vf.classList.toggle("open"); });
     addTs.addEventListener("click", () => { vf.classList.remove("open"); tf.classList.toggle("open"); });
 
-    body.appendChild(note);
-    body.appendChild(connListEl);
-    body.appendChild(addRow);
-    body.appendChild(vf);
-    body.appendChild(tf);
+    // Google section first: everyone has it, unlike the network half.
+    const gHead = document.createElement("div"); gHead.className = "ct-conn-head";
+    gHead.style.cssText = "border:0;padding:2px 0 6px;font-size:13px";
+    gHead.textContent = "Google account";
+    const gNote = document.createElement("div"); gNote.className = "ct-conn-note";
+    gNote.textContent = "Give Claude your calendar, mail, Drive, tasks and contacts. Yours alone: nobody else on this server can see it. Connect more than one and label them to tell work from personal.";
+    const gList = document.createElement("div");
+    const gRefresh = async () => renderGoogle(gList, await googleStatus(), gRefresh);
+    body.appendChild(gHead);
+    body.appendChild(gNote);
+    body.appendChild(gList);
+    void gRefresh();
+
+    if (connData.enabled) {
+      const nHead = document.createElement("div"); nHead.className = "ct-conn-head";
+      nHead.style.cssText = "border:0;padding:14px 0 6px;margin-top:8px;border-top:1px solid #383838;font-size:13px";
+      nHead.textContent = "External networks";
+      body.appendChild(nHead);
+      body.appendChild(note);
+      body.appendChild(connListEl);
+      body.appendChild(addRow);
+      body.appendChild(vf);
+      body.appendChild(tf);
+    }
     panel.appendChild(head); panel.appendChild(applying); panel.appendChild(body); connEl.appendChild(panel);
     connEl.addEventListener("click", (e) => { if (e.target === connEl && !connApply) closeConn(); });
     (document.documentElement || document.body).appendChild(connEl);
@@ -1219,13 +1335,9 @@
         if (d && d.enabled) { connData = d; renderTunnels(connListEl, connData); resolveApply(); }
       } catch {}
     }
-    connPoll = setInterval(refresh, 2000);
+    if (connData.enabled) connPoll = setInterval(refresh, 2000);
   }
   netBtn.addEventListener("click", openConnections);
-  // reveal the button only when the server reports the feature is enabled
-  (async () => {
-    try { const r = await api("connections"); const d = await r.json(); if (d && d.enabled) netBtn.style.display = ""; } catch {}
-  })();
   // reveal the chat-app button only for the owner (the /app routes are owner-gated)
   (async () => {
     try { const r = await api("app/api/models"); if (r.ok) chatBtn.style.display = ""; } catch {}
