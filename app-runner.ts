@@ -60,7 +60,7 @@ export type AppEvent =
   | { t: "compacting"; active: boolean } // compaction started/stopped (drives the progress banner, incl. auto-compaction)
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
-  | { t: "user"; text: string; cid?: string } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly
+  | { t: "user"; text: string; cid?: string; midTurn?: boolean } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly; midTurn = sent while a turn was running (folded into it, not a turn of its own)
   // Real token accounting for the turn (from the SDK result message): output = tokens Claude
   // actually generated this turn (thinking + text + tool-call args); in/cacheRead = context read.
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage }
@@ -369,6 +369,9 @@ const APP_UI_SYSTEM_APPEND = [
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.
+// The CLI's note after the model reads an image ("[Image: original 2856x1280, displayed at ...]") is
+// an isMeta user row. Never shown live; on reload it rendered as a user bubble.
+const IMAGE_NOTE_RE = /^\[Image: original \d+x\d+/;
 const HIDDEN_STRIP = /\s*<(voice-mode|turn-context|title-request)>[\s\S]*?<\/\1>\s*/g;
 const TITLE_TAG = /<title>[\s\S]*?<\/title>\s*/i; // the conversation-title tag the first reply opens with
 // #endregion
@@ -712,8 +715,9 @@ export class Conversation {
     // The user is actively driving this conversation, so any auto-resume we had queued for it is
     // no longer wanted (this counts as the "easy cancel" for the default-on behaviour).
     try { cancelResume(this.id); } catch { /* */ }
+    const midTurn = this.running; // folded into the running turn by the SDK, not a turn of its own
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
-    this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
+    this.emit({ t: "user", text, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
@@ -1502,6 +1506,7 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
         }
       }
       const txt = textOfContent(c).replace(HIDDEN_STRIP, ""); // hide the appended voice-mode directive
+      if (o.isMeta && IMAGE_NOTE_RE.test(txt.trim())) continue;
       const sk = skillLoadName(txt);
       if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
       else if (o.isMeta && RESUME_PROMPT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: "Resumed after a service restart. The interrupted turn was picked up automatically." });
@@ -1552,6 +1557,14 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
         // output/thinking = cumulative turn totals so the footer matches what was shown live.
         out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output: turnOut, thinking: turnThink, cacheCreate, cacheRead, context, total: context + turnOut, costUsd: 0, durationMs } });
       }
+    } else if (o.type === "attachment" && o.attachment?.type === "queued_command") {
+      // A message sent while a turn was running. The CLI does not write it as a user row: it is an
+      // attachment injected into the running turn at this point, so it rendered nowhere on reload.
+      // Not a turn boundary (the accumulators keep running) and not an edit target (resolveEditPoints
+      // does not count it either), hence midTurn.
+      const a = o.attachment;
+      const txt = textOfContent(a.prompt).replace(HIDDEN_STRIP, "");
+      if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt, midTurn: true });
     } else if (o.type === "system" && o.subtype === "task_notification" && o.tool_use_id) {
       out.push({ t: "agent_done", id: String(o.tool_use_id), status: o.status || "completed", summary: o.summary ? String(o.summary).slice(0, 400) : undefined });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
@@ -1586,7 +1599,7 @@ export async function resolveEditPoints(path: string, userIndex: number): Promis
       const hasToolResult = Array.isArray(c) && c.some((b: any) => b?.type === "tool_result");
       if (!hasToolResult) {
         const t = textOfContent(c).replace(HIDDEN_STRIP, "");
-        if (t.trim() && !t.startsWith("<") && !skillLoadName(t)) { isPrompt = true; ptext = t; }
+        if (t.trim() && !t.startsWith("<") && !skillLoadName(t) && !(o.isMeta && (IMAGE_NOTE_RE.test(t.trim()) || RESUME_PROMPT_RE.test(t.trim())))) { isPrompt = true; ptext = t; }
       }
     }
     entries.push({ uuid: o.uuid, isPrompt, isSidechain, text: ptext });

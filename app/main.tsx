@@ -91,7 +91,7 @@ type AppEvent =
   | { t: "compacting"; active: boolean; _seq?: number }
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
-  | { t: "user"; text: string; cid?: string; _seq?: number }
+  | { t: "user"; text: string; cid?: string; midTurn?: boolean; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
   | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string; _seq?: number }
   | { t: "busy"; busy: boolean; _seq?: number }
@@ -113,7 +113,7 @@ type SubscriptionWin = { utilization: number | null; resetsAt: string | null };
 type Subscription = { available: boolean; subscription: string | null; fiveHour: SubscriptionWin | null; sevenDay: SubscriptionWin | null } | null;
 
 type Item =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; midTurn?: boolean }
   | { kind: "assistant"; text: string; usage?: TurnUsage; bid?: string }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }; done?: "completed" | "failed" | "stopped" }
@@ -356,7 +356,7 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       // A loaded skill arrives as a user message that dumps the whole skill file. Render a compact card.
       const sk = skillLoadName(e.text);
       if (sk) return [...items, { kind: "notice", noticeKind: "skill", text: sk }];
-      return [...items, { kind: "user", text: sanitizeUserText(e.text) }];
+      return [...items, { kind: "user", text: sanitizeUserText(e.text), ...(e.midTurn ? { midTurn: true } : {}) }];
     }
     case "text":
     case "text_delta": {
@@ -622,7 +622,7 @@ class ConvStore {
   // now (so the send is visibly acknowledged) but pinned BELOW the reply that is still streaming
   // instead of splitting it. doEdit passes false, because a rewind cancels the running turn and its rerun
   // must appear under the edited bubble, not above it.
-  addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
+  addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text, ...(this.busy ? { midTurn: true } : {}) }); this.busy = true; this.setSendState("sending"); this.touch(); }
   // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
   // below), and restore the pre-edit view if the server rejects the edit.
   truncateFrom(index: number) { this.items = this.items.slice(0, Math.max(0, index)); this.pendingEcho = []; this.touch(); }
@@ -2371,7 +2371,8 @@ function App() {
     if (!s || !realId) return "This chat hasn't started on the server yet, so there's no turn to rewind. Cancel the edit to send it as a new message.";
     if (typeof navigator !== "undefined" && !navigator.onLine) return "You're offline. An edit rewinds the conversation on the server, so unlike a normal message it can't be queued. It will work once you're back online.";
     // 0-based ordinal among user turns up to the edited item — matches the server's user-turn count.
-    let uindex = -1; for (let k = 0; k <= ed.i && k < s.items.length; k++) if (s.items[k].kind === "user") uindex++;
+    // A mid-turn message is not a turn on the server, so it is not counted (and cannot be edited).
+    let uindex = -1; for (let k = 0; k <= ed.i && k < s.items.length; k++) { const x = s.items[k]; if (x.kind === "user" && !x.midTurn) uindex++; }
     if (uindex < 0) return "Couldn't work out which turn to rewind to. Reload the conversation and try again.";
     stickBottom.current = true; setAtBottom(true);
     const snapshot = s.items;
@@ -2973,7 +2974,7 @@ function App() {
               }}>Read aloud</button>
             )}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
-            {msgMenu.kind === "user" && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
+            {msgMenu.kind === "user" && !(activeStore?.items[msgMenu.i] as { midTurn?: boolean } | undefined)?.midTurn && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
           </div>
         </>
       )}
