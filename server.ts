@@ -296,44 +296,57 @@ function buildLeaderboard() {
     return w != null ? w : rawOut; // no model breakdown -> count raw output at weight 1
   };
   const users: any[] = [];
-  for (const { user } of qUsers.all() as any[]) {
+  // A "<user>_work" row holds tokens run on an unbilled box login (transcripts.ts accountRouter).
+  // The card shows the person's whole usage, so it folds into the user's own card; byMonth (the
+  // split, the monthly chart) counts only the billed row.
+  const present = new Set((qUsers.all() as any[]).map((r) => r.user as string));
+  const bases = [...new Set([...present].map((u) => (isWorkUser(u) ? u.slice(0, -WORK_SUFFIX.length) : u)))];
+  for (const user of bases) {
     const hours = new Map<string, any>();
-    for (const r of qHours.all(user) as any[]) {
-      hours.set(r.hour_utc, { total: r.total, output: r.output });
-      const mk = r.hour_utc.slice(0, 7);
-      (byMonth[mk] ??= {})[user] = (byMonth[mk][user] || 0) + r.output;
+    let outTotal = 0, tokTotal = 0, sessions = 0, last: string | null = null, monthOutput = 0, monthWeighted = 0;
+    const models = new Set<string>();
+    for (const row of [user, user + WORK_SUFFIX]) {
+      if (!present.has(row)) continue;
+      const billed = row === user;
+      let rowMonth = 0;
+      for (const r of qHours.all(row) as any[]) {
+        const h = hours.get(r.hour_utc) || { total: 0, output: 0 };
+        h.total += r.total; h.output += r.output;
+        hours.set(r.hour_utc, h);
+        const mk = r.hour_utc.slice(0, 7);
+        if (billed) (byMonth[mk] ??= {})[user] = (byMonth[mk][user] || 0) + r.output;
+        if (mk === monthPrefix) rowMonth += r.output;
+      }
+      const cum = (qCum.get(row) as any) || { output: 0, total: 0 };
+      const meta = (qMeta.get(row) as any) || {};
+      outTotal += cum.output; tokTotal += cum.total; sessions += meta.sessions || 0;
+      for (const m of JSON.parse(meta.models || "[]")) if (!String(m).startsWith("<")) models.add(m);
+      if (meta.last_activity && (!last || Date.parse(meta.last_activity) > Date.parse(last))) last = meta.last_activity;
+      monthOutput += rowMonth;
+      monthWeighted += weightedFor(monthPrefix, row, rowMonth);
     }
-    const cum = (qCum.get(user) as any) || { output: 0, total: 0 };
-    const meta = (qMeta.get(user) as any) || {};
-    const last = meta.last_activity || null;
     let active = false;
     if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
-    let monthOutput = 0;
-    for (const [hk, b] of hours) if (hk.slice(0, 7) === monthPrefix) monthOutput += b.output;
-    // A "<user>_work" row is tokens run on an unbilled box login (transcripts.ts accountRouter):
-    // shown on the board, kept out of the split like an external peer.
-    const work = isWorkUser(user);
-    const base = work ? user.slice(0, -WORK_SUFFIX.length) : user;
     users.push({
       user,
-      name: (cfg.names?.[base] || titleCase(base)) + (work ? " (work)" : ""),
-      host: !work && (cfg.hosts || []).includes(user),
-      work,
+      name: cfg.names?.[user] || titleCase(user),
+      host: (cfg.hosts || []).includes(user),
+      billed: present.has(user),
       output_5h: rolling(hours, "output", now),
-      output_total: cum.output,
-      tokens_total: cum.total,
-      sessions: meta.sessions || 0,
-      models: JSON.parse(meta.models || "[]").filter((m: string) => !String(m).startsWith("<")),
+      output_total: outTotal,
+      tokens_total: tokTotal,
+      sessions,
+      models: [...models].sort(),
       last_used: last,
       active,
       spark: sparkSeries(hours, now, SPARK_HOURS),
       hourly: sparkSeries(hours, now, HOURLY_HOURS),
       month_output: monthOutput,
-      month_weighted: Math.round(weightedFor(monthPrefix, user, monthOutput)),
+      month_weighted: Math.round(monthWeighted),
     });
   }
 
-  const allUsers = users.filter((u) => !u.work).map((u) => u.user);
+  const allUsers = users.filter((u) => u.billed).map((u) => u.user);
   const nameOf = Object.fromEntries(users.map((u) => [u.user, u.name]));
   const months: any[] = [];
   for (const mk of Object.keys(byMonth).sort()) {
@@ -359,7 +372,7 @@ function buildLeaderboard() {
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
   const curCents = splitCents(cur, subUsdFor(monthPrefix) * 100);
   for (const u of users) {
-    if (u.work) { u.share_usd = null; u.month_pct = null; continue; }
+    if (!u.billed) { u.share_usd = null; u.month_pct = null; continue; }
     u.share_usd = curCents[u.user] / 100;
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0; // share of WEIGHTED output
   }
