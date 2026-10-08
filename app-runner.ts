@@ -1640,11 +1640,19 @@ let ctrlReady: Promise<void> | null = null;
 let subCache: SubscriptionUsage | null = null;
 let subRefreshing = false;
 
+// The limits shown are those of the personal Max subscription the guests, the coach and stonkbot
+// draw on, not whatever account the box's CLI login is (Filip signed it in to his work account on
+// 2026-10-08 and the bars jumped to that account). The guests' setup token is inference-only and
+// cannot read usage, so the personal account has its own full login in a separate config dir
+// (`CLAUDE_CONFIG_DIR=~/.claude-usage claude`, done by hand once). No login there -> the box login.
+const SUB_CONFIG_DIR = process.env.CT_USAGE_CONFIG_DIR || "/home/filip/.claude-usage";
+
 function startControlQuery() {
   try { mkdirSync(SUB_CWD, { recursive: true }); } catch { /* */ }
   let release = () => {};
   const gen = (async function* (): AsyncGenerator<SDKUserMessage> { await new Promise<void>((r) => { release = r; }); })();
-  const q: any = query({ prompt: gen, options: { cwd: SUB_CWD, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
+  const env = existsSync(join(SUB_CONFIG_DIR, ".credentials.json")) ? { ...process.env, CLAUDE_CONFIG_DIR: SUB_CONFIG_DIR } : undefined;
+  const q: any = query({ prompt: gen, options: { cwd: SUB_CWD, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true, ...(env ? { env } : {}) } });
   ctrlQuery = q;
   ctrlReady = new Promise<void>((resolve) => {
     (async () => {
