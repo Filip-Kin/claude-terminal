@@ -6,6 +6,7 @@
 // Config-driven via config.json. Reads usage.db (written by collector.ts); never scrapes
 // transcripts itself. HOME-relative for the per-instance terminal bits (tab-registry, settings,
 // tmux), so the same binary runs for the host owner and inside each guest container.
+import { isWorkUser, WORK_SUFFIX } from "./transcripts.ts";
 import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -309,10 +310,15 @@ function buildLeaderboard() {
     if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
     let monthOutput = 0;
     for (const [hk, b] of hours) if (hk.slice(0, 7) === monthPrefix) monthOutput += b.output;
+    // A "<user>_work" row is tokens run on an unbilled box login (transcripts.ts accountRouter):
+    // shown on the board, kept out of the split like an external peer.
+    const work = isWorkUser(user);
+    const base = work ? user.slice(0, -WORK_SUFFIX.length) : user;
     users.push({
       user,
-      name: cfg.names?.[user] || titleCase(user),
-      host: (cfg.hosts || []).includes(user),
+      name: (cfg.names?.[base] || titleCase(base)) + (work ? " (work)" : ""),
+      host: !work && (cfg.hosts || []).includes(user),
+      work,
       output_5h: rolling(hours, "output", now),
       output_total: cum.output,
       tokens_total: cum.total,
@@ -327,7 +333,7 @@ function buildLeaderboard() {
     });
   }
 
-  const allUsers = users.map((u) => u.user);
+  const allUsers = users.filter((u) => !u.work).map((u) => u.user);
   const nameOf = Object.fromEntries(users.map((u) => [u.user, u.name]));
   const months: any[] = [];
   for (const mk of Object.keys(byMonth).sort()) {
@@ -353,6 +359,7 @@ function buildLeaderboard() {
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
   const curCents = splitCents(cur, subUsdFor(monthPrefix) * 100);
   for (const u of users) {
+    if (u.work) { u.share_usd = null; u.month_pct = null; continue; }
     u.share_usd = curCents[u.user] / 100;
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0; // share of WEIGHTED output
   }
@@ -773,6 +780,7 @@ const appCtx: AppCtx = {
       const now = Date.now();
       let n = 0;
       for (const { user } of qUsers.all() as any[]) {
+        if (isWorkUser(user)) continue; // another plan: not contending for the shared limit
         const meta = qMeta.get(user) as any;
         const t = meta?.last_activity ? Date.parse(meta.last_activity) : NaN;
         if (!isNaN(t) && now - t <= ACTIVE_MS) n++;

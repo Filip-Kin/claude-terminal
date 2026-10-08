@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS offsets (
   offset INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (user, path)
 );
+-- Which account the box's own CLI login was at each change (see transcripts.ts accountUser).
+-- One row per switch, written by the collector when ~/.claude.json names a different account.
+CREATE TABLE IF NOT EXISTS login_periods (
+  since_ms INTEGER PRIMARY KEY,
+  email    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (
   user          TEXT PRIMARY KEY,
   sessions      INTEGER NOT NULL DEFAULT 0,

@@ -17,7 +17,7 @@
 // must never disturb token collection.
 import { openSync, fstatSync, readSync, closeSync } from "node:fs";
 import { openDb } from "./db.ts";
-import { minuteKey, trackedUsers, userTranscripts, type CollectorConfig } from "./transcripts.ts";
+import { minuteKey, trackedUsers, userTranscripts, accountRouter, type CollectorConfig } from "./transcripts.ts";
 
 // IF NOT EXISTS so this ships on the next collector tick with no migration and no service
 // restart, the same way subscription_samples did.
@@ -70,11 +70,13 @@ export async function sampleModelUsage(configPath: string): Promise<void> {
          cache_read=cache_read+excluded.cache_read, total=total+excluded.total`,
     );
 
+    // Same per-account routing as collector.ts, so the weighted split sees the same rows.
+    const routeOf = accountRouter(cfg, db as any);
     for (const user of trackedUsers(cfg)) {
       const offsets = new Map<string, number>();
       for (const r of getOffsets.all(user) as any[]) offsets.set(r.path, r.offset);
 
-      // key: minute + tab + model, so a model id containing a space cannot split wrong
+      // key: row + tab + minute + tab + model, so a model id containing a space cannot split wrong
       const delta = new Map<string, Bucket>();
       const offsetUpdates = new Map<string, number>();
 
@@ -107,7 +109,7 @@ export async function sampleModelUsage(configPath: string): Promise<void> {
             const usage = rec.message?.usage;
             if (!usage || typeof usage !== "object") continue;
             const model = String(rec.message?.model || "unknown");
-            const key = minuteKey(rec.timestamp || "") + "\t" + model;
+            const key = routeOf(user, f, rec.timestamp || "") + "\t" + minuteKey(rec.timestamp || "") + "\t" + model;
             const b = delta.get(key) || zero();
             let lineTotal = 0;
             for (const [name, src] of Object.entries(TOKEN_KEYS)) {
@@ -127,10 +129,9 @@ export async function sampleModelUsage(configPath: string): Promise<void> {
 
       const tx = db.transaction(() => {
         for (const [key, b] of delta) {
-          const tab = key.indexOf("\t");
-          const mk = key.slice(0, tab);
-          const model = key.slice(tab + 1);
-          if (b.total) upBucket.run(user, mk, model, b.input, b.output, b.cache_creation, b.cache_read, b.total);
+          const t1 = key.indexOf("\t"), t2 = key.indexOf("\t", t1 + 1);
+          const row = key.slice(0, t1), mk = key.slice(t1 + 1, t2), model = key.slice(t2 + 1);
+          if (b.total) upBucket.run(row, mk, model, b.input, b.output, b.cache_creation, b.cache_read, b.total);
         }
         for (const [p, off] of offsetUpdates) setOffset.run(user, p, off);
       });

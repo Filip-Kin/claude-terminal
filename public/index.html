@@ -274,7 +274,7 @@ function mainOpts(d){
 
 // External peers are excluded here: this chart pairs with the money split, and peers
 // are not in the split. Their activity still shows on the hourly chart and their card.
-const splitUsers = (d) => d.users.filter(u => !u.external);
+const splitUsers = (d) => d.users.filter(u => !u.external && !u.work);
 // The early months (Dec 2025 through May 2026) are sparse and gappy, so drop them from this
 // chart. Keys are "YYYY-MM", so a plain string compare is enough. June 2026 onward only.
 const MONTH_CUTOFF = "2026-06";
@@ -383,6 +383,7 @@ function build(d){
         <span class="swatch" style="background:${c}"></span>
         <span class="name">${u.name}</span>
         ${u.external ? `<span class="badge external">external</span>`
+          : u.work ? '<span class="badge external">work</span>'
           : u.host ? '<span class="badge host">host</span>' : '<span class="badge">sandbox</span>'}
         ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>

@@ -8,10 +8,10 @@
 // read every configured transcript dir (root, for Filip's 0700 guest dirs).
 //
 // Usage: bun run collector.ts [configPath]
-import { openSync, fstatSync, readSync, closeSync } from "node:fs";
+import { openSync, fstatSync, readSync, closeSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { openDb } from "./db.ts";
-import { hourKey, trackedUsers as listUsers, userTranscripts } from "./transcripts.ts";
+import { hourKey, trackedUsers as listUsers, userTranscripts, recordLogin, accountRouter } from "./transcripts.ts";
 import { sampleModelUsage } from "./model-collector.ts";
 import { sampleCloudCost } from "./cost-collector.ts";
 import { sampleExternalPeers } from "./external-collector.ts";
@@ -33,6 +33,11 @@ const TOKEN_KEYS: Record<string, string> = {
 const trackedUsers = listUsers(cfg);
 
 const db = openDb(DB_PATH);
+recordLogin(cfg, db as any);
+const routeOf = accountRouter(cfg, db as any);
+// Start of the first period on an unbilled account: a work row's session count is the number of
+// the user's box-login transcripts written since then.
+const firstUnbilled = (db.query("SELECT MIN(since_ms) AS t FROM login_periods WHERE email != ?").get(cfg.boxLogin?.billedEmail ?? "") as any)?.t ?? null;
 
 const getOffsets = db.prepare("SELECT path, offset FROM offsets WHERE user = ?");
 const getMeta = db.prepare("SELECT models FROM meta WHERE user = ?");
@@ -52,17 +57,26 @@ const setMeta = db.prepare(
      last_activity=COALESCE(excluded.last_activity, meta.last_activity)`,
 );
 
+// Per row (the user, or "<user>_work" for tokens run on an unbilled box login): token deltas,
+// hour buckets and models. Offsets stay per user and per file, so routing never re-reads a byte.
+type Acc = { cum: { input: number; output: number; cache_creation: number; cache_read: number; total: number }; hours: Map<string, { total: number; output: number }>; models: Set<string>; changed: boolean };
+function accFor(accs: Map<string, Acc>, key: string): Acc {
+  let a = accs.get(key);
+  if (!a) {
+    const metaRow = getMeta.get(key) as any;
+    a = { cum: { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 }, hours: new Map(), models: new Set(metaRow ? JSON.parse(metaRow.models || "[]") : []), changed: false };
+    accs.set(key, a);
+  }
+  return a;
+}
+
 function collectUser(user: string): void {
   const offsets = new Map<string, number>();
   for (const r of getOffsets.all(user) as any[]) offsets.set(r.path, r.offset);
 
-  const metaRow = getMeta.get(user) as any;
-  const models = new Set<string>(metaRow ? JSON.parse(metaRow.models || "[]") : []);
-
-  const cumDelta = { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 };
-  const hourDelta = new Map<string, { total: number; output: number }>();
+  const accs = new Map<string, Acc>();
+  accFor(accs, user); // the user's own row always gets its meta refreshed
   const offsetUpdates = new Map<string, number>();
-  const changed = new Set<string>();
 
   // One flat list per user: every project dir walked, other tracked users' nested dirs
   // removed. See transcripts.ts.
@@ -97,21 +111,22 @@ function collectUser(user: string): void {
         }
         const usage = rec.message?.usage;
         if (!usage || typeof usage !== "object") continue;
+        const acc = accFor(accs, routeOf(user, f, rec.timestamp || ""));
         const hk = hourKey(rec.timestamp || "");
-        const b = hourDelta.get(hk) || { total: 0, output: 0 };
+        const b = acc.hours.get(hk) || { total: 0, output: 0 };
         let lineTotal = 0;
         for (const [name, src] of Object.entries(TOKEN_KEYS)) {
           const v = usage[src];
           if (typeof v !== "number") continue;
-          (cumDelta as any)[name] += v;
+          (acc.cum as any)[name] += v;
           lineTotal += v;
           if (name === "output") b.output += v;
         }
-        cumDelta.total += lineTotal;
+        acc.cum.total += lineTotal;
         b.total += lineTotal;
-        hourDelta.set(hk, b);
-        if (lineTotal) changed.add(hk);
-        if (rec.message?.model) models.add(rec.message.model);
+        acc.hours.set(hk, b);
+        if (lineTotal) acc.changed = true;
+        if (rec.message?.model) acc.models.add(rec.message.model);
       }
       offsetUpdates.set(f, start + consumed.length);
     } finally {
@@ -120,12 +135,22 @@ function collectUser(user: string): void {
   }
 
   const nowIso = new Date().toISOString().replace(/\.\d+Z$/, "+00:00");
+  const workSessions = () => {
+    if (firstUnbilled == null) return 0;
+    const root = cfg.dataDir.endsWith("/") ? cfg.dataDir : cfg.dataDir + "/";
+    let n = 0;
+    for (const f of files) { try { if (f.startsWith(root) && statSync(f).mtimeMs >= firstUnbilled) n++; } catch { /* */ } }
+    return n;
+  };
   const tx = db.transaction(() => {
-    for (const [hk, b] of hourDelta) if (b.total || b.output) upHour.run(user, hk, b.total, b.output);
-    if (cumDelta.total)
-      upCum.run(user, cumDelta.input, cumDelta.output, cumDelta.cache_creation, cumDelta.cache_read, cumDelta.total);
+    for (const [key, a] of accs) {
+      for (const [hk, b] of a.hours) if (b.total || b.output) upHour.run(key, hk, b.total, b.output);
+      const c = a.cum;
+      if (c.total) upCum.run(key, c.input, c.output, c.cache_creation, c.cache_read, c.total);
+      const n = key === user ? sessions : workSessions();
+      if (key === user || a.changed) setMeta.run(key, n, JSON.stringify([...a.models].sort()), a.changed ? nowIso : null);
+    }
     for (const [p, off] of offsetUpdates) setOffset.run(user, p, off);
-    setMeta.run(user, sessions, JSON.stringify([...models].sort()), changed.size ? nowIso : null);
   });
   tx();
 }

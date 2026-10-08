@@ -13,6 +13,7 @@
 //
 // Non-fatal by contract: a stopped service / missing subscription data must never disturb token
 // collection. No-ops quietly when the snapshot is unavailable.
+import { isWorkUser } from "./transcripts.ts";
 import { openDb } from "./db.ts";
 
 // Kept in a sibling table inside usage.db. IF NOT EXISTS so the collector creates it on its
@@ -148,12 +149,13 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
       .query(
         `SELECT COALESCE(SUM(output),0) AS output, COALESCE(SUM(total),0) AS total,
                 COALESCE(SUM(input),0) AS input, COALESCE(SUM(cache_creation),0) AS cacheCreation,
-                COALESCE(SUM(cache_read),0) AS cacheRead FROM cumulative`,
+                COALESCE(SUM(cache_read),0) AS cacheRead FROM cumulative WHERE user NOT LIKE '%\\_work' ESCAPE '\\'`,
       )
       .get() as { output: number; total: number; input: number; cacheCreation: number; cacheRead: number };
 
     const perUser: Record<string, number> = {};
     for (const r of db.query("SELECT user, output FROM cumulative").all() as any[]) {
+      if (isWorkUser(r.user)) continue; // tokens on another plan never touch this limit
       perUser[r.user] = r.output;
     }
 
@@ -165,7 +167,7 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
     const perModelTotal: Record<string, number> = {};
     try {
       for (const r of db
-        .query("SELECT model, SUM(output) AS output, SUM(total) AS total FROM model_usage GROUP BY model")
+        .query("SELECT model, SUM(output) AS output, SUM(total) AS total FROM model_usage WHERE user NOT LIKE '%\\_work' ESCAPE '\\' GROUP BY model")
         .all() as any[]) {
         perModelOutput[r.model] = r.output;
         perModelTotal[r.model] = r.total;
@@ -178,7 +180,8 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
     // is refreshed earlier in this same collector run, so it reflects the current minute.
     const cutoff = Date.now() - activeWindowMs;
     let active = 0;
-    for (const r of db.query("SELECT last_activity FROM meta").all() as any[]) {
+    for (const r of db.query("SELECT user, last_activity FROM meta").all() as any[]) {
+      if (isWorkUser(r.user)) continue;
       const t = r.last_activity ? Date.parse(r.last_activity) : NaN;
       if (isFinite(t) && t >= cutoff) active++;
     }

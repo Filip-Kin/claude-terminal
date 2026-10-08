@@ -72,5 +72,6 @@
   },
   "voice": true,
   "sttUrl": "http://127.0.0.1:7801",
-  "ttsUrl": "http://127.0.0.1:7802"
+  "ttsUrl": "http://127.0.0.1:7802",
+  "boxLogin": { "file": "/home/you/.claude.json", "billedEmail": "you@example.com" }
 }
