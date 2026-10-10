@@ -57,21 +57,33 @@ const saveDraft = (id: string | null, v: string) => { try { if (v.trim()) localS
 // Save image as) instead of our text menu — the images are served inline, so native save works.
 const isImageTarget = (t: EventTarget | null) => (t as HTMLElement | null)?.tagName === "IMG";
 
-function longPressBind(open: (x: number, y: number) => void) {
+// The pressed element is passed along so a menu can offer what was under the finger (a link, code).
+function longPressBind(open: (x: number, y: number, target: Element | null) => void) {
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let sx = 0, sy = 0, fired = false, firedAt = 0;
+  let sx = 0, sy = 0, fired = false, firedAt = 0, st: Element | null = null;
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   return {
-    onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); open(e.clientX, e.clientY); },
+    onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); open(e.clientX, e.clientY, e.target as Element); },
     // 600ms hold, cancelled by any real movement (a scroll or a normal tap never opens the menu). On
     // an image the hold is left to the browser so its native "save image" sheet can open.
-    onTouchStart: (e: React.TouchEvent) => { if (isImageTarget(e.target)) return; const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy); }, 600); },
+    onTouchStart: (e: React.TouchEvent) => { if (isImageTarget(e.target)) return; const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; st = e.target as Element; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy, st); }, 600); },
     onTouchMove: (e: React.TouchEvent) => { const t = e.touches[0]; if (t && (Math.abs(t.clientX - sx) > 8 || Math.abs(t.clientY - sy) > 8)) clear(); },
     onTouchEnd: (e: React.TouchEvent) => { clear(); if (fired) e.preventDefault(); },
     onTouchCancel: clear,
     // Swallow the click the browser fires after a long-press so the row doesn't ALSO navigate/open.
     onClickCapture: (e: React.MouseEvent) => { if (fired || Date.now() - firedAt < 700) { e.preventDefault(); e.stopPropagation(); fired = false; } },
   };
+}
+
+// What a long-press / right-click landed on inside a message: a link (its absolute URL) and/or code
+// (an inline code span, or the whole block it sits in), so the menu can copy just that.
+function pressedExtras(target: Element | null): { link?: string; code?: string } {
+  const el = target instanceof Element ? target : null;
+  if (!el) return {};
+  const a = el.closest("a") as HTMLAnchorElement | null;
+  const pre = el.closest("pre");
+  const code = pre ? (pre.querySelector("code") || pre) : el.closest("code");
+  return { link: a?.href || undefined, code: code?.textContent ?? undefined };
 }
 
 // #region types
@@ -1164,7 +1176,7 @@ function UserAttachments({ images, files, convId }: { images: string[]; files: s
   );
 }
 
-function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy }: { items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
+function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy }: { items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number, extra?: { link?: string; code?: string }) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
   // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
   // audio actually plays (Kokoro TTS can take a moment), then a subtle "playing" state until it ends.
@@ -1183,8 +1195,8 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   // triggers our menu instead of the OS text-selection popup.
   const menuBind = (text: string, kind: "user" | "assistant"): Record<string, unknown> => {
     if (!onMenu) return {};
-    if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y) => onMenu(x, y, text, kind, i)) };
-    return { onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
+    if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y, t) => onMenu(x, y, text, kind, i, pressedExtras(t))) };
+    return { onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i, pressedExtras(e.target as Element)); } };
   };
   if (it.kind === "user") {
     // A message from another Claude session -> a tidy card, not the raw XML tag.
@@ -1385,7 +1397,7 @@ function App() {
   const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
   const [readTick, setReadTick] = useState(0); // bump to re-render unread dots after marking read
-  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant"; i: number } | null>(null);
+  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant"; i: number; link?: string; code?: string } | null>(null);
   // Editing a past user turn: its item index + original text. Set by the message "Edit" action;
   // on submit the turn is rewound-and-rerun (full rollback) instead of appended as a new turn.
   const [editing, setEditing] = useState<{ i: number; orig: string } | null>(null);
@@ -2354,8 +2366,12 @@ function App() {
   const stop = async () => { const s = activeStoreRef.current; if (!s) return; s.setBusy(false); await api.interrupt(s.id); };
 
   // #region context menus (long-press / right-click): message copy+edit, conversation rename+delete
-  const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant", i: number) => setMsgMenu({ x, y, text, kind, i }), []);
-  const copyText = (t: string) => { try { void navigator.clipboard?.writeText(t); } catch { /* */ } };
+  const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant", i: number, extra?: { link?: string; code?: string }) => setMsgMenu({ x, y, text, kind, i, ...extra }), []);
+  // Clipboard API first; the hidden-textarea fallback covers browsers/contexts where it is missing.
+  const copyText = (t: string) => {
+    const fallback = () => { try { const ta = document.createElement("textarea"); ta.value = t; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); } catch { /* */ } };
+    try { if (navigator.clipboard?.writeText) navigator.clipboard.writeText(t).catch(fallback); else fallback(); } catch { fallback(); }
+  };
   // Enter edit mode for a past user turn: prefill the composer and remember which turn, so submit
   // rewinds-and-reruns from there (see doEdit) instead of appending a new turn.
   const startEdit = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
@@ -2958,7 +2974,7 @@ function App() {
       {msgMenu && (
         <>
           <div className="ctx-scrim" onClick={() => setMsgMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMsgMenu(null); }} />
-          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 160), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
+          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 260), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
             {speaking ? (
               <button onClick={() => { stopReadAloud(); setReading(null); setMsgMenu(null); }}>Stop reading</button>
             ) : (
@@ -2973,6 +2989,9 @@ function App() {
                 });
               }}>Read aloud</button>
             )}
+            {msgMenu.link && <button onClick={() => { copyText(msgMenu.link!); setMsgMenu(null); }}>Copy link</button>}
+            {msgMenu.link && <button onClick={() => { window.open(msgMenu.link!, "_blank", "noopener"); setMsgMenu(null); }}>Open link</button>}
+            {msgMenu.code !== undefined && <button onClick={() => { copyText(msgMenu.code!); setMsgMenu(null); }}>Copy code</button>}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
             {msgMenu.kind === "user" && !(activeStore?.items[msgMenu.i] as { midTurn?: boolean } | undefined)?.midTurn && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
           </div>
