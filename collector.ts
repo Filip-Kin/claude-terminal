@@ -4,7 +4,7 @@
 // exclusion), config-driven, with ALL Home Assistant (MQTT + recorder statistics)
 // removed. Adds only NEW bytes to existing buckets, so re-runs never double-count.
 //
-// Reads config.json for: owner + dataDir + extraUsers. Must run as a user that can
+// Reads config.json for: owner + dataDir + extraUsers + guestsFile. Must run as a user that can
 // read every configured transcript dir (root, for Filip's 0700 guest dirs).
 //
 // Usage: bun run collector.ts [configPath]

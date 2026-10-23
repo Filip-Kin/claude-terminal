@@ -16,6 +16,9 @@
       "/path/to/another/.claude/projects"
     ]
   },
+  "guestsFile": "/path/to/guests.tsv",
+  "guestProjectsDir": "/path/to/guests/{user}/.claude/projects",
+  "guestsExclude": [],
   "names": {
     "me": "Me"
   },

@@ -69,7 +69,9 @@ Minimal `config.json`:
 | `usagePage` | serve the dashboard (default true) |
 | `subscriptionUsd` | monthly cost to split across users; `0`/omit disables the split feature |
 | `collectSeconds` | collector cadence hint (drive it from your timer) |
-| `extraUsers` | `{ name: [transcriptDir, ...] }` — extra tracked "users" (bots, agents, guests) |
+| `extraUsers` | `{ name: [transcriptDir, ...] }` — extra tracked "users" (bots, agents) |
+| `guestsFile` / `guestProjectsDir` | guest registry TSV (username in column 1, read live each run) and transcript dir with `{user}` for the name; every listed guest is tracked with no config edit |
+| `guestsExclude` | registry names not to track (test accounts) |
 | `names` / `hosts` / `colors` | display name, host-vs-sandbox badge, and fixed dot color per user |
 | `corsOrigins` | origins allowed to read the usage API cross-site (e.g. a homepage that lists sessions) |
 | `appName` / `appShort` | PWA name / short name (default "Claude Terminal" / "Claude") |

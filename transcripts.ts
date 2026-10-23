@@ -16,15 +16,40 @@ export interface CollectorConfig {
   // in to at the time; tokens run on any account but billedEmail go to a separate "<user>_work"
   // row that is shown but kept out of the subscription split.
   boxLogin?: { file: string; billedEmail: string };
+  // Sandboxed guests, read live from the guest registry (a TSV whose first column is the
+  // username, the same file the router reads) so a new guest is tracked from their first
+  // session without anyone editing this config. guestProjectsDir is the guest's transcript dir
+  // with {user} in place of the name. An extraUsers entry with the same name wins.
+  // guestsExclude lists registry names that are not real guests (an owner's test account).
+  guestsFile?: string;
+  guestProjectsDir?: string;
+  guestsExclude?: string[];
+}
+
+function userDirMap(cfg: CollectorConfig): Record<string, string[]> {
+  const map: Record<string, string[]> = {};
+  if (cfg.guestsFile && cfg.guestProjectsDir) {
+    let text = "";
+    try {
+      text = readFileSync(cfg.guestsFile, "utf8");
+    } catch {}
+    for (const line of text.split("\n")) {
+      const user = line.split("\t")[0].trim();
+      if (!user || user.startsWith("#") || user === cfg.owner) continue;
+      if ((cfg.guestsExclude || []).includes(user)) continue;
+      map[user] = [cfg.guestProjectsDir.replaceAll("{user}", user)];
+    }
+  }
+  return { ...map, ...(cfg.extraUsers || {}) };
 }
 
 export function trackedUsers(cfg: CollectorConfig): string[] {
-  return [cfg.owner, ...Object.keys(cfg.extraUsers || {})];
+  return [cfg.owner, ...Object.keys(userDirMap(cfg))];
 }
 
 export function projDirs(cfg: CollectorConfig, user: string): string[] {
   if (user === cfg.owner) return [cfg.dataDir];
-  return (cfg.extraUsers || {})[user] || [];
+  return userDirMap(cfg)[user] || [];
 }
 
 export function hourKey(iso: string): string {
