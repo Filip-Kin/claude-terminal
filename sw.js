@@ -186,7 +186,7 @@ async function warmConv(db, id) {
   if (!(cursor > 0)) return false;
   let data;
   try {
-    const r = await fetch(`/app/api/conversation/${encodeURIComponent(id)}?since=${cursor}`, { credentials: "same-origin" });
+    const r = await fetch(`/app/api/conversation/${encodeURIComponent(id)}?since=${cursor}&src=sw`, { credentials: "same-origin" });
     if (!r.ok) return false;
     data = await r.json();
   } catch { return false; } // offline or the session expired: cache just stays where it is

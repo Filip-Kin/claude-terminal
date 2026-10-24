@@ -1,6 +1,7 @@
 // Chat-app front-end. A Claude-app-style UI that drives Claude Code through the
 // headless Agent SDK via the /app* routes in app-server.ts. The terminal stays one
 // click away (the "Terminal" link -> "/").
+import "../bstats-client.js"; // first: patches EventSource/WebSocket/setInterval for battery diagnostics
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";

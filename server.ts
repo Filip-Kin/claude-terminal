@@ -19,6 +19,7 @@ import { appRoutes, type AppCtx } from "./app-server.ts";
 import { initSubscriptionResume } from "./subscription-resume.ts";
 import { startStatusPush, type StatusPayload } from "./status-push.ts";
 import { liveActivity } from "./app-runner.ts";
+import { initBstats, recordSample, countEvent, buildReport } from "./battery-stats.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -41,6 +42,7 @@ const UPLOAD_DIR = "/tmp/claude-paste";
 const MAX_BYTES = 20 * 1024 * 1024;
 const PUBLIC_DIR = join(import.meta.dir, "public");
 const overlayPath = join(import.meta.dir, "overlay.js");
+const bstatsClientPath = join(import.meta.dir, "bstats-client.js");
 
 // #region PWA + Web Push config
 const APP_NAME: string = cfg.appName || "Claude Terminal";
@@ -53,6 +55,7 @@ const VAPID_SUBJECT: string = cfg.vapidSubject || "mailto:admin@localhost";
 const STATE_DIR: string = cfg.stateDir || join(HOME, ".claude");
 const VAPID_FILE = join(STATE_DIR, "claude-terminal-vapid.json");
 const SUBS_FILE = join(STATE_DIR, "claude-terminal-push.json");
+try { initBstats(join(STATE_DIR, "claude-terminal-bstats.db")); } catch (e) { console.error("bstats init failed", e); }
 const PWA_DIR = join(import.meta.dir, "pwa");
 const swPath = join(import.meta.dir, "sw.js");
 const PWA_MIME: Record<string, string> = { ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
@@ -512,6 +515,7 @@ async function pushAll(payload: NotifPayload, opts?: { cadenceOnly?: boolean }):
     catch (e: any) { const c = e?.statusCode; if (c === 404 || c === 410) dead.push(s.endpoint); }
   }));
   for (const d of dead) removeSub(d);
+  countEvent(payload.tag === "ct-status" ? "push:status" : "push:other", targets.length);
   return { sent: targets.length, pruned: dead.length };
 }
 
@@ -867,7 +871,10 @@ const server = Bun.serve({
   // offline" on a perfectly good wired LAN (1058 stream opens in one hour). Well above the ping.
   idleTimeout: 120,
   async fetch(req) {
-    const path = new URL(req.url).pathname;
+    const url = new URL(req.url);
+    const path = url.pathname;
+    // Battery diagnostics: the service worker tags its background delta pulls with src=sw.
+    if (url.searchParams.get("src") === "sw") countEvent("sw:delta");
 
     // Chat-app front-end (/app*). Returns null for non-app paths so the rest still matches.
     const appRes = await appRoutes(req, path, appCtx);
@@ -933,8 +940,21 @@ const server = Bun.serve({
     // #endregion
 
     // #region terminal sidecar (owner-gated where noted)
+    // Battery diagnostics (battery-stats.ts). The beacon carries the owner's cookie like any request.
+    if (req.method === "POST" && path === "/bstats") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      try { recordSample(await req.json()); } catch { /* malformed beacon */ }
+      return new Response(null, { status: 204 });
+    }
+    if (req.method === "GET" && path === "/bstats/report") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      const hours = Math.min(336, Math.max(1, Number(url.searchParams.get("hours")) || 24));
+      return Response.json(buildReport(hours), { headers: { "Cache-Control": "no-store" } });
+    }
     if (req.method === "GET" && path === "/overlay.js") {
-      return new Response(Bun.file(overlayPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" } });
+      // The counters must patch WebSocket before the overlay's own patch captures ttyd's socket.
+      const js = (await Bun.file(bstatsClientPath).text()) + "\n" + (await Bun.file(overlayPath).text());
+      return new Response(js, { headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" } });
     }
 
     // #region PWA (installable app) — manifest, service worker, icons. Ungated
