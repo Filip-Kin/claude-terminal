@@ -1394,6 +1394,7 @@ function App() {
   const [limitToast, setLimitToast] = useState<{ left: number; resetIn: string; n: number } | null>(null);
   const limitDismissed = useRef(false);
   const [statuses, setStatuses] = useState<Record<string, { busy: boolean; waiting: boolean }>>({});
+  const prevStatusesRef = useRef<Record<string, { busy: boolean; waiting: boolean }>>({});
   const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
   const [readTick, setReadTick] = useState(0); // bump to re-render unread dots after marking read
@@ -1689,6 +1690,10 @@ function App() {
             if (!/^[A-Za-z0-9-]{20,}$/.test(id) || known.has(id) || seenConvIds.current.has(id)) continue;
             seenConvIds.current.add(id); fresh = true;
           }
+          // A turn finishing (busy -> idle) changes that chat's place in the list, on whichever device ran it.
+          const prev = prevStatusesRef.current;
+          for (const [id, st] of Object.entries<any>(d?.statuses || {})) if (prev[id]?.busy && !st?.busy) fresh = true;
+          prevStatusesRef.current = d?.statuses || {};
           if (fresh) refreshConvs();
         })
         .catch(() => { netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
@@ -2074,7 +2079,10 @@ function App() {
   // Open a conversation: point the view at its store, paint instantly from what we already have (memory
   // -> cache), then reconcile from the network once and connect if it's live. The store holds its items
   // continuously, so a switch is a pointer change — no reconnect, no re-fetch when it's already in memory.
-  const loadConv = useCallback(async (id: string, highlight?: string) => {
+  // `resync`: a same-conversation catch-up (coming back to the app). Fetch what this device missed
+  // and reconnect, without the side effects of OPENING a chat (drawer, search, read-aloud, spinner).
+  const loadConv = useCallback(async (id: string, highlight?: string, opts?: { resync?: boolean }) => {
+    const resync = !!opts?.resync && activeIdRef.current === id;
     activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
     setEditing(null); setEditError(null); // a stale edit target from another conversation must not carry over
     const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
@@ -2082,10 +2090,12 @@ function App() {
     setActiveStore(s); activeStoreRef.current = s;
     activeIdRef.current = id;
     if (switching) setInput(loadDraft(id)); // swap the composer to this conversation's saved draft
-    setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
-    stopReadAloud(); setReading(null); // don't keep reading a message from the conversation you just left
-    setDrawer(false);
-    history.replaceState(null, "", `/app?c=${id}`);
+    if (!resync) {
+      setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
+      stopReadAloud(); setReading(null); // don't keep reading a message from the conversation you just left
+      setDrawer(false);
+      history.replaceState(null, "", `/app?c=${id}`);
+    }
     // Jump to the end only when actually OPENING a different conversation. A same-conversation reload
     // (stall-watchdog resync, stream reconnect, offline-queue drain) must not force-scroll, or it yanks
     // you back to the bottom every few seconds while you're scrolled up reading.
@@ -2107,7 +2117,7 @@ function App() {
       }
     }
     if (!navigator.onLine) { if (!s.items.length) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
-    setLoadingConv(true);
+    if (!resync) setLoadingConv(true);
     try {
       const useDelta = s.evCount > 0 && !s.evDirty;
       const d = await api.conversation(id, useDelta ? s.evCount : 0);
@@ -2135,6 +2145,28 @@ function App() {
       if (!s.items.length && activeStoreRef.current === s) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
     } finally { if (activeStoreRef.current === s) setLoadingConv(false); }
   }, [defaultCwd]);
+
+  // Coming back to the app (phone unlocked, tab refocused) after using another device: the list
+  // and the open thread were only refreshed by this device's own actions, and a stream that died
+  // while asleep reconnected only if this device thought a turn was running, so turns sent from the
+  // other device stayed missing until the app was closed and reopened. Re-pull both on return, and
+  // pull the list once a minute while visible so renames, deletes and reordering show up too.
+  useEffect(() => {
+    let last = 0;
+    const resync = () => {
+      if (document.visibilityState !== "visible" || !navigator.onLine) return;
+      const now = Date.now();
+      if (now - last < 3000) return; // visibilitychange and focus fire together
+      last = now;
+      refreshConvs();
+      const id = activeIdRef.current;
+      if (id && !id.startsWith("new-") && !id.startsWith("pending-")) void loadConv(id, undefined, { resync: true });
+    };
+    document.addEventListener("visibilitychange", resync);
+    window.addEventListener("focus", resync);
+    const iv = setInterval(() => { if (document.visibilityState === "visible" && navigator.onLine) refreshConvs(); }, 60_000);
+    return () => { document.removeEventListener("visibilitychange", resync); window.removeEventListener("focus", resync); clearInterval(iv); };
+  }, [refreshConvs, loadConv]);
 
   loadConvRef.current = loadConv;
   useEffect(() => { setOpenConversation((id) => { void loadConv(id); }); return () => setOpenConversation(null); }, [loadConv]);
