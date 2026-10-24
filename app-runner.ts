@@ -527,6 +527,34 @@ export class Conversation {
   // running work; fold them into busy so the list dot shows while they run.
   private bgTasks = new Set<string>();
   get busy(): boolean { return this.phase !== "idle" || this.bgTasks.size > 0; }
+  // What the idle sweeper must not kill: every live background task, ambient ones INCLUDED. The CLI
+  // flips a long polling loop (`until curl ...; do sleep 15; done`) to ambient as a "live-update
+  // watcher" after a few minutes; it then dropped out of busy, and the sweeper closed the chat and
+  // killed the watcher (RustDesk cart chat, 2026-10-24 06:19, launched 03:25, busy=0 from 03:40).
+  private liveTasks = new Set<string>();
+  // Session cron jobs and /loop wakeups live in the CLI process too and send no task signal at all,
+  // so they are tracked from the tool calls: CronCreate holds for 7 days (the CLI expires recurring
+  // jobs then), a matching number of CronDelete calls releases it, ScheduleWakeup holds until a
+  // little after its wake, and ScheduleWakeup stop releases.
+  private cronCreated = 0;
+  private cronDeleted = 0;
+  private cronHoldUntil = 0;
+  private wakeHoldUntil = 0;
+  private noteScheduling(name: string, input: any) {
+    const now = Date.now();
+    if (name === "CronCreate") { this.cronCreated++; this.cronHoldUntil = now + 7 * 86_400_000; }
+    else if (name === "CronDelete") { this.cronDeleted++; if (this.cronDeleted >= this.cronCreated) this.cronHoldUntil = 0; }
+    else if (name === "ScheduleWakeup") {
+      if (input?.stop) this.wakeHoldUntil = 0;
+      else this.wakeHoldUntil = now + Math.max(0, Number(input?.delaySeconds) || 0) * 1000 + 15 * 60_000;
+    }
+  }
+  // True while closing this conversation would kill work the user started: a background task, a
+  // cron job or a pending wakeup. The sweeper skips it.
+  holdsWork(): boolean {
+    const now = Date.now();
+    return this.liveTasks.size > 0 || now < this.cronHoldUntil || now < this.wakeHoldUntil;
+  }
   get seq(): number { return this.seqCounter - 1; } // highest _seq handed out so far (-1 = none)
   private curMsgId = ""; // id of the assistant message being streamed: block ids are <msg>:<index>
   private ctxMax = 0;    // context window for this model, fetched once after init
@@ -1074,6 +1102,8 @@ export class Conversation {
         if (anyM.subtype === "init") {
           this.inited = true;
           this.bgTasks.clear(); // the level is per-process: a (re)start resets it; the CLI re-sends a snapshot
+          this.liveTasks.clear();
+          this.cronCreated = this.cronDeleted = this.cronHoldUntil = this.wakeHoldUntil = 0; // a new process has none of the old one's jobs
           // The model the user CHOSE (an alias like "default" or "opus[1m]", or a pinned id) is what drives
           // the query and what the selector shows. anyM.model is only what that choice resolved to
           // today. Overwriting the choice with it pinned every chat to the concrete model of the moment,
@@ -1121,7 +1151,9 @@ export class Conversation {
         // change, so emit the busy edge ourselves.
         else if (anyM.subtype === "background_tasks_changed") {
           const next = new Set<string>();
-          for (const t of (anyM.tasks as any[]) || []) if (t && !t.ambient && t.task_id) next.add(String(t.task_id));
+          const all = new Set<string>();
+          for (const t of (anyM.tasks as any[]) || []) if (t && t.task_id) { all.add(String(t.task_id)); if (!t.ambient) next.add(String(t.task_id)); }
+          this.liveTasks = all;
           const wasBusy = this.busy;
           this.bgTasks = next;
           if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy });
@@ -1208,6 +1240,7 @@ export class Conversation {
         for (const b of blocks) {
           if (b?.type !== "tool_use") continue;
           if (b.name === "mcp__app-ui__ask_user") { this.askToolUseIds.add(b.id); continue; } // the ask card renders this, not a raw tool card
+          this.noteScheduling(b.name, b.input);
           this.emit({ t: "tool_use", id: b.id, name: b.name, input: b.input });
         }
         break;
@@ -1386,7 +1419,7 @@ setInterval(() => {
     // close() kills the SDK query and answers pending asks with "(the user did not answer)", which
     // would throw away a real turn just because the phone dropped its stream.
     const s = c.statusInfo();
-    if (s.busy || s.waiting) continue;
+    if (s.busy || s.waiting || c.holdsWork()) continue;
     // watchedWithin, not hasSubscribers: the sweep once landed in the ~3 s gap between a tab's
     // stream expiring and reconnecting, closed a chat that was open on screen, and the next
     // morning's messages were dropped (3b4a0dc1, 2026-09-25 17:26).
