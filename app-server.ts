@@ -10,7 +10,7 @@ import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync,
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
-import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, resolveEditPointsByUuid, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -62,7 +62,8 @@ const seenSends = new Map<string, { at: number; id: string }>();
 // Edit and delete-from check the client's copy of the turn against the transcript, so a stale view
 // cannot rewind the wrong turn. The client's copy has image markers and whitespace normalised away.
 const sameTurn = (a: string, b: string) => {
-  const n = (t: string) => t.replace(/\[Image[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
+  // An older client sends the bubble's display text, which has the "Attached files:" block removed.
+  const n = (t: string) => t.replace(/^Attached files:\n[\s\S]*?(\n\n|$)/, "").replace(/\[Image[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
   return n(a) === n(b);
 };
 // Where delete-from keeps the transcript tail it cut off, one file per delete (outside the projects
@@ -887,7 +888,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (dedupSeen(b.cid)) return jsonRes({ ok: true, id, deduped: true }, ctx, req);
     const found = findTranscript(ctx, id);
     if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
-    const points = await resolveEditPoints(found.path, index);
+    const points = typeof b.uuid === "string" && b.uuid ? await resolveEditPointsByUuid(found.path, b.uuid) : await resolveEditPoints(found.path, index);
     if (!points) return jsonRes({ error: "could not resolve the edited turn (reload and retry)" }, ctx, req, 409);
     // Guard against a stale client view: if the client told us the original text, it must still match
     // the turn at that index, or we'd fork at the wrong place.
@@ -915,7 +916,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!id || !Number.isInteger(index) || index < 0) return jsonRes({ error: "id and index (>=0) required" }, ctx, req, 400);
     const found = findTranscript(ctx, id);
     if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
-    const points = await resolveEditPoints(found.path, index);
+    const points = typeof b.uuid === "string" && b.uuid ? await resolveEditPointsByUuid(found.path, b.uuid) : await resolveEditPoints(found.path, index);
     if (!points) return jsonRes({ error: "could not resolve the turn (reload and retry)" }, ctx, req, 409);
     if (typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
       return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);

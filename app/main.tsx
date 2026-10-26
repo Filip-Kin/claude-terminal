@@ -104,7 +104,7 @@ type AppEvent =
   | { t: "compacting"; active: boolean; _seq?: number }
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
-  | { t: "user"; text: string; cid?: string; midTurn?: boolean; _seq?: number }
+  | { t: "user"; text: string; cid?: string; midTurn?: boolean; uuid?: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
   | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string; _seq?: number }
   | { t: "busy"; busy: boolean; _seq?: number }
@@ -126,7 +126,7 @@ type SubscriptionWin = { utilization: number | null; resetsAt: string | null };
 type Subscription = { available: boolean; subscription: string | null; fiveHour: SubscriptionWin | null; sevenDay: SubscriptionWin | null } | null;
 
 type Item =
-  | { kind: "user"; text: string; midTurn?: boolean }
+  | { kind: "user"; text: string; midTurn?: boolean; uuid?: string }
   | { kind: "assistant"; text: string; usage?: TurnUsage; bid?: string }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }; done?: "completed" | "failed" | "stopped" }
@@ -258,9 +258,9 @@ const api = {
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
     fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
-  deleteFrom: (b: { id: string; index: number; orig?: string }) =>
+  deleteFrom: (b: { id: string; index: number; orig?: string; uuid?: string }) =>
     fetch("/app/api/delete-from", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
-  edit: (b: { id: string; index: number; text: string; cid?: string; orig?: string; model?: string }) =>
+  edit: (b: { id: string; index: number; text: string; cid?: string; orig?: string; uuid?: string; model?: string }) =>
     fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   setModel: (b: { id: string; model: string }) =>
     fetch("/app/api/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
@@ -371,7 +371,7 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       // A loaded skill arrives as a user message that dumps the whole skill file. Render a compact card.
       const sk = skillLoadName(e.text);
       if (sk) return [...items, { kind: "notice", noticeKind: "skill", text: sk }];
-      return [...items, { kind: "user", text: sanitizeUserText(e.text), ...(e.midTurn ? { midTurn: true } : {}) }];
+      return [...items, { kind: "user", text: sanitizeUserText(e.text), ...(e.midTurn ? { midTurn: true } : {}), ...(e.uuid ? { uuid: e.uuid } : {}) }];
     }
     case "text":
     case "text_delta": {
@@ -2088,8 +2088,13 @@ function App() {
   const loadConv = useCallback(async (id: string, highlight?: string, opts?: { resync?: boolean }) => {
     const resync = !!opts?.resync && activeIdRef.current === id;
     activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
-    setEditing(null); setEditError(null); // a stale edit target from another conversation must not carry over
-    if (editChipsRef.current) { editChipsRef.current = false; setAttachments([]); } // nor the edited turn's attachment chips
+    // A stale edit target from another conversation must not carry over, nor its attachment chips. A
+    // resync is the SAME conversation catching up (app refocused): an edit in progress stays. Clearing
+    // it here is what turned an edit into a plain new message on 2026-10-26.
+    if (!resync) {
+      setEditing(null); setEditError(null);
+      if (editChipsRef.current) { editChipsRef.current = false; setAttachments([]); }
+    }
     const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
     const s = manager.ensure(id);
     setActiveStore(s); activeStoreRef.current = s;
@@ -2449,7 +2454,8 @@ function App() {
       // orig = the stored turn text (attachment lines included), not the bubble's display text: the
       // server checks it against the transcript, and a turn with an image never matched.
       const origItem = snapshot[ed.i] as { kind: string; text?: string } | undefined;
-      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: origItem?.kind === "user" ? origItem.text : ed.orig, model: s.model || undefined }), 30000);
+      const uuid = origItem?.kind === "user" ? (origItem as { uuid?: string }).uuid : undefined; // the transcript entry itself, when known
+      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: origItem?.kind === "user" ? origItem.text : ed.orig, uuid, model: s.model || undefined }), 30000);
       if (r?.error) { s.restore(snapshot); return "Couldn't edit that message: " + r.error; }
       if (s.sendState === "sending") s.setSendState("delivered");
       return null;
@@ -2474,7 +2480,7 @@ function App() {
     const stored = (snapshot[i] as { text?: string }).text ?? orig; // the turn text, attachment lines included
     s.truncateFrom(i);
     try {
-      const r = await api.deleteFrom({ id: s.id, index, orig: stored });
+      const r = await api.deleteFrom({ id: s.id, index, orig: stored, uuid: (snapshot[i] as { uuid?: string }).uuid });
       if (r?.error) throw new Error(r.error);
     } catch (e) {
       s.showItems(snapshot);

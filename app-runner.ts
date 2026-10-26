@@ -60,7 +60,7 @@ export type AppEvent =
   | { t: "compacting"; active: boolean } // compaction started/stopped (drives the progress banner, incl. auto-compaction)
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
-  | { t: "user"; text: string; cid?: string; midTurn?: boolean } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly; midTurn = sent while a turn was running (folded into it, not a turn of its own)
+  | { t: "user"; text: string; cid?: string; midTurn?: boolean; uuid?: string } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly; midTurn = sent while a turn was running (folded into it, not a turn of its own)
   // Real token accounting for the turn (from the SDK result message): output = tokens Claude
   // actually generated this turn (thinking + text + tool-call args); in/cacheRead = context read.
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage }
@@ -1555,7 +1555,7 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
       else if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; apiErrors = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
-        out.push({ t: "user", text: txt });
+        out.push({ t: "user", text: txt, ...(o.uuid ? { uuid: String(o.uuid) } : {}) }); // uuid: edit/delete target this exact entry
       }
     } else if (o.type === "assistant" && msg) {
       // Same synthetic session-limit message as the live path. Replaying its text put "You've hit
@@ -1625,6 +1625,27 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
 // transcript uuid (rewindTo, for the file rollback), the uuid of the kept history's last chain entry
 // (forkAt, for resumeSessionAt — null when editing the first turn), and the original prompt text (so
 // the caller can guard against a stale index). Mirrors replayTranscript's notion of a "user turn".
+// Same fork points as resolveEditPoints, but for the transcript entry the client names by uuid
+// (replayed user turns carry it). Exact: no ordinal to drift, no text to compare.
+export async function resolveEditPointsByUuid(path: string, uuid: string): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
+  let text: string;
+  try { text = await Bun.file(path).text(); } catch { return null; }
+  const entries: { uuid: string; isSidechain: boolean }[] = [];
+  let hit = -1, prompt = "";
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let o: any;
+    try { o = JSON.parse(line); } catch { continue; }
+    if (!o.uuid) continue;
+    if (o.uuid === uuid && o.type === "user" && !o.isSidechain) { hit = entries.length; prompt = textOfContent(o.message?.content).replace(HIDDEN_STRIP, ""); }
+    entries.push({ uuid: o.uuid, isSidechain: !!o.isSidechain });
+  }
+  if (hit < 0) return null;
+  let forkAtUuid: string | null = null;
+  for (let i = hit - 1; i >= 0; i--) if (!entries[i].isSidechain) { forkAtUuid = entries[i].uuid; break; }
+  return { rewindToUuid: uuid, forkAtUuid, promptText: prompt };
+}
+
 export async function resolveEditPoints(path: string, userIndex: number): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
   let text: string;
   try { text = await Bun.file(path).text(); } catch { return null; }
