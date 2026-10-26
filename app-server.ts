@@ -59,6 +59,12 @@ export interface AppCtx {
 // link (a timeout requeue, the offline drain, or Background Sync) can never post the same message
 // twice. In-memory + short TTL: a redelivery only races within a few seconds of the original.
 const seenSends = new Map<string, { at: number; id: string }>();
+// Edit and delete-from check the client's copy of the turn against the transcript, so a stale view
+// cannot rewind the wrong turn. The client's copy has image markers and whitespace normalised away.
+const sameTurn = (a: string, b: string) => {
+  const n = (t: string) => t.replace(/\[Image[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
+  return n(a) === n(b);
+};
 // Where delete-from keeps the transcript tail it cut off, one file per delete (outside the projects
 // dir so no collector or conversation list ever reads it).
 const DELETED_DIR = join(process.env.HOME || "/home/filip", ".local/state/claude-terminal/deleted");
@@ -885,7 +891,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!points) return jsonRes({ error: "could not resolve the edited turn (reload and retry)" }, ctx, req, 409);
     // Guard against a stale client view: if the client told us the original text, it must still match
     // the turn at that index, or we'd fork at the wrong place.
-    if (typeof b.orig === "string" && b.orig.trim() && points.promptText.trim() !== String(b.orig).trim())
+    if (typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
       return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);
     const meta = await convMeta(found.path);
     let conv = get(id);
@@ -911,7 +917,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
     const points = await resolveEditPoints(found.path, index);
     if (!points) return jsonRes({ error: "could not resolve the turn (reload and retry)" }, ctx, req, 409);
-    if (typeof b.orig === "string" && b.orig.trim() && points.promptText.trim() !== String(b.orig).trim())
+    if (typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
       return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);
     if (!points.forkAtUuid) return jsonRes({ error: "first message: delete the conversation instead" }, ctx, req, 400);
     discard(id);

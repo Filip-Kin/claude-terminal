@@ -1371,6 +1371,7 @@ function App() {
   const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
+  const editChipsRef = useRef(false); // the composer chips came from an edited turn (cleared on chat switch)
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -2088,6 +2089,7 @@ function App() {
     const resync = !!opts?.resync && activeIdRef.current === id;
     activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
     setEditing(null); setEditError(null); // a stale edit target from another conversation must not carry over
+    if (editChipsRef.current) { editChipsRef.current = false; setAttachments([]); } // nor the edited turn's attachment chips
     const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
     const s = manager.ensure(id);
     setActiveStore(s); activeStoreRef.current = s;
@@ -2326,6 +2328,7 @@ function App() {
     // Doing it here (not only via the input-change effect) avoids a race where a new chat gets its real
     // id before the effect runs, leaving the "__new__" draft set so the next new chat reloads it.
     saveDraft(activeIdRef.current, "");
+    const sentAttachments = attachments;
     setInput(""); setAttachments([]);
     if (taRef.current) taRef.current.style.height = "auto";
     // The composer being emptied is authoritative. Without this, dictation's next poll returns the
@@ -2334,14 +2337,14 @@ function App() {
     // so you can send mid-thought and carry straight on into a clean composer.
     if (dictation.active) { dictation.reset(); dictAnchorRef.current = { prefix: "", suffix: "" }; }
     else dictAnchorRef.current = null;
-    // Editing a past turn -> rewind-and-rerun instead of appending. Attachments don't apply to an edit.
+    // Editing a past turn -> rewind-and-rerun instead of appending, with the chips as its attachments.
     if (editing) {
       const ed = editing;
       setEditing(null); setEditError(null);
-      const err = await doEdit(ed, raw);
+      const err = await doEdit(ed, text);
       // Failed edits stay edits: restore the composer and the banner so it can be retried or cancelled.
       // Falling through to submitText() here is what used to append the edit as a duplicate turn.
-      if (err) { setEditing(ed); setEditError(err); setInput(raw); requestAnimationFrame(() => taRef.current?.focus()); }
+      if (err) { setEditing(ed); setEditError(err); setInput(raw); setAttachments(sentAttachments); requestAnimationFrame(() => taRef.current?.focus()); }
       return;
     }
     // An unanswered ask_user card blocks the whole turn: the SDK is parked inside the tool call, so
@@ -2409,8 +2412,20 @@ function App() {
   };
   // Enter edit mode for a past user turn: prefill the composer and remember which turn, so submit
   // rewinds-and-reruns from there (see doEdit) instead of appending a new turn.
-  const startEdit = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
-  const cancelEdit = () => { setEditing(null); setEditError(null); setInput(""); if (taRef.current) taRef.current.style.height = "auto"; };
+  // Editing a turn loads its attachments into the composer chips too, so they can be removed or
+  // added to before the rerun (doSend builds the same "Attached files:" text a normal send does).
+  const startEdit = (i: number, t: string) => {
+    const it = activeStoreRef.current?.items[i] as { kind: string; text?: string } | undefined;
+    editChipsRef.current = true;
+    if (it?.kind === "user" && it.text) {
+      const p = parseUserText(it.text);
+      const cid = activeIdRef.current;
+      setAttachments([...p.images, ...p.files].map((path) => ({ name: path.split("/").pop() || path, path, isImage: IMG_RE.test(path), preview: IMG_RE.test(path) ? downloadUrl(cid, path) : undefined })));
+    }
+    startEditText(i, t);
+  };
+  const startEditText = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
+  const cancelEdit = () => { setEditing(null); setEditError(null); setInput(""); setAttachments([]); if (taRef.current) taRef.current.style.height = "auto"; };
   // Rewind-and-rerun: drop the edited turn + everything after (optimistically), then ask the server to
   // roll files back to that turn's checkpoint, fork the transcript, and re-run the edited text. The
   // forked session's new id + reply stream back in on the existing socket. Returns null on success or
@@ -2431,7 +2446,10 @@ function App() {
     const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
     s.addOptimisticUser(text, cid); // re-render the edited text below; arms the echo dedup
     try {
-      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: ed.orig, model: s.model || undefined }), 30000);
+      // orig = the stored turn text (attachment lines included), not the bubble's display text: the
+      // server checks it against the transcript, and a turn with an image never matched.
+      const origItem = snapshot[ed.i] as { kind: string; text?: string } | undefined;
+      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: origItem?.kind === "user" ? origItem.text : ed.orig, model: s.model || undefined }), 30000);
       if (r?.error) { s.restore(snapshot); return "Couldn't edit that message: " + r.error; }
       if (s.sendState === "sending") s.setSendState("delivered");
       return null;
@@ -2453,9 +2471,10 @@ function App() {
     const index = userOrdinal(s.items, i);
     if (index < 1) return;
     const snapshot = s.items;
+    const stored = (snapshot[i] as { text?: string }).text ?? orig; // the turn text, attachment lines included
     s.truncateFrom(i);
     try {
-      const r = await api.deleteFrom({ id: s.id, index, orig });
+      const r = await api.deleteFrom({ id: s.id, index, orig: stored });
       if (r?.error) throw new Error(r.error);
     } catch (e) {
       s.showItems(snapshot);
