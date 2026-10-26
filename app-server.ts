@@ -6,11 +6,11 @@
 // or null to let server.ts keep matching its own routes.
 
 import { dirname, join, resolve } from "path";
-import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
+import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync, mkdirSync, truncateSync } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -59,6 +59,9 @@ export interface AppCtx {
 // link (a timeout requeue, the offline drain, or Background Sync) can never post the same message
 // twice. In-memory + short TTL: a redelivery only races within a few seconds of the original.
 const seenSends = new Map<string, { at: number; id: string }>();
+// Where delete-from keeps the transcript tail it cut off, one file per delete (outside the projects
+// dir so no collector or conversation list ever reads it).
+const DELETED_DIR = join(process.env.HOME || "/home/filip", ".local/state/claude-terminal/deleted");
 const SEND_DEDUP_TTL_MS = 2 * 60 * 1000;
 function dedupSeen(cid: unknown): { id: string } | null {
   if (typeof cid !== "string" || !cid) return null;
@@ -892,6 +895,40 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text);
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id, rewind }, ctx, req);
+  }
+
+  // Delete a user turn and everything after it: the conversation goes back to how it was before
+  // that message. Chat only, files on disk are left alone (Filip, 2026-10-26). A fork cannot do this:
+  // the SDK writes a forked session only when its first new message is sent, so a fork with nothing
+  // to send leaves no trace. Instead the live session is stopped and the transcript is cut right
+  // after the last entry the kept history ends on. The cut tail is kept under DELETED_DIR.
+  if (req.method === "POST" && path === "/app/api/delete-from") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const id = String(b.id || "");
+    const index = Number(b.index);
+    if (!id || !Number.isInteger(index) || index < 0) return jsonRes({ error: "id and index (>=0) required" }, ctx, req, 400);
+    const found = findTranscript(ctx, id);
+    if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
+    const points = await resolveEditPoints(found.path, index);
+    if (!points) return jsonRes({ error: "could not resolve the turn (reload and retry)" }, ctx, req, 409);
+    if (typeof b.orig === "string" && b.orig.trim() && points.promptText.trim() !== String(b.orig).trim())
+      return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);
+    if (!points.forkAtUuid) return jsonRes({ error: "first message: delete the conversation instead" }, ctx, req, 400);
+    discard(id);
+    await new Promise((r) => setTimeout(r, 500)); // let the stopped CLI process exit before the file is cut
+    const buf = readFileSync(found.path);
+    let pos = 0, cut = -1;
+    while (pos < buf.length) {
+      const nl = buf.indexOf(0x0a, pos);
+      const end = nl < 0 ? buf.length : nl + 1;
+      try { if (JSON.parse(buf.subarray(pos, end).toString("utf8")).uuid === points.forkAtUuid) cut = end; } catch { /* partial line */ }
+      pos = end;
+    }
+    if (cut < 0) return jsonRes({ error: "could not find the cut point (reload and retry)" }, ctx, req, 409);
+    try { mkdirSync(DELETED_DIR, { recursive: true }); writeFileSync(join(DELETED_DIR, `${id}-${Date.now()}.jsonl.cut`), buf.subarray(cut)); } catch { /* the cut still goes ahead */ }
+    truncateSync(found.path, cut);
+    tlog("accept", { route: "delete-from", conv: id, index, cutBytes: buf.length - cut });
+    return jsonRes({ ok: true, id }, ctx, req);
   }
 
   // Live event stream (SSE). Must already be started (GET can't carry the first turn).

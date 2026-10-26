@@ -258,6 +258,8 @@ const api = {
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
     fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+  deleteFrom: (b: { id: string; index: number; orig?: string }) =>
+    fetch("/app/api/delete-from", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   edit: (b: { id: string; index: number; text: string; cid?: string; orig?: string; model?: string }) =>
     fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   setModel: (b: { id: string; model: string }) =>
@@ -2435,6 +2437,35 @@ function App() {
       return null;
     } catch { s.restore(snapshot); return "Couldn't reach the server to edit, so nothing was sent and nothing was duplicated. Try again."; }
   };
+  // Ordinal of item i among real user turns (mid-turn messages are not turns on the server), or -1.
+  const userOrdinal = (items: Item[], i: number) => {
+    let n = -1;
+    for (let k = 0; k <= i && k < items.length; k++) { const x = items[k]; if (x.kind === "user" && !x.midTurn) n++; }
+    return items[i]?.kind === "user" && !(items[i] as { midTurn?: boolean }).midTurn ? n : -1;
+  };
+  // Delete a sent message and everything after it: the server cuts the transcript back to just
+  // before it (chat only; files are left alone). Not offered on the first message: that is the
+  // whole conversation, which has its own Delete.
+  const deleteFrom = async (i: number, orig: string) => {
+    setMsgMenu(null);
+    const s = activeStoreRef.current;
+    if (!s || s.id.startsWith("new-") || s.id.startsWith("pending-") || !navigator.onLine) return;
+    const index = userOrdinal(s.items, i);
+    if (index < 1) return;
+    const snapshot = s.items;
+    s.truncateFrom(i);
+    try {
+      const r = await api.deleteFrom({ id: s.id, index, orig });
+      if (r?.error) throw new Error(r.error);
+    } catch (e) {
+      s.showItems(snapshot);
+      window.alert("Delete failed: " + (e instanceof Error ? e.message : String(e)));
+      return;
+    }
+    s.evDirty = true; // the transcript was cut under the cursor: next load is a full one
+    await loadConv(s.id, undefined, { resync: true });
+    refreshConvs();
+  };
   const deleteConv = useCallback(async (id: string) => {
     setConvMenu(null);
     setConvs((cs) => cs.filter((c) => c.sessionId !== id)); // optimistic
@@ -3027,6 +3058,7 @@ function App() {
             {msgMenu.code !== undefined && <button onClick={() => { copyText(msgMenu.code!); setMsgMenu(null); }}>Copy code</button>}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
             {msgMenu.kind === "user" && !(activeStore?.items[msgMenu.i] as { midTurn?: boolean } | undefined)?.midTurn && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
+            {msgMenu.kind === "user" && activeStore && userOrdinal(activeStore.items, msgMenu.i) >= 1 && !busy && <button className="ctx-danger" onClick={() => void deleteFrom(msgMenu.i, msgMenu.text)}>Delete from here</button>}
           </div>
         </>
       )}

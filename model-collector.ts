@@ -90,7 +90,7 @@ export async function sampleModelUsage(configPath: string): Promise<void> {
         try {
           const size = fstatSync(fd).size;
           let start = offsets.get(f) ?? 0;
-          if (start > size) start = 0; // file rewritten or truncated, re-read from the top
+          if (start > size) { offsetUpdates.set(f, size); continue; } // cut (delete-from): already counted, never re-read from 0
           if (start === size) continue;
           const buf = Buffer.allocUnsafe(size - start);
           readSync(fd, buf, 0, size - start, start);

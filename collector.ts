@@ -93,7 +93,9 @@ function collectUser(user: string): void {
     try {
       size = fstatSync(fd).size;
       let start = offsets.get(f) ?? 0;
-      if (start > size) start = 0;
+      // Shorter than our cursor = the transcript was cut (delete-from in /app). The tokens before the
+      // cut were really spent and are already counted; re-reading from 0 would count them twice.
+      if (start > size) { offsetUpdates.set(f, size); continue; }
       if (start === size) continue;
       const len = size - start;
       const buf = Buffer.allocUnsafe(len);

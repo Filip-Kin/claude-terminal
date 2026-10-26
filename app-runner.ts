@@ -1330,6 +1330,15 @@ export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
 }
 
 export function get(key: string): Conversation | undefined { return conversations.get(key); }
+// Stop a conversation and forget it, so the next open builds a fresh one (new epoch) from the
+// transcript. Used before the transcript is cut (delete-from-here): the old process must not write
+// to it again, and clients holding the old log must reload rather than resume into it.
+export function discard(key: string): void {
+  const c = conversations.get(key);
+  if (!c) return;
+  c.close();
+  for (const [k, v] of conversations) if (v === c) conversations.delete(k);
+}
 
 // A conversation can also be driven from a TERMINAL tab by the CLI, which this process knows nothing
 // about — it only tracks its own /app conversations. Those CLI sessions publish their own state to
