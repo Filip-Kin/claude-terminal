@@ -892,8 +892,8 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!points) return jsonRes({ error: "could not resolve the edited turn (reload and retry)" }, ctx, req, 409);
     // Guard against a stale client view: if the client told us the original text, it must still match
     // the turn at that index, or we'd fork at the wrong place.
-    if (typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
-      return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);
+    if (!b.uuid && typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
+      { tlog("reject", { route: path, conv: id, index, uuid: b.uuid || null, why: "text", orig: String(b.orig).slice(0, 60), server: points.promptText.slice(0, 60) }); return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409); }
     const meta = await convMeta(found.path);
     let conv = get(id);
     if (!conv) { conv = getOrCreate(id, { cwd: meta.cwd || ctx.defaultCwd, model: b.model || undefined, resume: id, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile }); await conv.bootForRewind(); }
@@ -918,8 +918,8 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
     const points = typeof b.uuid === "string" && b.uuid ? await resolveEditPointsByUuid(found.path, b.uuid) : await resolveEditPoints(found.path, index);
     if (!points) return jsonRes({ error: "could not resolve the turn (reload and retry)" }, ctx, req, 409);
-    if (typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
-      return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);
+    if (!b.uuid && typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
+      { tlog("reject", { route: path, conv: id, index, uuid: b.uuid || null, why: "text", orig: String(b.orig).slice(0, 60), server: points.promptText.slice(0, 60) }); return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409); }
     if (!points.forkAtUuid) return jsonRes({ error: "first message: delete the conversation instead" }, ctx, req, 400);
     discard(id);
     await new Promise((r) => setTimeout(r, 500)); // let the stopped CLI process exit before the file is cut

@@ -2129,7 +2129,10 @@ function App() {
     if (!navigator.onLine) { if (!s.items.length) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
     if (!resync) setLoadingConv(true);
     try {
-      const useDelta = s.evCount > 0 && !s.evDirty;
+      // Every user bubble must carry its transcript id (edit and delete act on it). Bubbles from the
+      // offline cache or a live stream have none, so a store holding any of those loads in full.
+      const missingIds = s.items.some((x) => x.kind === "user" && !x.midTurn && !(x as { uuid?: string }).uuid);
+      const useDelta = s.evCount > 0 && !s.evDirty && !missingIds;
       const d = await api.conversation(id, useDelta ? s.evCount : 0);
       if (activeStoreRef.current !== s) return; // user switched away while we fetched
       // Delta path: the server only sent what we were missing, so fold it instead of rebuilding. Skips
@@ -2443,8 +2446,10 @@ function App() {
     if (typeof navigator !== "undefined" && !navigator.onLine) return "You're offline. An edit rewinds the conversation on the server, so unlike a normal message it can't be queued. It will work once you're back online.";
     // 0-based ordinal among user turns up to the edited item — matches the server's user-turn count.
     // A mid-turn message is not a turn on the server, so it is not counted (and cannot be edited).
-    let uindex = -1; for (let k = 0; k <= ed.i && k < s.items.length; k++) { const x = s.items[k]; if (x.kind === "user" && !x.midTurn) uindex++; }
-    if (uindex < 0) return "Couldn't work out which turn to rewind to. Reload the conversation and try again.";
+    const target = await idOf(s, ed.i);
+    if (!target) return "Couldn't find that message on the server. Reload the conversation and try again.";
+    ed = { ...ed, i: target.i };
+    const uindex = userOrdinal(s.items, ed.i);
     stickBottom.current = true; setAtBottom(true);
     const snapshot = s.items;
     s.truncateFrom(ed.i);             // drop the edited bubble + everything after
@@ -2453,9 +2458,7 @@ function App() {
     try {
       // orig = the stored turn text (attachment lines included), not the bubble's display text: the
       // server checks it against the transcript, and a turn with an image never matched.
-      const origItem = snapshot[ed.i] as { kind: string; text?: string } | undefined;
-      const uuid = origItem?.kind === "user" ? (origItem as { uuid?: string }).uuid : undefined; // the transcript entry itself, when known
-      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: origItem?.kind === "user" ? origItem.text : ed.orig, uuid, model: s.model || undefined }), 30000);
+      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, uuid: target.uuid, model: s.model || undefined }), 30000);
       if (r?.error) { s.restore(snapshot); return "Couldn't edit that message: " + r.error; }
       if (s.sendState === "sending") s.setSendState("delivered");
       return null;
@@ -2467,20 +2470,39 @@ function App() {
     for (let k = 0; k <= i && k < items.length; k++) { const x = items[k]; if (x.kind === "user" && !x.midTurn) n++; }
     return items[i]?.kind === "user" && !(items[i] as { midTurn?: boolean }).midTurn ? n : -1;
   };
+  // The transcript id of user bubble i. A bubble without one (just sent, or from the offline cache)
+  // gets it from a full reload; the same bubble is found again by its position among user turns.
+  const idOf = async (s: ConvStore, i: number): Promise<{ uuid: string; i: number } | null> => {
+    const have = (s.items[i] as { uuid?: string } | undefined)?.uuid;
+    if (have) return { uuid: have, i };
+    const n = userOrdinal(s.items, i);
+    if (n < 0) return null;
+    s.evDirty = true;
+    await loadConv(s.id, undefined, { resync: true });
+    let k = -1;
+    for (let j = 0; j < s.items.length; j++) {
+      const x = s.items[j] as { kind: string; midTurn?: boolean; uuid?: string };
+      if (x.kind === "user" && !x.midTurn && ++k === n) return x.uuid ? { uuid: x.uuid, i: j } : null;
+    }
+    return null;
+  };
   // Delete a sent message and everything after it: the server cuts the transcript back to just
   // before it (chat only; files are left alone). Not offered on the first message: that is the
   // whole conversation, which has its own Delete.
-  const deleteFrom = async (i: number, orig: string) => {
+  const deleteFrom = async (i: number, orig: string) => { // eslint-disable-line prefer-const
     setMsgMenu(null);
     const s = activeStoreRef.current;
     if (!s || s.id.startsWith("new-") || s.id.startsWith("pending-") || !navigator.onLine) return;
+    if (userOrdinal(s.items, i) < 1) return;
+    const target = await idOf(s, i);
+    if (!target) { window.alert("Delete failed: message not found on the server"); return; }
+    i = target.i;
     const index = userOrdinal(s.items, i);
-    if (index < 1) return;
     const snapshot = s.items;
-    const stored = (snapshot[i] as { text?: string }).text ?? orig; // the turn text, attachment lines included
+    void orig;
     s.truncateFrom(i);
     try {
-      const r = await api.deleteFrom({ id: s.id, index, orig: stored, uuid: (snapshot[i] as { uuid?: string }).uuid });
+      const r = await api.deleteFrom({ id: s.id, index, uuid: target.uuid });
       if (r?.error) throw new Error(r.error);
     } catch (e) {
       s.showItems(snapshot);
