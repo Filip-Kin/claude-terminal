@@ -10,7 +10,7 @@ import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync,
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
-import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, resolveEditPointsByUuid, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -59,13 +59,6 @@ export interface AppCtx {
 // link (a timeout requeue, the offline drain, or Background Sync) can never post the same message
 // twice. In-memory + short TTL: a redelivery only races within a few seconds of the original.
 const seenSends = new Map<string, { at: number; id: string }>();
-// Edit and delete-from check the client's copy of the turn against the transcript, so a stale view
-// cannot rewind the wrong turn. The client's copy has image markers and whitespace normalised away.
-const sameTurn = (a: string, b: string) => {
-  // An older client sends the bubble's display text, which has the "Attached files:" block removed.
-  const n = (t: string) => t.replace(/^Attached files:\n[\s\S]*?(\n\n|$)/, "").replace(/\[Image[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
-  return n(a) === n(b);
-};
 // Where delete-from keeps the transcript tail it cut off, one file per delete (outside the projects
 // dir so no collector or conversation list ever reads it).
 const DELETED_DIR = join(process.env.HOME || "/home/filip", ".local/state/claude-terminal/deleted");
@@ -882,24 +875,20 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   if (req.method === "POST" && path === "/app/api/edit") {
     let b: any = {}; try { b = await req.json(); } catch {}
     const id = String(b.id || "");
-    const index = Number(b.index);
+    const uuid = String(b.uuid || "");
     const rawText = String(b.text ?? "").trim();
-    if (!id || !Number.isInteger(index) || index < 0 || !rawText) return jsonRes({ error: "id, index (>=0) and text required" }, ctx, req, 400);
+    if (!id || !uuid || !rawText) return jsonRes({ error: "id, uuid and text required" }, ctx, req, 400);
     if (dedupSeen(b.cid)) return jsonRes({ ok: true, id, deduped: true }, ctx, req);
     const found = findTranscript(ctx, id);
     if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
-    const points = typeof b.uuid === "string" && b.uuid ? await resolveEditPointsByUuid(found.path, b.uuid) : await resolveEditPoints(found.path, index);
-    if (!points) return jsonRes({ error: "could not resolve the edited turn (reload and retry)" }, ctx, req, 409);
-    // Guard against a stale client view: if the client told us the original text, it must still match
-    // the turn at that index, or we'd fork at the wrong place.
-    if (!b.uuid && typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
-      { tlog("reject", { route: path, conv: id, index, uuid: b.uuid || null, why: "text", orig: String(b.orig).slice(0, 60), server: points.promptText.slice(0, 60) }); return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409); }
+    const points = await resolveEditPoints(found.path, uuid);
+    if (!points) { tlog("reject", { route: "edit", conv: id, uuid, why: "no such message" }); return jsonRes({ error: "message not found" }, ctx, req, 404); }
     const meta = await convMeta(found.path);
     let conv = get(id);
     if (!conv) { conv = getOrCreate(id, { cwd: meta.cwd || ctx.defaultCwd, model: b.model || undefined, resume: id, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile }); await conv.bootForRewind(); }
     const text = b.voice ? decorateVoiceTurn(rawText) : rawText;
-    tlog("accept", { route: "edit", conv: conv.id, cid: shortCid(b.cid), chars: text.length, index });
-    const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text);
+    tlog("accept", { route: "edit", conv: conv.id, cid: shortCid(b.cid), chars: text.length, uuid });
+    const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text, typeof b.cid === "string" ? b.cid : undefined);
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id, rewind }, ctx, req);
   }
@@ -912,14 +901,12 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   if (req.method === "POST" && path === "/app/api/delete-from") {
     let b: any = {}; try { b = await req.json(); } catch {}
     const id = String(b.id || "");
-    const index = Number(b.index);
-    if (!id || !Number.isInteger(index) || index < 0) return jsonRes({ error: "id and index (>=0) required" }, ctx, req, 400);
+    const uuid = String(b.uuid || "");
+    if (!id || !uuid) return jsonRes({ error: "id and uuid required" }, ctx, req, 400);
     const found = findTranscript(ctx, id);
     if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
-    const points = typeof b.uuid === "string" && b.uuid ? await resolveEditPointsByUuid(found.path, b.uuid) : await resolveEditPoints(found.path, index);
-    if (!points) return jsonRes({ error: "could not resolve the turn (reload and retry)" }, ctx, req, 409);
-    if (!b.uuid && typeof b.orig === "string" && b.orig.trim() && !sameTurn(points.promptText, String(b.orig)))
-      { tlog("reject", { route: path, conv: id, index, uuid: b.uuid || null, why: "text", orig: String(b.orig).slice(0, 60), server: points.promptText.slice(0, 60) }); return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409); }
+    const points = await resolveEditPoints(found.path, uuid);
+    if (!points) { tlog("reject", { route: "delete-from", conv: id, uuid, why: "no such message" }); return jsonRes({ error: "message not found" }, ctx, req, 404); }
     if (!points.forkAtUuid) return jsonRes({ error: "first message: delete the conversation instead" }, ctx, req, 400);
     discard(id);
     await new Promise((r) => setTimeout(r, 500)); // let the stopped CLI process exit before the file is cut
@@ -934,7 +921,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (cut < 0) return jsonRes({ error: "could not find the cut point (reload and retry)" }, ctx, req, 409);
     try { mkdirSync(DELETED_DIR, { recursive: true }); writeFileSync(join(DELETED_DIR, `${id}-${Date.now()}.jsonl.cut`), buf.subarray(cut)); } catch { /* the cut still goes ahead */ }
     truncateSync(found.path, cut);
-    tlog("accept", { route: "delete-from", conv: id, index, cutBytes: buf.length - cut });
+    tlog("accept", { route: "delete-from", conv: id, uuid, cutBytes: buf.length - cut });
     return jsonRes({ ok: true, id }, ctx, req);
   }
 

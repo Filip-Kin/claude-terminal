@@ -745,9 +745,10 @@ export class Conversation {
     try { cancelResume(this.id); } catch { /* */ }
     const midTurn = this.running; // folded into the running turn by the SDK, not a turn of its own
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
-    this.emit({ t: "user", text, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
+    const uuid = messageId(cid);
+    this.emit({ t: "user", text, uuid, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
-    const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+    const msg: SDKUserMessage = { type: "user", uuid: uuid as any, message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
     // nor the queue, and its dead inputGen is parked exactly at the waiter below, so the healthy-path
     // early return must be covered too. handle() clears this the instant any real message arrives.
@@ -876,7 +877,7 @@ export class Conversation {
   // turn -> start a fresh session). rewindToUuid = the edited user message's uuid (files restore to
   // its pre-turn state). The forked session's new id arrives on the next init event, which re-keys
   // the map and rebinds the client automatically.
-  async editTurn(forkAtUuid: string | null, rewindToUuid: string | null, text: string): Promise<RewindInfo> {
+  async editTurn(forkAtUuid: string | null, rewindToUuid: string | null, text: string, cid?: string): Promise<RewindInfo> {
     let rewind: RewindInfo = {};
     if (rewindToUuid && this.q) {
       try {
@@ -890,7 +891,7 @@ export class Conversation {
     if (forkAtUuid) { this.resume = this.id; this.forkAt = forkAtUuid; this.forkNext = true; }
     else { this.resume = undefined; this.forkAt = undefined; this.forkNext = false; } // editing the first turn -> fresh session
     this.closed = false;
-    void this.run(text);                         // bumps runGen, starts the forked query, emits the edited user turn
+    void this.run(text, cid);                    // bumps runGen, starts the forked query, emits the edited user turn
     try { oldQ?.close(); } catch { /* the old run's finally is superseded (older gen) -> stays silent */ }
     return rewind;
   }
@@ -972,10 +973,11 @@ export class Conversation {
     if (first !== undefined) {
       this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
       this.runStart = this.log.length; // first turn's replay boundary
-      this.emit({ t: "user", text: first, ...(cid ? { cid } : {}) });
+      const uuid = messageId(cid);
+      this.emit({ t: "user", text: first, uuid, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
       this.titleScan = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
-      yield { type: "user", message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+      yield { type: "user", uuid: uuid as any, message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     }
     while (!this.closed) {
       const next = this.queue.shift() ?? (await new Promise<SDKUserMessage | null>((res) => { this.waiter = res; }));
@@ -1470,6 +1472,13 @@ function replayCacheRemember(path: string, size: number, mtimeMs: number, events
 
 // Parses a session .jsonl into the normalized events the front-end already renders. Callers get
 // their own array (the conversation route rewrites the trailing model event in place).
+// A user message's id: the client's cid when it is a UUID (the app makes one per message), so the
+// bubble, the live event and the transcript entry (Claude Code keeps a uuid it is handed) all carry
+// the same value. Anything else (an old client, a server-originated turn) gets a fresh one, which the
+// live user event carries to every client.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function messageId(cid?: string): string { return cid && UUID_RE.test(cid) ? cid.toLowerCase() : crypto.randomUUID(); }
+
 export async function replayTranscript(path: string): Promise<AppEvent[]> {
   let size = -1, mtimeMs = -1;
   try { const st = statSync(path); size = st.size; mtimeMs = st.mtimeMs; } catch {}
@@ -1602,11 +1611,10 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
     } else if (o.type === "attachment" && o.attachment?.type === "queued_command") {
       // A message sent while a turn was running. The CLI does not write it as a user row: it is an
       // attachment injected into the running turn at this point, so it rendered nowhere on reload.
-      // Not a turn boundary (the accumulators keep running) and not an edit target (resolveEditPoints
-      // does not count it either), hence midTurn.
+      // Not a turn boundary (the accumulators keep running) and not an edit target, hence midTurn.
       const a = o.attachment;
       const txt = textOfContent(a.prompt).replace(HIDDEN_STRIP, "");
-      if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt, midTurn: true });
+      if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt, midTurn: true, ...(a.source_uuid ? { uuid: String(a.source_uuid) } : {}) });
     } else if (o.type === "system" && o.subtype === "task_notification" && o.tool_use_id) {
       out.push({ t: "agent_done", id: String(o.tool_use_id), status: o.status || "completed", summary: o.summary ? String(o.summary).slice(0, 400) : undefined });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
@@ -1620,63 +1628,6 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
   return out;
 }
 
-// Resolve the fork points for editing the user turn at ordinal `userIndex` (0-based, counting only
-// real user prompts — the same turns the UI renders as `user` bubbles). Returns the edited turn's
-// transcript uuid (rewindTo, for the file rollback), the uuid of the kept history's last chain entry
-// (forkAt, for resumeSessionAt — null when editing the first turn), and the original prompt text (so
-// the caller can guard against a stale index). Mirrors replayTranscript's notion of a "user turn".
-// Same fork points as resolveEditPoints, but for the transcript entry the client names by uuid
-// (replayed user turns carry it). Exact: no ordinal to drift, no text to compare.
-export async function resolveEditPointsByUuid(path: string, uuid: string): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
-  let text: string;
-  try { text = await Bun.file(path).text(); } catch { return null; }
-  const entries: { uuid: string; isSidechain: boolean }[] = [];
-  let hit = -1, prompt = "";
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let o: any;
-    try { o = JSON.parse(line); } catch { continue; }
-    if (!o.uuid) continue;
-    if (o.uuid === uuid && o.type === "user" && !o.isSidechain) { hit = entries.length; prompt = textOfContent(o.message?.content).replace(HIDDEN_STRIP, ""); }
-    entries.push({ uuid: o.uuid, isSidechain: !!o.isSidechain });
-  }
-  if (hit < 0) return null;
-  let forkAtUuid: string | null = null;
-  for (let i = hit - 1; i >= 0; i--) if (!entries[i].isSidechain) { forkAtUuid = entries[i].uuid; break; }
-  return { rewindToUuid: uuid, forkAtUuid, promptText: prompt };
-}
-
-export async function resolveEditPoints(path: string, userIndex: number): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
-  let text: string;
-  try { text = await Bun.file(path).text(); } catch { return null; }
-  const entries: { uuid: string; isPrompt: boolean; isSidechain: boolean; text: string }[] = [];
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let o: any;
-    try { o = JSON.parse(line); } catch { continue; }
-    if (!o.uuid) continue;
-    const isSidechain = !!o.isSidechain;
-    let isPrompt = false, ptext = "";
-    if (o.type === "user" && o.message && !o.isCompactSummary && !isSidechain) {
-      const c = o.message.content;
-      const hasToolResult = Array.isArray(c) && c.some((b: any) => b?.type === "tool_result");
-      if (!hasToolResult) {
-        const t = textOfContent(c).replace(HIDDEN_STRIP, "");
-        if (t.trim() && !t.startsWith("<") && !skillLoadName(t) && !(o.isMeta && (IMAGE_NOTE_RE.test(t.trim()) || RESUME_PROMPT_RE.test(t.trim())))) { isPrompt = true; ptext = t; }
-      }
-    }
-    entries.push({ uuid: o.uuid, isPrompt, isSidechain, text: ptext });
-  }
-  const prompts = entries.filter((e) => e.isPrompt);
-  const target = prompts[userIndex];
-  if (!target) return null;
-  const pos = entries.indexOf(target);
-  // Fork at the last MAIN-chain (non-sidechain) entry before the edited turn: that's the kept
-  // history's tail. Subagent (sidechain) entries aren't valid main-chain fork points.
-  let forkAtUuid: string | null = null;
-  for (let i = pos - 1; i >= 0; i--) { if (!entries[i].isSidechain) { forkAtUuid = entries[i].uuid; break; } }
-  return { rewindToUuid: target.uuid, forkAtUuid, promptText: target.text };
-}
 // #endregion
 
 // #region subscription usage (claude.ai subscription rate-limit windows — the data behind `/usage`)
@@ -1756,3 +1707,25 @@ export function getSubscriptionUsage(): SubscriptionUsage | null {
   return subCache;
 }
 // #endregion
+
+// Fork points for editing or deleting the user message with this id (the transcript entry's uuid,
+// which every message carries on client and server). rewindTo = that entry; forkAt = the last main-
+// chain entry before it (null for the first message).
+export async function resolveEditPoints(path: string, uuid: string): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
+  let text: string;
+  try { text = await Bun.file(path).text(); } catch { return null; }
+  const entries: { uuid: string; isSidechain: boolean }[] = [];
+  let hit = -1, prompt = "";
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let o: any;
+    try { o = JSON.parse(line); } catch { continue; }
+    if (!o.uuid) continue;
+    if (o.uuid === uuid && o.type === "user" && !o.isSidechain) { hit = entries.length; prompt = textOfContent(o.message?.content).replace(HIDDEN_STRIP, ""); }
+    entries.push({ uuid: o.uuid, isSidechain: !!o.isSidechain });
+  }
+  if (hit < 0) return null;
+  let forkAtUuid: string | null = null;
+  for (let i = hit - 1; i >= 0; i--) if (!entries[i].isSidechain) { forkAtUuid = entries[i].uuid; break; }
+  return { rewindToUuid: uuid, forkAtUuid, promptText: prompt };
+}

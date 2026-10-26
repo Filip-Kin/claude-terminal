@@ -258,9 +258,9 @@ const api = {
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
     fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
-  deleteFrom: (b: { id: string; index: number; orig?: string; uuid?: string }) =>
+  deleteFrom: (b: { id: string; uuid: string }) =>
     fetch("/app/api/delete-from", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
-  edit: (b: { id: string; index: number; text: string; cid?: string; orig?: string; uuid?: string; model?: string }) =>
+  edit: (b: { id: string; uuid: string; text: string; cid: string; model?: string }) =>
     fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   setModel: (b: { id: string; model: string }) =>
     fetch("/app/api/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
@@ -637,7 +637,7 @@ class ConvStore {
   // now (so the send is visibly acknowledged) but pinned BELOW the reply that is still streaming
   // instead of splitting it. doEdit passes false, because a rewind cancels the running turn and its rerun
   // must appear under the edited bubble, not above it.
-  addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text, ...(this.busy ? { midTurn: true } : {}) }); this.busy = true; this.setSendState("sending"); this.touch(); }
+  addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text, ...(cid ? { uuid: cid } : {}), ...(this.busy ? { midTurn: true } : {}) }); this.busy = true; this.setSendState("sending"); this.touch(); }
   // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
   // below), and restore the pre-edit view if the server rejects the edit.
   truncateFrom(index: number) { this.items = this.items.slice(0, Math.max(0, index)); this.pendingEcho = []; this.touch(); }
@@ -1119,6 +1119,16 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
   );
 }
 
+// A message's id. The client makes it when the message is sent; the server and Claude Code store the
+// same value as the transcript entry's uuid, so every message has one id everywhere from the start.
+function newId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
 const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|heic|heif|svg|avif)$/i;
 // A user turn that carried attachments is stored as "Attached files:\n<path>\n...\n\n<message>".
 // Split it back out so image paths render as thumbnails and the typed message shows on its own.
@@ -1405,7 +1415,7 @@ function App() {
   const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant"; i: number; link?: string; code?: string } | null>(null);
   // Editing a past user turn: its item index + original text. Set by the message "Edit" action;
   // on submit the turn is rewound-and-rerun (full rollback) instead of appended as a new turn.
-  const [editing, setEditing] = useState<{ i: number; orig: string } | null>(null);
+  const [editing, setEditing] = useState<{ uuid: string; orig: string } | null>(null); // the message being edited, by id
   // Why an in-flight edit could not be applied. An edit is a server-side rewind, so when it fails the
   // turn must stay in edit mode with the reason shown, never silently fall through to a normal send.
   const [editError, setEditError] = useState<string | null>(null);
@@ -2071,7 +2081,7 @@ function App() {
     compactQueue.current = compactQueue.current.filter((it) => !take.includes(it));
     void (async () => {
       for (const { store: s, text } of take) {
-        const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+        const cid = newId();
         s.addOptimisticUser(text, cid); // now renders below the compaction divider (card already applied)
         const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: (s.id.startsWith("new-") ? modelRef.current : s.model) || undefined, cwd: cwdRef.current || undefined };
         try { if (s.connected) await api.send({ id: s.id, text, cid }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
@@ -2302,7 +2312,7 @@ function App() {
     if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push({ store: s!, text }); return s!.id; }
     // Stable client id so a redelivery (offline queue OR a timeout requeue) is deduped server-side
     // instead of posting the same turn twice, and so the server's echo of this turn matches it exactly.
-    const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    const cid = newId();
     s!.addOptimisticUser(text, cid); // renders the turn, flips busy, sets sendState "sending"
     const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: (s!.id.startsWith("new-") ? modelRef.current : s!.model) || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
     const queue = async () => {
@@ -2432,77 +2442,50 @@ function App() {
     }
     startEditText(i, t);
   };
-  const startEditText = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
+  const startEditText = (i: number, t: string) => { const uuid = (activeStoreRef.current?.items[i] as { uuid?: string } | undefined)?.uuid; setMsgMenu(null); if (!uuid) { window.alert("Edit failed: message has no id"); return; } setEditing({ uuid, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
   const cancelEdit = () => { setEditing(null); setEditError(null); setInput(""); setAttachments([]); if (taRef.current) taRef.current.style.height = "auto"; };
   // Rewind-and-rerun: drop the edited turn + everything after (optimistically), then ask the server to
   // roll files back to that turn's checkpoint, fork the transcript, and re-run the edited text. The
   // forked session's new id + reply stream back in on the existing socket. Returns null on success or
   // a human reason on failure. It must NEVER fall back to submitText(): an edit that degrades into a
   // plain send leaves the original turn in place and posts the edited text as a second, duplicate turn.
-  const doEdit = async (ed: { i: number; orig: string }, text: string): Promise<string | null> => {
+  const doEdit = async (ed: { uuid: string; orig: string }, text: string): Promise<string | null> => {
     const s = activeStoreRef.current;
     const realId = !!s && !s.id.startsWith("new-") && !s.id.startsWith("pending-");
     if (!s || !realId) return "This chat hasn't started on the server yet, so there's no turn to rewind. Cancel the edit to send it as a new message.";
     if (typeof navigator !== "undefined" && !navigator.onLine) return "You're offline. An edit rewinds the conversation on the server, so unlike a normal message it can't be queued. It will work once you're back online.";
-    // 0-based ordinal among user turns up to the edited item — matches the server's user-turn count.
-    // A mid-turn message is not a turn on the server, so it is not counted (and cannot be edited).
-    const target = await idOf(s, ed.i);
-    if (!target) return "Couldn't find that message on the server. Reload the conversation and try again.";
-    ed = { ...ed, i: target.i };
-    const uindex = userOrdinal(s.items, ed.i);
+    const target = ed.uuid; // the message's own id, same on client and server
+    const at = s.items.findIndex((x) => (x as { uuid?: string }).uuid === target);
+    if (at < 0) return "That message is no longer in this conversation.";
     stickBottom.current = true; setAtBottom(true);
     const snapshot = s.items;
-    s.truncateFrom(ed.i);             // drop the edited bubble + everything after
-    const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
-    s.addOptimisticUser(text, cid); // re-render the edited text below; arms the echo dedup
+    s.truncateFrom(at);               // drop the edited bubble + everything after
+    const cid = newId();              // the edited message's id, used by the server and Claude Code as-is
+    s.addOptimisticUser(text, cid);   // re-render the edited text below; arms the echo dedup
     try {
-      // orig = the stored turn text (attachment lines included), not the bubble's display text: the
-      // server checks it against the transcript, and a turn with an image never matched.
-      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, uuid: target.uuid, model: s.model || undefined }), 30000);
+      const r = await withTimeout(api.edit({ id: s.id, uuid: target, text, cid, model: s.model || undefined }), 30000);
       if (r?.error) { s.restore(snapshot); return "Couldn't edit that message: " + r.error; }
       if (s.sendState === "sending") s.setSendState("delivered");
       return null;
     } catch { s.restore(snapshot); return "Couldn't reach the server to edit, so nothing was sent and nothing was duplicated. Try again."; }
   };
-  // Ordinal of item i among real user turns (mid-turn messages are not turns on the server), or -1.
-  const userOrdinal = (items: Item[], i: number) => {
-    let n = -1;
-    for (let k = 0; k <= i && k < items.length; k++) { const x = items[k]; if (x.kind === "user" && !x.midTurn) n++; }
-    return items[i]?.kind === "user" && !(items[i] as { midTurn?: boolean }).midTurn ? n : -1;
-  };
-  // The transcript id of user bubble i. A bubble without one (just sent, or from the offline cache)
-  // gets it from a full reload; the same bubble is found again by its position among user turns.
-  const idOf = async (s: ConvStore, i: number): Promise<{ uuid: string; i: number } | null> => {
-    const have = (s.items[i] as { uuid?: string } | undefined)?.uuid;
-    if (have) return { uuid: have, i };
-    const n = userOrdinal(s.items, i);
-    if (n < 0) return null;
-    s.evDirty = true;
-    await loadConv(s.id, undefined, { resync: true });
-    let k = -1;
-    for (let j = 0; j < s.items.length; j++) {
-      const x = s.items[j] as { kind: string; midTurn?: boolean; uuid?: string };
-      if (x.kind === "user" && !x.midTurn && ++k === n) return x.uuid ? { uuid: x.uuid, i: j } : null;
-    }
-    return null;
+  // The first real user turn is the whole conversation: it has Delete on the conversation instead.
+  const isFirstTurn = (items: Item[], i: number) => {
+    for (let k = 0; k < i; k++) { const x = items[k]; if (x.kind === "user" && !x.midTurn) return false; }
+    return true;
   };
   // Delete a sent message and everything after it: the server cuts the transcript back to just
-  // before it (chat only; files are left alone). Not offered on the first message: that is the
-  // whole conversation, which has its own Delete.
-  const deleteFrom = async (i: number, orig: string) => { // eslint-disable-line prefer-const
+  // before the message with this id (chat only; files are left alone).
+  const deleteFrom = async (i: number) => {
     setMsgMenu(null);
     const s = activeStoreRef.current;
     if (!s || s.id.startsWith("new-") || s.id.startsWith("pending-") || !navigator.onLine) return;
-    if (userOrdinal(s.items, i) < 1) return;
-    const target = await idOf(s, i);
-    if (!target) { window.alert("Delete failed: message not found on the server"); return; }
-    i = target.i;
-    const index = userOrdinal(s.items, i);
+    const target = (s.items[i] as { uuid?: string } | undefined)?.uuid;
+    if (!target) { window.alert("Delete failed: message has no id"); return; }
     const snapshot = s.items;
-    void orig;
     s.truncateFrom(i);
     try {
-      const r = await api.deleteFrom({ id: s.id, index, uuid: target.uuid });
+      const r = await api.deleteFrom({ id: s.id, uuid: target });
       if (r?.error) throw new Error(r.error);
     } catch (e) {
       s.showItems(snapshot);
@@ -3105,7 +3088,7 @@ function App() {
             {msgMenu.code !== undefined && <button onClick={() => { copyText(msgMenu.code!); setMsgMenu(null); }}>Copy code</button>}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
             {msgMenu.kind === "user" && !(activeStore?.items[msgMenu.i] as { midTurn?: boolean } | undefined)?.midTurn && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
-            {msgMenu.kind === "user" && activeStore && userOrdinal(activeStore.items, msgMenu.i) >= 1 && !busy && <button className="ctx-danger" onClick={() => void deleteFrom(msgMenu.i, msgMenu.text)}>Delete from here</button>}
+            {msgMenu.kind === "user" && activeStore && !(activeStore.items[msgMenu.i] as { midTurn?: boolean } | undefined)?.midTurn && !isFirstTurn(activeStore.items, msgMenu.i) && !busy && <button className="ctx-danger" onClick={() => void deleteFrom(msgMenu.i)}>Delete from here</button>}
           </div>
         </>
       )}
