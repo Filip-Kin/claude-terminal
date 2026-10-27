@@ -711,12 +711,24 @@ export class Conversation {
   // happened, so it fills the gap by inventing one: "in the hour since we started talking" after
   // fifteen minutes. Stamp the real local time and the real gap onto every turn. Hidden from the UI
   // by HIDDEN_STRIP, the same way the voice directive is.
+  // The timezone of the device the user is typing on (IANA name, sent with each turn). Without it the
+  // stamp used the server's zone, so Claude quoted Eastern times to Filip while he was in Europe.
+  private clientTz?: string;
+  setClientTz(tz: unknown) {
+    if (typeof tz !== "string" || !tz || tz.length > 64) return;
+    try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); this.clientTz = tz; } catch { /* unknown zone: keep the last good one */ }
+  }
   private turnContext(): string {
     const now = Date.now();
-    const stamp = new Date(now).toLocaleString(undefined, {
+    const fmt = (timeZone?: string) => new Date(now).toLocaleString("en-US", {
       weekday: "short", day: "numeric", month: "short", year: "numeric",
-      hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+      hour: "2-digit", minute: "2-digit", timeZoneName: "short", ...(timeZone ? { timeZone } : {}),
     });
+    const serverTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const tz = this.clientTz || serverTz;
+    // The server's own time is added when the zones differ: cron jobs, logs and services run on it.
+    const stamp = tz === serverTz ? `${fmt(tz)} (${tz})`
+      : `${fmt(tz)} (${tz}, where the user is). Server time is ${fmt(serverTz)} (${serverTz}); give times to the user in their zone`;
     // After a service restart a resumed conversation has no in-memory history, so "first message"
     // would be a plain lie about a chat with hours of history above it. Say unknown instead.
     const gap = this.lastTurnAt ? `My previous message was ${humanGap(now - this.lastTurnAt)} ago.`

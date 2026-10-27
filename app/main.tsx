@@ -255,13 +255,13 @@ const api = {
   conversation: (id: string, since?: number) =>
     withTimeout(fetch(`/app/api/conversation/${encodeURIComponent(id)}${since && since > 0 ? `?since=${since}` : ""}`).then(J)),
   start: (b: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean }) =>
-    fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+    fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
-    fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+    fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
   deleteFrom: (b: { id: string; uuid: string }) =>
     fetch("/app/api/delete-from", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   edit: (b: { id: string; uuid: string; text: string; cid: string; model?: string }) =>
-    fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+    fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
   setModel: (b: { id: string; model: string }) =>
     fetch("/app/api/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   interrupt: (id: string) => fetch("/app/api/interrupt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }),
@@ -1121,6 +1121,11 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
 
 // A message's id. The client makes it when the message is sent; the server and Claude Code store the
 // same value as the transcript entry's uuid, so every message has one id everywhere from the start.
+// The device's IANA timezone, sent with every turn so Claude's clock is the user's, not the server's.
+function clientTz(): string | undefined {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined; } catch { return undefined; }
+}
+
 function newId(): string {
   if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
   const b = crypto.getRandomValues(new Uint8Array(16));
