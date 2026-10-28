@@ -352,12 +352,12 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
       // time, and whether its cursor was stale. Not logged, no _seq.
       write({ t: "hello", epoch: conv.epoch, seq: conv.seq, resync });
       write(conv.statusEvent()); // current phase straight away, not whenever it next changes
-      tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, epoch: epochParam ? (sameEpoch ? "same" : "stale") : undefined, busy: conv.busy ? 1 : 0 });
+      tlog("stream-open", { conv: conv.id, cl: clientKey ?? "-", ip: req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || req.headers.get("x-real-ip") || "-", tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, epoch: epochParam ? (sameEpoch ? "same" : "stale") : undefined, busy: conv.busy ? 1 : 0 });
       // Tear this stream down. Both the abort and the lifetime paths close the controller themselves,
       // so cancel() never runs and would not log the close; log it here or the open/close counter goes
       // blind, which is the metric this whole problem was found with. `evicted` is the runner dropping
       // the oldest subscriber when a conversation piles past its cap; `replaced` is the same client socket reconnecting.
-      const shut = (why: string) => { tlog("stream-close", { conv: conv.id, why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
+      const shut = (why: string) => { tlog("stream-close", { conv: conv.id, cl: clientKey ?? "-", why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
       // replays the gap (resume), this run's buffer (fromNow=false), or nothing — then live. A stale
       // epoch streams future-only: the client is about to reload the whole thing anyway. evict lets
       // the runner shut THIS stream when the conversation exceeds its subscriber cap.
