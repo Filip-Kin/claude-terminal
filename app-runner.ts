@@ -576,7 +576,7 @@ export class Conversation {
   // holds the upstream connection open (Zoraxy), a client that reloads or navigates away leaves its
   // subscriber alive until the stream's own lifetime expires, so without a cap the count climbs into
   // the hundreds and every event is written to every dead socket.
-  private subs = new Map<Sub, { at: number; evict?: () => void }>();
+  private subs = new Map<Sub, { at: number; evict?: (why?: string) => void; key?: string }>();
   private hooks = new Set<Sub>(); // internal lifecycle listeners (init/closed bookkeeping); do NOT count as client subscribers, or the idle reaper never fires
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
   private pendingAsks = new Map<string, (answer: string) => void>(); // ask_user awaiting a tap
@@ -620,8 +620,8 @@ export class Conversation {
   // fromNow: subscribe to FUTURE events only (no buffer replay). Used when a client reopens a
   // live conversation and has already rebuilt the current turn from the transcript + pending
   // asks, so replaying the buffer would double-render it.
-  subscribe(fn: Sub, fromNow = false, evict?: () => void): () => void {
-    this.addSub(fn, evict);
+  subscribe(fn: Sub, fromNow = false, evict?: (why?: string) => void, key?: string): () => void {
+    this.addSub(fn, evict, key);
     // Replay only the CURRENT turn (from the last turn boundary), so a client that reopens
     // an already-live conversation doesn't get every prior turn re-injected. The client has
     // the earlier turns from the transcript, and _seq dedupe covers mid-turn reconnects.
@@ -635,8 +635,8 @@ export class Conversation {
   // "future only" and every event emitted during the gap is lost for good — which is how a one-shot
   // event like the compaction card disappears while the streamed text around it looks fine. Safe to
   // over-deliver: the client drops anything whose _seq it has already seen.
-  subscribeSince(fn: Sub, sinceSeq: number, evict?: () => void): () => void {
-    this.addSub(fn, evict);
+  subscribeSince(fn: Sub, sinceSeq: number, evict?: (why?: string) => void, key?: string): () => void {
+    this.addSub(fn, evict, key);
     for (const e of this.log) { const s = (e as any)._seq; if (typeof s === "number" && s > sinceSeq) fn(e); }
     return () => { this.subs.delete(fn); this.lastWatchedAt = Date.now(); };
   }
@@ -645,9 +645,21 @@ export class Conversation {
   // A single client keeps one stream per conversation, so a two-figure count is always leaked
   // reconnections a proxy never told us had closed; dropping the oldest reclaims them without
   // touching anyone actually watching (their stream reconnects and resumes from its cursor anyway).
-  private addSub(fn: Sub, evict?: () => void) {
+  //
+  // `key` names the client socket (one per ConvStore in a browser tab). A stream that reconnects with
+  // the same key is the same viewer coming back, so its old subscriber is a dead socket the proxy never
+  // closed: replace it. Without this, every reconnect added a subscriber and pushed out the oldest one,
+  // which was usually another tab's LIVE stream. That tab reconnected 3s later and pushed out the next,
+  // a ring of ~25 reopens a minute, each replaying its gap synchronously, which stalled the event loop
+  // for up to 14s and put "Connection unstable" on every client (2026-10-28).
+  private addSub(fn: Sub, evict?: (why?: string) => void, key?: string) {
     this.lastWatchedAt = Date.now();
-    this.subs.set(fn, { at: Date.now(), evict });
+    if (key) for (const [f, meta] of this.subs) {
+      if (meta.key !== key) continue;
+      this.subs.delete(f);
+      try { meta.evict?.("replaced"); } catch {}
+    }
+    this.subs.set(fn, { at: Date.now(), evict, key });
     if (this.subs.size <= SUBS_CAP) return;
     const oldest = [...this.subs.entries()].sort((a, b) => a[1].at - b[1].at);
     for (let i = 0; i < oldest.length - SUBS_CAP; i++) {

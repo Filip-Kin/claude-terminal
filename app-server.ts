@@ -333,6 +333,9 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
   const epochParam = url.searchParams.get("epoch") || "";
   const sameEpoch = epochParam === conv.epoch;
   const resync = !!epochParam && !sameEpoch;
+  // Client socket id: a reconnect carrying the same one replaces its own stale subscriber (see addSub).
+  const clRaw = url.searchParams.get("cl") || "";
+  const clientKey = /^[A-Za-z0-9_-]{1,64}$/.test(clRaw) ? clRaw : undefined;
   const resumeFrom = Number.isInteger(lastIdRaw) && lastIdRaw >= 0 ? lastIdRaw
     : sameEpoch && Number.isInteger(sinceRaw) && sinceRaw >= -1 ? sinceRaw
     : null;
@@ -353,12 +356,12 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
       // Tear this stream down. Both the abort and the lifetime paths close the controller themselves,
       // so cancel() never runs and would not log the close; log it here or the open/close counter goes
       // blind, which is the metric this whole problem was found with. `evicted` is the runner dropping
-      // the oldest subscriber when a conversation piles past its cap.
+      // the oldest subscriber when a conversation piles past its cap; `replaced` is the same client socket reconnecting.
       const shut = (why: string) => { tlog("stream-close", { conv: conv.id, why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
       // replays the gap (resume), this run's buffer (fromNow=false), or nothing — then live. A stale
       // epoch streams future-only: the client is about to reload the whole thing anyway. evict lets
       // the runner shut THIS stream when the conversation exceeds its subscriber cap.
-      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom, () => shut("evicted")) : conv.subscribe(write, fromNow || resync, () => shut("evicted"));
+      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom, (why) => shut(why || "evicted"), clientKey) : conv.subscribe(write, fromNow || resync, (why) => shut(why || "evicted"), clientKey);
       // Heartbeat as a DATA frame. It used to be an SSE comment, which EventSource never surfaces to
       // JavaScript, so the client could not tell a quiet stream from a dead one and guessed with a
       // timer. If the client is gone the enqueue throws (caught) and the stream is torn down.

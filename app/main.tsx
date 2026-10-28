@@ -524,6 +524,10 @@ class ConvStore {
   private lastWrite = 0;
   private subs = new Set<() => void>();
   private mgr: ConvManager;
+  // Names this store's socket to the server, so a reconnect replaces its own stale subscriber there
+  // instead of pushing out another tab's live one (the reconnect ring of 2026-10-28). Per store, not
+  // per tab: two stores for one conversation must never replace each other.
+  private readonly cl = Math.random().toString(36).slice(2, 12);
   constructor(id: string, mgr: ConvManager) { this.id = id; this.mgr = mgr; }
 
   subscribe = (l: () => void) => { this.subs.add(l); return () => { this.subs.delete(l); }; };
@@ -537,7 +541,7 @@ class ConvStore {
     // the whole fix for "sent from my phone, never showed on the laptop": a fresh EventSource carries
     // no Last-Event-ID, so a deliberate reconnect used to ask for future-only and drop the gap.
     const resume = this.epoch && this.seq >= 0;
-    const q = resume ? `?epoch=${encodeURIComponent(this.epoch!)}&since=${this.seq}` : tail ? "?tail=1" : "";
+    const q = "?" + new URLSearchParams({ ...(resume ? { epoch: this.epoch!, since: String(this.seq) } : tail ? { tail: "1" } : {}), cl: this.cl });
     this.connectMode = resume ? "resume" : tail ? "tail" : "full";
     let es: EventSource;
     try { es = new EventSource(`/app/stream/${encodeURIComponent(this.id)}${q}`); } catch { return; }
@@ -777,6 +781,7 @@ class ConvStore {
   }
 
   teardown() { this.disconnect(); this.flushCache(); this.subs.clear(); }
+  abandon() { this.disconnect(); if (this.cacheTimer) { clearTimeout(this.cacheTimer); this.cacheTimer = null; } this.subs.clear(); } // replaced by another store for the same id: write nothing, its cache entry belongs to that one now
 }
 
 class ConvManager {
@@ -787,6 +792,11 @@ class ConvManager {
   get(id: string) { return this.stores.get(id); }
   rebind(store: ConvStore, newId: string) {
     if (store.id === newId) return;
+    // The status poll can see a new chat's real id before this store learns it and open a background
+    // store for it. Overwriting that entry orphaned it with its EventSource still open, reconnecting
+    // forever with nothing able to close it. Close it before taking its place.
+    const other = this.stores.get(newId);
+    if (other && other !== store) other.abandon();
     this.stores.delete(store.id);
     this.stores.set(newId, store); store.id = newId; store.hydrated = true; store.signal();
   }
