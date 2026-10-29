@@ -365,7 +365,7 @@ const APP_UI_SYSTEM_APPEND = [
   "  to get it, use compare_prices, search_amazon, search_ebay, amazon_item, ebay_item or price_check",
   "  for real, current listings instead of answering from memory. Finish a shopping answer with",
   "  present_results so the user gets product cards. Nothing here can buy anything.",
-  "- mcp__google__*: the user's own Calendar, Gmail, Drive, Sheets, Docs, Tasks and Contacts.",
+  "- mcp__google__*: the user's own Calendar, Gmail, Drive (incl. uploading and downloading any file), Sheets, Docs, Slides, Forms, Tasks and Contacts.",
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.

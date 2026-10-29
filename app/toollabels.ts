@@ -56,6 +56,18 @@ const LABELS: Record<string, string> = {
   "google:docs_create": "Docs · New document",
   "google:docs_append": "Docs · Append",
   "google:docs_replace": "Docs · Replace",
+  "google:slides_read": "Slides · Presentation",
+  "google:slides_create": "Slides · New presentation",
+  "google:slides_add_slide": "Slides · New slide",
+  "google:slides_replace": "Slides · Replace",
+  "google:slides_add_image": "Slides · Image",
+  "google:slides_delete_slide": "Slides · Slide delete",
+  "google:forms_read": "Forms · Form",
+  "google:forms_responses": "Forms · Responses",
+  "google:forms_create": "Forms · New form",
+  "google:forms_add_question": "Forms · New question",
+  "google:drive_upload": "Drive · Upload",
+  "google:drive_download": "Drive · Download",
   "google:tasks_list_lists": "Tasks · Lists",
   "google:tasks_list": "Tasks · Tasks",
   "google:tasks_create": "Tasks · New task",
@@ -69,7 +81,7 @@ const LABELS: Record<string, string> = {
 // Input fields worth showing next to the label, in priority order.
 const SUMMARY_KEYS = [
   "query", "q", "text", "question", "title", "summary", "subject", "to", "name",
-  "asin", "itemId", "item_id", "range", "find", "documentId", "spreadsheetId", "fileId", "eventId", "timeMin",
+  "asin", "itemId", "item_id", "range", "find", "documentId", "spreadsheetId", "presentationId", "formId", "path", "fileId", "eventId", "timeMin",
 ];
 
 const words = (s: string) => s.replace(/_/g, " ");
