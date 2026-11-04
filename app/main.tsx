@@ -182,6 +182,9 @@ function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
 const pushSupported = (): boolean =>
   typeof navigator !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 const isIOSDevice = (): boolean => /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+// Installed to the home screen (iOS uses navigator.standalone, everyone else display-mode).
+const isStandalone = (): boolean =>
+  (typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || (navigator as any).standalone === true;
 
 // Backed by an explicit ArrayBuffer (not the default ArrayBufferLike), because applicationServerKey
 // requires a BufferSource over a real ArrayBuffer.
@@ -1902,7 +1905,7 @@ function App() {
   useEffect(() => {
     try {
       const sp = new URLSearchParams(location.search);
-      const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || (navigator as any).standalone === true;
+      const standalone = isStandalone();
       const navType = (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.type || "";
       const cold = sp.get("home") === "1" || (standalone && !document.referrer && navType !== "reload");
       if (cold && localStorage.getItem("ct-last-surface") === "/terminal") { location.replace("/terminal"); return; }
@@ -3074,10 +3077,10 @@ function App() {
       </main>
       {artifact && (
         window.matchMedia("(max-width: 820px)").matches
-          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={() => setArtifact(null)} />
+          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={() => setArtifact(null)} onOpen={setArtifact} />
           : <div className="artifact-panel" style={{ flex: `0 0 ${artifactW}px` }}>
               <div className="artifact-resizer" onPointerDown={onArtifactResizeDown} onPointerMove={onArtifactResizeMove} onPointerUp={onArtifactResizeUp} onPointerCancel={onArtifactResizeUp} title="Drag to resize" aria-label="Resize artifact panel" />
-              <ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} />
+              <ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} onOpen={setArtifact} />
             </div>
       )}
       {msgMenu && (
