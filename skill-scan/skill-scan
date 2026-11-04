@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Scan agent skills with NVIDIA SkillSpector.
+
+With no arguments, finds every skill under the watched roots and scans the
+ones that are new or whose contents changed since the last scan. With paths,
+scans those skill directories (or every skill below them) unconditionally,
+which is how to vet a skill before installing it.
+
+Runs the LLM pass through the local claude CLI when CLAUDE_CODE_OAUTH_TOKEN
+is in the environment; otherwise static analysis only. Configuration is by
+environment variable; see skill-scan/README.md.
+"""
+
+import argparse
+import atexit
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+HERE = Path(__file__).resolve().parent
+REPO_SKILLS = HERE.parent / "skills"
+
+
+def env_path(name: str, default: Path) -> Path:
+    value = os.environ.get(name)
+    return Path(value).expanduser() if value else default
+
+
+def env_paths(name: str, default: list[Path]) -> list[Path]:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return [Path(p).expanduser() for p in value.split(":") if p]
+
+
+ROOTS = env_paths("SKILL_SCAN_ROOTS", [
+    HOME / ".claude/skills",
+    HOME / ".claude/plugins/cache",
+    REPO_SKILLS,
+])
+# Project skills: <dir>/<proj>/.claude/skills and <dir>/<group>/<proj>/.claude/skills
+PROJECT_DIRS = env_paths("SKILL_SCAN_PROJECT_DIRS", [])
+PROJECT_GLOBS = ["*/.claude/skills", "*/*/.claude/skills"]
+SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__"}
+
+STATE_DIR = env_path("XDG_STATE_HOME", HOME / ".local/state") / "skill-scan"
+DATA_DIR = env_path("XDG_DATA_HOME", HOME / ".local/share") / "skill-scan"
+STATE_FILE = STATE_DIR / "state.json"
+REPORT_DIR = DATA_DIR / "reports"
+LOG_FILE = DATA_DIR / "scan.log"
+SKILLSPECTOR = os.environ.get("SKILLSPECTOR") or shutil.which("skillspector") \
+    or str(HOME / ".local/bin/skillspector")
+MODEL = os.environ.get("SKILL_SCAN_MODEL", "claude-sonnet-5")
+NOTIFY_URL = os.environ.get("SKILL_SCAN_NOTIFY_URL", "http://127.0.0.1:7682/notify")
+
+
+def find_skills(base: Path) -> list[Path]:
+    """Return directories below base that contain a SKILL.md."""
+    found = []
+    if not base.is_dir():
+        return found
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=True):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if "SKILL.md" in filenames or "skill.md" in filenames:
+            found.append(Path(dirpath))
+            dirnames[:] = []  # a skill's own subfolders are part of it
+    return found
+
+
+def watched_skills() -> list[Path]:
+    skills = []
+    for root in ROOTS:
+        skills += find_skills(root)
+    for base in PROJECT_DIRS:
+        for pattern in PROJECT_GLOBS:
+            for d in base.glob(pattern):
+                skills += find_skills(d)
+    return sorted(set(p.resolve() for p in skills))
+
+
+def content_hash(skill: Path) -> str:
+    h = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(skill, followlinks=True):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in sorted(filenames):
+            f = Path(dirpath, name)
+            h.update(str(f.relative_to(skill)).encode())
+            try:
+                h.update(f.read_bytes())
+            except OSError:
+                h.update(b"<unreadable>")
+    return h.hexdigest()
+
+
+def setup_llm() -> bool:
+    """Hand the OAuth token to the claude wrapper; return whether LLM mode is on."""
+    token = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", "")
+    claude = shutil.which("claude") or shutil.which("claude", path=str(HOME / ".local/bin"))
+    if not token:
+        return False
+    if not claude:
+        print("CLAUDE_CODE_OAUTH_TOKEN is set but no claude CLI was found; static only",
+              file=sys.stderr)
+        return False
+    # systemd sets RUNTIME_DIRECTORY (mode 0700); a manual run gets a private temp dir.
+    if os.environ.get("RUNTIME_DIRECTORY"):
+        run_dir = Path(os.environ["RUNTIME_DIRECTORY"])
+    else:
+        run_dir = Path(tempfile.mkdtemp(prefix="skill-scan-"))
+        atexit.register(shutil.rmtree, run_dir, ignore_errors=True)
+    fd = os.open(run_dir / "oauth-token", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token)
+    (run_dir / "claude-path").write_text(claude)
+    # skillspector strips unknown env vars from the claude child, so the wrapper
+    # finds the token and the real CLI next to the symlink it was called through.
+    bindir = run_dir / "bin"
+    bindir.mkdir(exist_ok=True)
+    link = bindir / "claude"
+    if not link.is_symlink():
+        link.symlink_to(HERE / "claude-wrapper")
+    os.environ["PATH"] = f"{bindir}:" + os.environ.get("PATH", "/usr/bin:/bin")
+    os.environ["SKILLSPECTOR_PROVIDER"] = "claude_cli"
+    os.environ["SKILLSPECTOR_MODEL"] = MODEL
+    os.environ.setdefault("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "2")
+    return True
+
+
+def scan(skill: Path, use_llm: bool) -> dict:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = REPORT_DIR / f"{skill.name}-{stamp}.json"
+    cmd = [SKILLSPECTOR, "scan", str(skill), "--format", "json", "--output", str(out)]
+    if not use_llm:
+        cmd.append("--no-llm")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    result = {"skill": str(skill), "report": str(out), "exit": proc.returncode, "llm": use_llm}
+    try:
+        report = json.loads(out.read_text())
+    except (OSError, json.JSONDecodeError):
+        result.update(score=None, recommendation="ERROR", issues=[],
+                      error=proc.stderr.strip()[-500:])
+        return result
+    risk = report.get("risk_assessment", {})
+    meta = report.get("metadata", {})
+    result.update(
+        score=risk.get("score"),
+        recommendation=risk.get("recommendation"),
+        llm_used=bool(meta.get("llm_available")),
+        coverage=report.get("analysis_completeness", {}).get("coverage_percent"),
+        issues=[f'{i.get("severity")} {i.get("id")} {i.get("pattern")} '
+                f'({i.get("location", {}).get("file")})'
+                for i in report.get("issues", [])],
+    )
+    return result
+
+
+def notify(results: list[dict]) -> None:
+    """Push a summary through the sidecar's POST /notify (loopback needs no auth)."""
+    if not NOTIFY_URL:
+        return
+    order = {"ERROR": 4, "DO_NOT_INSTALL": 3, "REVIEW": 2, "CAUTION": 1, "SAFE": 0}
+    worst = max(results, key=lambda r: (order.get(r["recommendation"], 2), r["score"] or 0))
+    name = Path(worst["skill"]).name
+    if len(results) == 1:
+        title = f"Skill scan: {name} {worst['recommendation']} ({worst['score']})"
+    else:
+        title = (f"Skill scan: {len(results)} skills, worst {name} "
+                 f"{worst['recommendation']} ({worst['score']})")
+    body = "; ".join(f"{Path(r['skill']).name} {r['recommendation']} {r['score']}"
+                     for r in results)[:400]
+    req = urllib.request.Request(NOTIFY_URL, method="POST",
+                                 data=json.dumps({"title": title, "body": body,
+                                                  "tag": "skill-scan"}).encode(),
+                                 headers={"content-type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10).close()
+    except OSError as e:
+        print(f"notify failed: {e}", file=sys.stderr)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("paths", nargs="*", type=Path, help="skill dirs to scan regardless of state")
+    ap.add_argument("--no-llm", action="store_true", help="static analysis only")
+    ap.add_argument("--no-notify", action="store_true")
+    args = ap.parse_args()
+
+    if not Path(SKILLSPECTOR).exists():
+        print(f"skillspector not found at {SKILLSPECTOR}; install it or set SKILLSPECTOR",
+              file=sys.stderr)
+        return 1
+    use_llm = not args.no_llm and setup_llm()
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+
+    if args.paths:
+        targets = sorted(set(s.resolve() for p in args.paths for s in find_skills(p)))
+    else:
+        targets = [s for s in watched_skills()
+                   if state.get(str(s), {}).get("hash") != content_hash(s)]
+
+    watched = set(watched_skills()) if args.paths else set(targets)
+    results = []
+    for skill in targets:
+        digest = content_hash(skill)
+        r = scan(skill, use_llm)
+        r["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        results.append(r)
+        # Record only watched skills, so vetting a scratch copy leaves no state.
+        if r["recommendation"] != "ERROR" and skill in watched:
+            state[str(skill)] = {"hash": digest, **{k: r.get(k) for k in
+                                 ("score", "recommendation", "report", "time", "llm_used")}}
+            STATE_FILE.write_text(json.dumps(state, indent=1))
+        with LOG_FILE.open("a") as log:
+            log.write(json.dumps(r) + "\n")
+        print(f"{r['recommendation']:>14} {str(r['score']):>4}  {skill}  "
+              f"(llm={r.get('llm_used')}, report {r['report']})")
+        for issue in r["issues"]:
+            print(f"{'':20}{issue}")
+
+    if results and not args.no_notify:
+        notify(results)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

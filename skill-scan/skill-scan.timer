@@ -1,0 +1,9 @@
+[Unit]
+Description=Sweep for new or changed agent skills every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=10min
+
+[Install]
+WantedBy=timers.target

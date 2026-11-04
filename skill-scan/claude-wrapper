@@ -1,0 +1,10 @@
+#!/bin/sh
+# skillspector strips CLAUDE_CODE_OAUTH_TOKEN from the claude child process.
+# skill-scan writes the token and the real CLI's path to its runtime dir and
+# calls this script through a symlink in <runtime dir>/bin; load both from there.
+RUN_DIR="$(dirname "$0")/.."
+if [ -r "$RUN_DIR/oauth-token" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN=$(cat "$RUN_DIR/oauth-token")
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+exec "$(cat "$RUN_DIR/claude-path")" "$@"

@@ -27,3 +27,5 @@ instead (see the Claude Code docs for skill discovery locations).
   extra things worth surfacing while you are away.
 
 Both assume the sidecar is running with notifications configured; see the main README.
+
+To scan these and any other skills you add with NVIDIA SkillSpector, see [`skill-scan/`](../skill-scan/README.md).
