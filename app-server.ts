@@ -1007,14 +1007,35 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // "~/vault/note.md" is how Claude routinely writes a path; expand it before resolving, or it
     // lands under the chat's cwd and 404s. The traversal guard below still applies.
     const relPath = /^~(\/|$)/.test(rel) ? join(process.env.HOME || homedir(), rel.slice(1)) : rel;
-    const target = resolve(relPath.startsWith("/") ? relPath : join(base, relPath)); // resolve() so a ".." in the path cannot walk out of a root
+    let target = resolve(relPath.startsWith("/") ? relPath : join(base, relPath)); // resolve() so a ".." in the path cannot walk out of a root
     // Traversal guard. The chat's own cwd always counts; the configured roots cover the rest of the
     // owner's filesystem, so a file Claude wrote outside the directory the chat happens to sit in
     // still resolves. A guest container ships no roots, so it keeps the old cwd-only behaviour.
     const under = (root: string) => target === root || target.startsWith(root.replace(/\/+$/, "") + "/");
     if (!under(base) && !ctx.downloadRoots.some(under)) return jsonRes({ error: "path outside conversation" }, ctx, req, 403);
-    const f = Bun.file(target);
-    if (!(await f.exists())) return jsonRes({ error: "not found" }, ctx, req, 404);
+    let f = Bun.file(target);
+    // A miss on a relative link usually means Claude wrote it relative to the folder its shell had
+    // cd'd into, not the chat's cwd. Every transcript line records the shell's cwd, so retry against
+    // those, newest first. A path Claude percent-encoded in the markdown arrives still encoded, so a
+    // decoded retry covers that too. Each candidate passes the same root check, so the retry cannot
+    // reach anything a direct link could not.
+    if (!(await f.exists())) {
+      const tries: string[] = [];
+      try { const dec = decodeURIComponent(relPath); if (dec !== relPath) tries.push(resolve(dec.startsWith("/") ? dec : join(base, dec))); } catch { /* malformed escape */ }
+      const t = !relPath.startsWith("/") && findTranscript(ctx, conv?.id || id);
+      if (t) {
+        const dirs = new Set<string>();
+        for (const line of (await Bun.file(t.path).text()).split("\n").reverse()) { const m = /"cwd":"([^"]+)"/.exec(line); if (m) dirs.add(m[1]); }
+        for (const d of dirs) tries.push(resolve(join(d, relPath)));
+      }
+      let hit = "";
+      for (const c of tries) {
+        const ok = (root: string) => c === root || c.startsWith(root.replace(/\/+$/, "") + "/");
+        if ((ok(base) || ctx.downloadRoots.some(ok)) && (await Bun.file(c).exists())) { hit = c; break; }
+      }
+      if (!hit) return jsonRes({ error: "not found" }, ctx, req, 404);
+      target = hit; f = Bun.file(target);
+    }
     const name = target.split("/").pop() || "download";
     // Freshness: the path is stable, so when Claude overwrites a file at the same name (an edited
     // chart/SVG) the browser would serve the cached copy and the change would never show. An ETag
