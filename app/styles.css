@@ -199,7 +199,9 @@ a { color: var(--accent-2); }
 /* In the composer foot the menu opens UPWARD (it sits at the bottom of the screen) and to the left. */
 .model-picker.up .model-menu { top: auto; bottom: 40px; left: 0; right: auto; }
 .model-picker.up .model-btn { padding: 5px 10px; font-size: 12.5px; }
-.composer-foot { display: flex; align-items: center; gap: 8px; padding: 8px 2px 0; }
+/* Same width and centering as .composer (its sibling in .composer-wrap), so the model pill and
+   usage chips sit under the box instead of spreading out to the window edges. */
+.composer-foot { display: flex; align-items: center; gap: 8px; padding: 8px 2px 0; max-width: 760px; margin: 0 auto; }
 .composer-foot .cf-spacer { flex: 1; }
 
 /* model dialog (Other versions) */
