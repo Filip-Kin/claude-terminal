@@ -1,0 +1,17 @@
+[Unit]
+Description=Scan new or changed agent skills with NVIDIA SkillSpector
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional: CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) turns on the LLM pass,
+# plus any SKILL_SCAN_* overrides. Keep this file mode 600.
+EnvironmentFile=-%h/.config/skill-scan/env
+RuntimeDirectory=skill-scan
+RuntimeDirectoryMode=0700
+# Let a skill finish copying before it is hashed.
+ExecStartPre=/bin/sleep 20
+ExecStart=%h/.local/bin/skill-scan
+Nice=10
+MemoryMax=2G
+TimeoutStartSec=2h

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run skill-scan when a skill folder changes
+
+[Path]
+PathChanged=%h/.claude/skills
+PathChanged=%h/.claude/plugins
+# Add a PathChanged= line for each extra root in SKILL_SCAN_ROOTS.
+
+[Install]
+WantedBy=default.target
