@@ -280,21 +280,38 @@ self.addEventListener("push", (event) => {
   })());
 });
 
-// Clicking a notification: focus an already-open terminal (and tell the overlay
-// which session to switch to), or open a fresh window at the target URL.
+// Clicking a notification opens the page it names. "/" and "/app" both listen for
+// ct-notification-click but read sessionId differently (tmux name vs chat id), so the
+// payload has to reach a window on the notification's own page.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const d = event.notification.data || {};
   const url = d.url || "/";
+  const msg = { type: "ct-notification-click", url, sessionId: d.sessionId || null };
   event.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (const c of all) {
-      try {
-        await c.focus();
-        c.postMessage({ type: "ct-notification-click", url, sessionId: d.sessionId || null });
-        return;
-      } catch {}
+    const path = (u) => { try { return new URL(u, self.location.origin).pathname; } catch { return ""; } };
+    const target = path(url);
+    // A window already on the notification's own page can act on the payload directly through
+    // its own listener (loadConv on /app, switchTo on /). Prefer that one if it is open.
+    const match = all.find((c) => path(c.url) === target);
+    if (match) {
+      try { await match.focus(); } catch {}
+      match.postMessage(msg);
+      return;
     }
-    if (self.clients.openWindow) return self.clients.openWindow(url);
+    const other = all[0];
+    if (!other) { if (self.clients.openWindow) return self.clients.openWindow(url); return; }
+    try {
+      // Send the open window to the right page; both pages read their session out of the URL
+      // (?c= on /app, ?arg= on /) on load, so navigating lands in the right place on its own.
+      const nav = await other.navigate(url);
+      try { await (nav || other).focus(); } catch {}
+    } catch {
+      // navigate() is unsupported in this browser (notably Safari/iOS) or threw for a window this
+      // worker does not control. Fall back to the old behaviour so the tap still does something.
+      try { await other.focus(); } catch {}
+      other.postMessage(msg);
+    }
   })());
 });
