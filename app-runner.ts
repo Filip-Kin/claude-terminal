@@ -1035,6 +1035,10 @@ export class Conversation {
         env: { ...(process.env as Record<string, string>), CLAUDE_CODE_RESUME_PROMPT: RESUME_PROMPT },
         ...(this.model ? { model: this.model } : {}),
         ...(this.resume ? { resume: this.resume } : {}),
+        // A brand-new chat runs under the id it was created with (a UUID made at /app/api/start), so
+        // the start reply already carries the real session id. Only on the very first run: a later
+        // fresh session (editing the first turn) must get a new id, never reuse this one.
+        ...(!this.resume && !this.inited && UUID_RE.test(this.id) ? { sessionId: this.id } : {}),
         ...forkOpts,
         ...(this.skills ? { skills: this.skills } : {}), // which skills this chat may use
         permissionMode: "bypassPermissions",
@@ -1332,7 +1336,6 @@ export class Conversation {
 
 // #region registry (one Conversation per session id / new-chat key)
 const conversations = new Map<string, Conversation>();
-let tmpCounter = 0;
 
 // Open (or reattach to) a conversation. For a brand-new chat pass resume=undefined and
 // a `first` turn to run(); we return the temp key immediately and the real session id
@@ -1343,7 +1346,11 @@ export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
     c.lastActivity = Date.now();
     return c;
   }
-  const id = key || `new-${Date.now().toString(36)}-${tmpCounter++}`;
+  // A new chat gets its real id now (the SDK runs under it, see run()), so /app/api/start returns
+  // the id every later send uses. Before 2026-11-06 it got a temp "new-" id and the client learned
+  // the real one only from the stream's init event; a stream that missed init left the app on the
+  // temp id and every follow-up started another new chat.
+  const id = key || crypto.randomUUID();
   const c = new Conversation(id, opts);
   conversations.set(id, c);
   // once the SDK assigns a real session id, register the conversation under it too
