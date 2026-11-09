@@ -1145,7 +1145,9 @@ export class Conversation {
           if (this.model && anyM.session_id) modelChoiceHook?.(anyM.session_id, this.model);
           if (this.phase === "starting") this.setPhase("waiting");
           // An MCP server that failed to connect is the classic silent pre-model stall. Say so.
-          for (const m of (anyM.mcp_servers as { name: string; status: string }[] | undefined) || []) if (m.status && m.status !== "connected") this.emit({ t: "notice", kind: "info", text: `MCP server "${m.name}" ${m.status}.` });
+          // needs-auth / disabled are standing states (a plugin nobody signed in to), posted on every
+          // start and resume as noise (Filip, 2026-11-08); only an actual failure is worth a line.
+          for (const m of (anyM.mcp_servers as { name: string; status: string }[] | undefined) || []) if (m.status && !["connected", "needs-auth", "disabled", "pending"].includes(m.status)) this.emit({ t: "notice", kind: "info", text: `MCP server "${m.name}" ${m.status}.` });
           // The context window for this model, once. Every later context event carries it.
           void this.contextUsage().then((cu) => { if (cu?.raw_max_tokens) { this.ctxMax = cu.raw_max_tokens; this.emit({ t: "context", used: cu.total_tokens || 0, max: this.ctxMax }); } });
         }
