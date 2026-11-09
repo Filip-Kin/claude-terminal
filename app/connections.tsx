@@ -142,6 +142,30 @@ function useNetAvail(active: boolean): [NetAvail, () => void] {
 }
 
 /**
+ * Names of MCP servers waiting on a sign-in in any running chat. Drives the red dot on the
+ * Connections buttons. Re-read once a minute while visible and whenever `bump` changes (the panel
+ * closing, so a sign-in just done clears the dot at once).
+ */
+export function useMcpNeedsAuth(bump: unknown): string[] {
+  const [names, setNames] = useState<string[]>([]);
+  useEffect(() => {
+    let dead = false;
+    const load = () => {
+      if (document.visibilityState !== "visible") return;
+      fetch("/app/api/mcp/attention", { credentials: "same-origin", cache: "no-store" })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (!dead && d && Array.isArray(d.needsAuth)) setNames((cur) => (cur.join("\n") === d.needsAuth.join("\n") ? cur : d.needsAuth)); })
+        .catch(() => { /* older server or offline: no dot */ });
+    };
+    load();
+    const t = setInterval(load, 60_000);
+    document.addEventListener("visibilitychange", load);
+    return () => { dead = true; clearInterval(t); document.removeEventListener("visibilitychange", load); };
+  }, [bump]);
+  return names;
+}
+
+/**
  * True only when the server reports the network feature is enabled. Kept for callers that want
  * to know; the Connections button itself no longer depends on it.
  */

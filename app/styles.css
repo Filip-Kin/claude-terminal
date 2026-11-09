@@ -93,6 +93,9 @@ a { color: var(--accent-2); }
 .sb-head { display: flex; align-items: center; gap: 8px; }
 .sb-gear { flex: 0 0 auto; background: none; border: 0; color: var(--text-3); cursor: pointer; padding: 4px; border-radius: 7px; display: inline-flex; }
 .sb-gear:hover { color: var(--text); background: var(--bg-2); }
+/* A server waiting on a sign-in: red dot on the Connections buttons. */
+.has-dot { position: relative; }
+.has-dot::after { content: ""; position: absolute; top: 2px; right: 2px; width: 8px; height: 8px; border-radius: 50%; background: #EF4444; box-shadow: 0 0 0 2px var(--bg); pointer-events: none; }
 .settings-body { padding: 6px 4px 4px; }
 .settings-section { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; padding: 8px 8px 6px; }
 .settings-row { display: flex; align-items: center; gap: 14px; padding: 10px 8px; }

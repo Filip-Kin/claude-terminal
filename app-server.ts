@@ -11,7 +11,7 @@ import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync,
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
-import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -157,6 +157,11 @@ async function saveTitles(file: string) { if (titleMap) await Bun.write(file, JS
 // #endregion
 
 const enc = (s: string) => encodeURIComponent(s);
+
+// MCP sign-ins in flight, by the OAuth state in their URL: which chat started it, for which server.
+// In memory: a restart drops them, and the sign-in is simply started again.
+const mcpAuthPending = new Map<string, { conv: string; name: string; at: number }>();
+const mcpAuthLast = new Map<string, string>(); // server name -> chat of its latest sign-in (pasted-URL path)
 
 function jsonRes(body: unknown, ctx: AppCtx, req: Request, status = 200) {
   return Response.json(body, { status, headers: { ...ctx.cors(req), "Cache-Control": "no-store" } });
@@ -445,8 +450,79 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const servers = await loadMcp(ctx.mcpFile);
     const id = new URL(req.url).searchParams.get("id") || "";
     const live = id ? get(id) : undefined;
-    const status = live ? await live.mcpStatus() : [];
+    // No running chat behind this view: any running chat answers for plugin and claude.ai servers,
+    // whose sign-in state is the same in every chat.
+    const from = live || runningConversations()[0];
+    const status = from ? await from.mcpStatus() : [];
     return jsonRes({ servers, builtins: BUILTIN_MCP_NAMES, status, live: !!live }, ctx, req);
+  }
+  // Servers waiting on a sign-in, across every running chat (the dot on the Connections button).
+  if (req.method === "GET" && path === "/app/api/mcp/attention") {
+    const names = new Set<string>();
+    for (const c of runningConversations()) for (const st of await c.mcpStatus()) if (st.status === "needs-auth") names.add(st.name);
+    return jsonRes({ needsAuth: [...names] }, ctx, req);
+  }
+  // Start a server's sign-in: { name, id? }. Answers with the URL to open. The redirect comes back
+  // to /app/mcp-callback on this same origin; a provider that refuses a custom redirect falls back
+  // to the CLI's localhost one (redirectScheme "localhost"), and then the browser's final address
+  // is pasted back through /app/api/mcp/auth/callback.
+  if (req.method === "POST" && path === "/app/api/mcp/auth") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const name = String(b.name || "");
+    if (!name) return jsonRes({ error: "name required" }, ctx, req, 400);
+    const conv = (b.id ? get(String(b.id)) : undefined) || runningConversations()[0];
+    if (!conv) return jsonRes({ error: "no running chat" }, ctx, req, 409);
+    const origin = req.headers.get("origin") || (req.headers.get("x-forwarded-host") ? `${req.headers.get("x-forwarded-proto") || "https"}://${req.headers.get("x-forwarded-host")}` : "");
+    try {
+      const r = await conv.mcpAuthenticate(name, origin ? `${origin}/app/mcp-callback` : undefined);
+      if (!r?.authUrl) return jsonRes({ error: "no sign-in URL", detail: r }, ctx, req, 502);
+      const state = r.state || (() => { try { return new URL(r.authUrl).searchParams.get("state") || ""; } catch { return ""; } })();
+      if (state) mcpAuthPending.set(state, { conv: conv.id, name, at: Date.now() });
+      mcpAuthLast.set(name, conv.id);
+      tlog("mcp-auth", { conv: conv.id, name, scheme: r.redirectScheme || "-", callback: r.callbackExpected ? 1 : 0 });
+      return jsonRes({ ok: true, ...r }, ctx, req);
+    } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 502); }
+  }
+  // The provider's redirect after a sign-in. Hands the whole URL to the chat that started the flow.
+  if (req.method === "GET" && path === "/app/mcp-callback") {
+    const u = new URL(req.url);
+    const p = mcpAuthPending.get(u.searchParams.get("state") || "");
+    const page = (title: string, ok: boolean) => new Response(
+      `<!doctype html><meta name="viewport" content="width=device-width"><title>${title}</title><body style="font:16px system-ui;background:#1c1917;color:#e7e5e4;display:grid;place-items:center;height:100vh;margin:0"><div>${ok ? "&#10003; " : ""}${title}</div>${ok ? "<script>setTimeout(()=>window.close(),800)</script>" : ""}`,
+      { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    const esc = (t: string) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!));
+    if (!p) return page("Sign-in expired", false);
+    const conv = get(p.conv);
+    if (!conv) return page("Chat closed", false);
+    const fwdHost = req.headers.get("x-forwarded-host");
+    const full = fwdHost ? `${req.headers.get("x-forwarded-proto") || "https"}://${fwdHost}${u.pathname}${u.search}` : req.url;
+    try {
+      await conv.mcpSubmitCallback(p.name, full);
+      mcpAuthPending.delete(u.searchParams.get("state") || "");
+      tlog("mcp-auth-done", { conv: conv.id, name: p.name });
+      return page(`${esc(p.name)} connected`, true);
+    } catch (e: any) { return page(`Sign-in failed: ${esc(String(e?.message || e))}`, false); }
+  }
+  // The localhost fallback: { name, url } with the address the browser ended on.
+  if (req.method === "POST" && path === "/app/api/mcp/auth/callback") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const name = String(b.name || ""), url = String(b.url || "");
+    let state = ""; try { state = new URL(url).searchParams.get("state") || ""; } catch { return jsonRes({ error: "not a URL" }, ctx, req, 400); }
+    const convId = mcpAuthPending.get(state)?.conv || mcpAuthLast.get(name);
+    const conv = convId ? get(convId) : undefined;
+    if (!conv) return jsonRes({ error: "no sign-in in progress" }, ctx, req, 409);
+    try { await conv.mcpSubmitCallback(name, url); mcpAuthPending.delete(state); return jsonRes({ ok: true }, ctx, req); }
+    catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 502); }
+  }
+  // Reconnect one server in every running chat (after a claude.ai connector sign-in, which has no
+  // callback to us): { name }.
+  if (req.method === "POST" && path === "/app/api/mcp/reconnect") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const name = String(b.name || "");
+    if (!name) return jsonRes({ error: "name required" }, ctx, req, 400);
+    const errors: string[] = [];
+    for (const c of runningConversations()) { try { await c.mcpReconnect(name); } catch (e: any) { errors.push(String(e?.message || e)); } }
+    return jsonRes({ ok: !errors.length, errors }, ctx, req);
   }
   // Add or update a server: { name, config, applyTo? }. Takes effect on the next new chat; pass
   // applyTo=<id> to also push it live into that running conversation via setMcpServers.

@@ -267,6 +267,11 @@ export function McpSection({ activeId }: { activeId: string | null }) {
   const [fUrl, setFUrl] = useState("");
   const [fPairs, setFPairs] = useState("");
   const [saving, setSaving] = useState(false);
+  // Sign-ins in progress, by server name: "callback" waits for the provider to redirect back here,
+  // "paste" for the address a localhost redirect left in the browser, "reconnect" for a claude.ai
+  // connector, which signs in on claude.ai and has no callback to us.
+  const [signing, setSigning] = useState<Record<string, "callback" | "paste" | "reconnect">>({});
+  const [pasteUrl, setPasteUrl] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -365,9 +370,72 @@ export function McpSection({ activeId }: { activeId: string | null }) {
     } catch (e) { setErr(msg(e)); }
   };
 
+  // While a sign-in is open, re-read the status so the row turns green on its own.
+  const signingAny = Object.keys(signing).length > 0;
+  useEffect(() => {
+    if (!signingAny) return;
+    const t = setInterval(() => { void refresh(); }, 3000);
+    return () => clearInterval(t);
+  }, [signingAny, refresh]);
+  useEffect(() => {
+    setSigning((cur) => {
+      const next = { ...cur };
+      for (const n of Object.keys(cur)) if (status[n]?.status === "connected") delete next[n];
+      return Object.keys(next).length === Object.keys(cur).length ? cur : next;
+    });
+  }, [status]);
+
+  const signIn = async (name: string) => {
+    setErr(""); setOk("");
+    // Opened inside the click, before any await, or the browser blocks it as a popup.
+    const w = window.open("", "_blank");
+    try {
+      const r = await postJson("/app/api/mcp/auth", { name, id: activeId || undefined });
+      if (r.error || !r.authUrl) { w?.close(); setErr(String(r.error || "No sign-in URL")); return; }
+      if (w) w.location.href = r.authUrl; else window.open(r.authUrl, "_blank");
+      setSigning((c) => ({ ...c, [name]: r.callbackExpected === false ? "reconnect" : r.redirectScheme === "localhost" ? "paste" : "callback" }));
+    } catch (e) { w?.close(); setErr(msg(e)); }
+  };
+  const submitPaste = async (name: string) => {
+    setErr("");
+    try {
+      const r = await postJson("/app/api/mcp/auth/callback", { name, url: pasteUrl.trim() });
+      if (r.error) { setErr(String(r.error)); return; }
+      setPasteUrl(""); await refresh();
+    } catch (e) { setErr(msg(e)); }
+  };
+  const reconnect = async (name: string) => {
+    setErr("");
+    try {
+      const r = await postJson("/app/api/mcp/reconnect", { name });
+      if (r.error) setErr(String(r.error));
+      await refresh();
+    } catch (e) { setErr(msg(e)); }
+  };
+  const authControls = (name: string, st?: McpStatus) => {
+    const mode = signing[name];
+    if (st?.status !== "needs-auth" && !mode) return null;
+    return (
+      <div className="ms-auth">
+        <button className="ms-ic ms-auth-go" onClick={() => { void signIn(name); }}>{mode ? "Sign in again" : "Sign in"}</button>
+        {mode === "reconnect" && <button className="ms-ic" onClick={() => { void reconnect(name); }}>Reconnect</button>}
+        {mode === "paste" && (
+          <>
+            <input className="ms-in ms-auth-url" value={pasteUrl} onChange={(e) => setPasteUrl(e.target.value)} placeholder="http://localhost:…/callback?code=…" aria-label="Callback URL" autoCapitalize="none" autoCorrect="off" />
+            <button className="ms-ic" disabled={!pasteUrl.trim()} onClick={() => { void submitPaste(name); }}>Submit</button>
+          </>
+        )}
+      </div>
+    );
+  };
+
   if (dead) return <Dead text={dead} onRetry={() => { void refresh(); }} />;
 
   const names = Object.keys(servers).sort();
+  // Servers the chat runs that are neither built in nor added here: plugin and claude.ai connectors.
+  const others = Object.keys(status).filter((n) => n !== "app-ui" && !builtins.includes(n) && !names.includes(n)).sort();
+  const sourceOf = (n: string) => (n.startsWith("plugin:") ? "plugin" : n.startsWith("claude.ai ") ? "claude.ai" : "other");
+  const labelOf = (n: string) => (n.startsWith("plugin:") ? n.split(":").pop() || n : n.replace(/^claude\.ai /, ""));
 
   return (
     <>
@@ -438,6 +506,26 @@ export function McpSection({ activeId }: { activeId: string | null }) {
                 </span>
               </div>
               {st?.error && <div className="ms-rowerr">{st.error}</div>}
+              {authControls(b, st)}
+            </div>
+          );
+        })}
+        {others.map((n) => {
+          const st = status[n];
+          const tools = toolCountOf(st);
+          return (
+            <div className="ms-row" key={n}>
+              <div className="ms-row-top">
+                <span className="ms-dot" style={{ background: MCP_DOT[st?.status || ""] || "#8a8078" }} title={st?.status} />
+                <span className="ms-name" title={n}>{labelOf(n)}</span>
+                <span className="ms-badge">{sourceOf(n)}</span>
+                <span className="ms-state">
+                  {st?.status}
+                  {tools !== null ? " · " + tools + (tools === 1 ? " tool" : " tools") : ""}
+                </span>
+              </div>
+              {st?.error && <div className="ms-rowerr">{st.error}</div>}
+              {authControls(n, st)}
             </div>
           );
         })}
@@ -476,9 +564,7 @@ export function McpSection({ activeId }: { activeId: string | null }) {
                 </div>
                 {detail && <div className="ms-sub"><code>{detail}</code></div>}
                 {st?.error && <div className="ms-rowerr">{st.error}</div>}
-                {st?.status === "needs-auth" && (
-                  <div className="ms-sub">Needs authorising. Open this server's login from a terminal session (<code>/mcp</code>).</div>
-                )}
+                {authControls(n, st)}
               </div>
             );
           })
@@ -740,6 +826,9 @@ export function injectManageCss() {
   .ms-row{border:1px solid var(--line-2,#2c2621);border-radius:11px;padding:12px 14px;background:var(--bg,#1a1613)}
   .ms-row-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .ms-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .ms-auth{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px}
+  .ms-auth-go{color:var(--accent,#d97757);border:1px solid var(--accent,#d97757)}
+  .ms-auth-url{flex:1 1 220px;min-width:0;padding:6px 9px;font-size:12.5px}
   .ms-name{font-weight:600;font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .ms-badge{flex:0 0 auto;font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;padding:2px 7px;border-radius:6px;background:var(--bg-3,#2a2420);color:var(--text-3,#8a8078)}
   .ms-state{font-size:12px;color:var(--text-3,#8a8078);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

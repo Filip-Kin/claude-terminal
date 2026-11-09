@@ -857,6 +857,27 @@ export class Conversation {
     try { return (await this.q?.mcpServerStatus?.()) ?? []; } catch { return []; }
   }
 
+  // MCP sign-in, through the SDK's control requests (present on the query object, not in its typings).
+  // mcpAuthenticate starts the server's OAuth flow and answers with the URL the user opens; with a
+  // redirectUri the provider sends the browser back to us, and mcpSubmitOAuthCallbackUrl hands the
+  // full callback URL (code + state) to the CLI, which finishes the token exchange and stores it in
+  // ~/.claude, so every chat sees the server signed in.
+  async mcpAuthenticate(name: string, redirectUri?: string): Promise<{ authUrl?: string; requiresUserAction?: boolean; callbackExpected?: boolean; redirectScheme?: string; state?: string } | null> {
+    const q = this.q as any;
+    if (!q?.mcpAuthenticate) return null;
+    return (await q.mcpAuthenticate(name, redirectUri)) ?? null;
+  }
+  async mcpSubmitCallback(name: string, callbackUrl: string): Promise<unknown> {
+    const q = this.q as any;
+    if (!q?.mcpSubmitOAuthCallbackUrl) throw new Error("not running");
+    return q.mcpSubmitOAuthCallbackUrl(name, callbackUrl);
+  }
+  async mcpReconnect(name: string): Promise<void> {
+    const q = this.q as any;
+    if (!q?.reconnectMcpServer) throw new Error("not running");
+    await q.reconnectMcpServer(name);
+  }
+
   // Apply a new persisted MCP set to THIS already-running conversation without restarting it.
   // setMcpServers replaces the whole dynamic set, so we always re-include the ask_user server.
   // Returns which servers were added/removed and any connection errors (or null if not running).
@@ -1415,6 +1436,12 @@ function cliSessionStatuses(): Record<string, LiveStatus> {
   } catch { /* no registry on this box */ }
   sessCache = { at: Date.now(), map };
   return map;
+}
+
+// Every conversation with a running query, newest first: the MCP sign-in and the needs-auth dot work
+// from any of them, since a sign-in is stored once for all chats.
+export function runningConversations(): Conversation[] {
+  return [...new Set(conversations.values())].filter((c) => !!(c as any).q).reverse();
 }
 
 // Live status for every in-memory conversation, keyed by session id (for the list indicators),

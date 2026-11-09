@@ -15,7 +15,7 @@ import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer, is
 import { toolDisplay } from "./toollabels";
 import { extractShopCards, ShopGallery } from "./shopcards";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
-import { ConnectionsModal } from "./connections";
+import { ConnectionsModal, useMcpNeedsAuth } from "./connections";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -1453,6 +1453,9 @@ function App() {
   const setTheme = useCallback((t: ThemePref) => { setThemeState(t); try { localStorage.setItem(THEME_LS, t); } catch { /* */ } applyTheme(t); }, []);
   useEffect(() => { applyTheme(theme); if (theme !== "system" || !themeMql) return; const on = () => applyTheme("system"); themeMql.addEventListener?.("change", on); return () => themeMql.removeEventListener?.("change", on); }, [theme]);
   const [connOpen, setConnOpen] = useState(false); // Connections: MCP servers, skills, memory, network
+  const mcpNeedsAuth = useMcpNeedsAuth(connOpen); // red dot on the Connections buttons
+  const connDot = mcpNeedsAuth.length ? " has-dot" : "";
+  const connTitle = mcpNeedsAuth.length ? `Connections · sign-in needed: ${mcpNeedsAuth.map((n) => n.split(":").pop()).join(", ")}` : "Connections (MCP servers, skills, memory, network)";
   // null = still checking, so the row shows a neutral state instead of flashing "off" then "on".
   const [pushOn, setPushOn] = useState<boolean | null>(null);
   const [pushBusy, setPushBusy] = useState(false);
@@ -2940,7 +2943,7 @@ function App() {
           <button className="sb-gear" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
           </button>
-          <button className="sb-gear" onClick={() => setConnOpen(true)} aria-label="Connections" title="Connections (MCP servers, skills, memory, network)">
+          <button className={"sb-gear" + connDot} onClick={() => setConnOpen(true)} aria-label="Connections" title={connTitle}>
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="2.6" /><circle cx="5" cy="5" r="2" /><circle cx="19" cy="5" r="2" /><circle cx="12" cy="20" r="2" /><path d="M10.2 10.2 6.4 6.4M13.8 10.2l3.8-3.8M12 14.6V18" /></svg>
           </button>
         </div>
@@ -3083,7 +3086,7 @@ function App() {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 12.5l-8.5 8.5a5 5 0 01-7-7L14 5.5a3.3 3.3 0 014.7 4.7l-9.2 9.2a1.6 1.6 0 01-2.3-2.3l8.5-8.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
                 <input type="file" multiple style={{ display: "none" }} onChange={onFile} />
               </label>
-              <button className="act-btn" onClick={() => setConnOpen(true)} title="Connections — MCP servers, skills, memory, network">
+              <button className={"act-btn" + connDot} onClick={() => setConnOpen(true)} aria-label="Connections" title={connTitle}>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M9 7V4a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v3M15 7V4a1 1 0 0 0-1-1M7 7h10l-.6 9a3 3 0 0 1-3 2.8H10.6a3 3 0 0 1-3-2.8L7 7z" /><path d="M12 18v3" /></svg>
               </button>
               <div className="spacer" />
