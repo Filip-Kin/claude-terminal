@@ -905,9 +905,9 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
 
 // A run of consecutive tool uses, collapsed into one accordion: "Used N tools · ~Xk tokens" (counts
 // up live). Open it to see each tool card. Single tools render on their own (no accordion).
-// A run of work (tool calls, the thinking between them, background-task notices) collapsed into
-// one row: "Used N tools · ~Xk tokens". Open it to see every step in order.
-function ToolGroup({ entries, live, render }: { entries: { it: Item; i: number; merged?: ThinkingItem }[]; live: boolean; render: (i: number, merged?: ThinkingItem) => React.ReactNode }) {
+// A run of back-to-back tool calls collapsed into one row: "Used N tools · ~Xk tokens". Open it to
+// see each call.
+function ToolGroup({ entries, live, render }: { entries: { it: Item; i: number }[]; live: boolean; render: (i: number) => React.ReactNode }) {
   const [open, setOpen] = useState(false);
   const tools = entries.filter((e) => e.it.kind === "tool").map((e) => e.it as Extract<Item, { kind: "tool" }>);
   const n = tools.length;
@@ -919,7 +919,7 @@ function ToolGroup({ entries, live, render }: { entries: { it: Item; i: number; 
         <span className="tg-label">{live ? `Using ${n} tool${n === 1 ? "" : "s"}…` : `Used ${n} tool${n === 1 ? "" : "s"}`}</span>
         {est > 0 && <span className="tg-tok" title="Estimated total tokens across these tools">~{fmtTokens(est)} tokens</span>}
       </button>
-      {open && <div className="tool-group-body">{entries.map((e) => <React.Fragment key={e.i}>{render(e.i, e.merged)}</React.Fragment>)}</div>}
+      {open && <div className="tool-group-body">{entries.map((e) => <React.Fragment key={e.i}>{render(e.i)}</React.Fragment>)}</div>}
     </div>
   );
 }
@@ -2765,8 +2765,10 @@ function App() {
     const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name) && !isSpawnTabTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input); // a spawn call stays standalone so its tab button shows
     let lastUserIdx = -1; for (let k = items.length - 1; k >= 0; k--) if (items[k].kind === "user") { lastUserIdx = k; break; }
     const liveThinkIdx = busy && items[items.length - 1]?.kind === "thinking" ? items.length - 1 : -1; // the block still streaming
-    // Work that collapses together: plain tools, thinking, background-task lines.
-    const isWork = (t: Item) => isPlainTool(t) || t.kind === "thinking" || (t.kind === "notice" && t.noticeKind === "task");
+    // What collapses into a "Used N tools" row: tool calls only. Thinking is not a tool and stays its
+    // own row (back-to-back thoughts merge, see thinkingRun); so do task lines. The count in the
+    // header is the number of rows inside it.
+    const isWork = (t: Item) => isPlainTool(t);
     // A task's "started" line once a later line reports how it ended: only the outcome is shown.
     const settledTasks = new Set<number>();
     { const done = new Set<string>();
@@ -2780,22 +2782,16 @@ function App() {
       if (cur.kind === "tool" && isTodoTool((cur as Extract<Item, { kind: "tool" }>).name)) continue; // pinned checklist replaces the inline card
       if (cur.kind === "notice" && cur.noticeKind === "task" && settledTasks.has(i)) continue; // superseded by its finished line
       if (isWork(cur)) {
-        // A run of work: tools, the thinking between them, background-task lines. Collapsed into one
-        // row once it holds a tool and something else. While the turn is live, trailing thinking stays
-        // outside so its text still streams in view.
-        let j = i; const run: { it: Item; i: number; merged?: ThinkingItem }[] = [];
+        // A run of back-to-back tool calls (a TodoWrite in the middle is hidden, not a break).
+        let j = i; const run: { it: Item; i: number }[] = [];
         while (j < items.length && (isWork(items[j]) || (items[j].kind === "tool" && isTodoTool((items[j] as Extract<Item, { kind: "tool" }>).name)))) {
           const it = items[j];
-          const tr = thinkingRun(items, j, liveThinkIdx);
-          if (tr) { run.push({ it, i: j, merged: tr.merged }); j = tr.end; continue; }
-          if (!(it.kind === "tool" && isTodoTool((it as Extract<Item, { kind: "tool" }>).name)) && !(it.kind === "notice" && settledTasks.has(j))) run.push({ it, i: j });
+          if (isWork(it)) run.push({ it, i: j });
           j++;
         }
         const live = busy && j === items.length;
-        while (live && run.length && run[run.length - 1].it.kind === "thinking") { run.pop(); j--; }
-        const toolCount = run.filter((e) => e.it.kind === "tool").length;
-        if (toolCount >= 1 && run.length >= 2) {
-          const render = (k: number, merged?: ThinkingItem) => merged ? <ThinkingCard it={merged} isLast={false} busy={busy} /> : <MessageBlock items={items} i={k} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} />;
+        if (run.length >= 2) {
+          const render = (k: number) => <MessageBlock items={items} i={k} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} />;
           nodes.push(<ToolGroup key={"tg" + i} entries={run} live={live} render={render} />);
           i = j - 1; continue;
         }
