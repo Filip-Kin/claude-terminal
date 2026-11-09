@@ -1709,12 +1709,24 @@ function App() {
     });
   }, []);
 
+  // The model list and the app settings that ride with it. Loaded once at start; a failed or empty
+  // answer (a slow first probe of the CLI past the timeout, a restart in progress) used to leave the
+  // model menu empty until the app was reloaded, so it retries, and opening an empty menu asks again.
+  const modelsTry = useRef(0);
+  const loadModelsRef = useRef<() => void>(() => {});
+  loadModelsRef.current = () => {
+    api.models().then((d) => {
+      if (!d.models?.length) throw new Error("no models");
+      modelsTry.current = 0;
+      setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); { const def = d.defaultModel || d.models?.[0]?.id; if (!localStorage.getItem("ct-app-model") && def) setDefaultModel(def); }
+    }).catch(() => { if (++modelsTry.current <= 6) setTimeout(() => loadModelsRef.current(), 5000); });
+  };
   useEffect(() => {
     // Paint the last cached conversation list INSTANTLY (before any network), so a cold open on a slow
     // or flaky link shows your chats immediately instead of an empty sidebar until the network answers.
     // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
     void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); { const def = d.defaultModel || d.models?.[0]?.id; if (!localStorage.getItem("ct-app-model") && def) setDefaultModel(def); } }).catch(() => {});
+    loadModelsRef.current();
     refreshConvs();
     refreshFavs();
     syncReads();
@@ -3119,7 +3131,7 @@ function App() {
           </div>
           <div className="composer-foot">
             <div className="model-picker up">
-              <button className="model-btn" onClick={() => setMenuOpen((o) => !o)}>
+              <button className="model-btn" onClick={() => { if (!models.length) loadModelsRef.current(); setMenuOpen((o) => !o); }}>
                 <span>{modelBtnLabel}</span>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
               </button>
