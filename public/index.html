@@ -493,9 +493,12 @@ function renderSubscription(d){
   // down): show no numbers and when the last real reading was, never old bars as if live.
   const stale = !(typeof p.sampled_at==="number" && Date.now()-p.sampled_at < 15*60e3);
   const w = (x)=> stale ? null : x;
+  const hasFive = stale || !!(p.five_hour && typeof p.five_hour.utilization==="number");
   document.getElementById("subUtil").innerHTML =
-    subCell("Session (5h)", w(p.five_hour), 5*3600)
-    + (p.fable ? subCell("Fable (7d)", w(p.fable), 7*86400) : "")
+    // The account reports no 5-hour window at all at times (five_hour null on a fresh reading, not
+    // just 0%): no cell then, rather than a dash that reads as broken.
+    (hasFive ? subCell("Session (5h)", w(p.five_hour), 5*3600) : "")
+    + (p.fable ? subCell("Fable (7d)", w(p.fable), 7*86400, !hasFive) : "")
     + subCell("Weekly (7d)", w(p.seven_day), 7*86400, true);
   const n = p.active_users, foot = document.getElementById("subFoot");
   if(stale){
