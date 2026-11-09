@@ -719,7 +719,7 @@ class ConvStore {
   }
   // Server transcript is truth for committed history. We keep our own tail when it's AHEAD of the
   // server (live tokens, or a just-sent turn not yet in the transcript) so nothing flickers away.
-  reconcile(items: Item[], meta: { busy: boolean; cwd: string | null; evCount?: number }) {
+  reconcile(items: Item[], meta: { busy: boolean; cwd: string | null; evCount?: number; epoch?: string | null; seq?: number }) {
     this.cwd = meta.cwd; this.hydrated = true;
     if (meta.evCount != null) { this.evCount = meta.evCount; this.evDirty = false; }
     // Expire orphaned optimistic echoes BEFORE computing localAhead below. The server emits the user
@@ -737,6 +737,14 @@ class ConvStore {
       const unsent = this.trailingUnsent(items);
       const merged = unsent.length ? [...items, ...unsent] : items;
       this.items = merged; this.cachedItems = merged;
+      // The transcript already holds every live event up to the server's cursor at the time it was
+      // read. Resuming the stream from our older cursor replayed those events on top of it: a reply
+      // and its tool calls appeared twice after switching back to a running chat, and the doubled
+      // rows shifted every block below them.
+      if (meta.epoch && typeof meta.seq === "number" && meta.seq >= 0) {
+        if (this.epoch !== meta.epoch) { this.epoch = meta.epoch; this.seq = meta.seq; }
+        else if (meta.seq > this.seq) this.seq = meta.seq;
+      }
     }
     // Trust the server's busy on a fresh reconcile so a stale cached busy clears (otherwise a finished
     // turn keeps the Stop button up). Stay busy only while we hold an unacknowledged optimistic send.
@@ -2214,7 +2222,7 @@ function App() {
         for (let i = serverItems.length - 1; i >= 0; i--) if (serverItems[i].kind === "ask" && (serverItems[i] as any).answered === undefined) serverItems.splice(i, 1);
         for (const a of d.pendingAsks) serverItems.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
       }
-      s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd, evCount: d.evTotal });
+      s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd, evCount: d.evTotal, epoch: d.epoch, seq: d.seq });
       if (d.live) s.connect(true); // stream follow-up events; connect() is a no-op if already connected
     } catch {
       if (!s.items.length && activeStoreRef.current === s) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
@@ -2228,7 +2236,14 @@ function App() {
   // pull the list once a minute while visible so renames, deletes and reordering show up too.
   useEffect(() => {
     let last = 0;
-    const resync = () => {
+    // Focus coming back from one of our own iframes (the artifact preview) is not a return to the
+    // app. Reloading the thread on it replaced the cards between mousedown and click, so a second
+    // artifact would not open and the card hover flickered.
+    let inFrame = false;
+    const onBlur = () => { setTimeout(() => { inFrame = document.activeElement?.tagName === "IFRAME"; }, 0); };
+    const resync = (ev?: Event) => {
+      if (ev?.type === "focus" && inFrame) { inFrame = false; return; }
+      inFrame = false;
       if (document.visibilityState !== "visible" || !navigator.onLine) return;
       const now = Date.now();
       if (now - last < 3000) return; // visibilitychange and focus fire together
@@ -2239,8 +2254,9 @@ function App() {
     };
     document.addEventListener("visibilitychange", resync);
     window.addEventListener("focus", resync);
+    window.addEventListener("blur", onBlur);
     const iv = setInterval(() => { if (document.visibilityState === "visible" && navigator.onLine) refreshConvs(); }, 60_000);
-    return () => { document.removeEventListener("visibilitychange", resync); window.removeEventListener("focus", resync); clearInterval(iv); };
+    return () => { document.removeEventListener("visibilitychange", resync); window.removeEventListener("focus", resync); window.removeEventListener("blur", onBlur); clearInterval(iv); };
   }, [refreshConvs, loadConv]);
 
   loadConvRef.current = loadConv;
