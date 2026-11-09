@@ -907,7 +907,7 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
 // up live). Open it to see each tool card. Single tools render on their own (no accordion).
 // A run of work (tool calls, the thinking between them, background-task notices) collapsed into
 // one row: "Used N tools · ~Xk tokens". Open it to see every step in order.
-function ToolGroup({ entries, live, render }: { entries: { it: Item; i: number }[]; live: boolean; render: (i: number) => React.ReactNode }) {
+function ToolGroup({ entries, live, render }: { entries: { it: Item; i: number; merged?: ThinkingItem }[]; live: boolean; render: (i: number, merged?: ThinkingItem) => React.ReactNode }) {
   const [open, setOpen] = useState(false);
   const tools = entries.filter((e) => e.it.kind === "tool").map((e) => e.it as Extract<Item, { kind: "tool" }>);
   const n = tools.length;
@@ -919,7 +919,7 @@ function ToolGroup({ entries, live, render }: { entries: { it: Item; i: number }
         <span className="tg-label">{live ? `Using ${n} tool${n === 1 ? "" : "s"}…` : `Used ${n} tool${n === 1 ? "" : "s"}`}</span>
         {est > 0 && <span className="tg-tok" title="Estimated total tokens across these tools">~{fmtTokens(est)} tokens</span>}
       </button>
-      {open && <div className="tool-group-body">{entries.map((e) => <React.Fragment key={e.i}>{render(e.i)}</React.Fragment>)}</div>}
+      {open && <div className="tool-group-body">{entries.map((e) => <React.Fragment key={e.i}>{render(e.i, e.merged)}</React.Fragment>)}</div>}
     </div>
   );
 }
@@ -1077,6 +1077,30 @@ function PhaseLine({ phase, since, detail }: { phase: Phase; since: number; deta
 // Thinking indicator. LIVE: "Thinking… 12s · ~340 tokens" ticking each second. When done we hide
 // the standalone indicator (the turn summary under the final reply carries the totals), unless the
 // platform actually exposed the reasoning text — then we show that.
+// Back-to-back finished thinking blocks (a long one then a 1 s one, as the model resumes after a
+// tool result) read as one thought: one row, times added, text joined. Display only: the items keep
+// their own indices, which edit and delete address the store by.
+type ThinkingItem = Extract<Item, { kind: "thinking" }>;
+function thinkingRun(items: Item[], i: number, liveIdx: number): { merged: ThinkingItem; end: number } | null {
+  // Finished = anything but the block still streaming (a reloaded chat's blocks carry no duration).
+  const done = (k: number) => items[k]?.kind === "thinking" && k !== liveIdx;
+  if (!done(i)) return null;
+  let j = i;
+  const parts: ThinkingItem[] = [];
+  while (j < items.length && done(j)) { parts.push(items[j] as ThinkingItem); j++; }
+  if (parts.length < 2) return null;
+  const timed = parts.filter((p) => p.elapsed != null);
+  return {
+    merged: {
+      ...parts[0],
+      text: parts.map((p) => p.text).filter(Boolean).join("\n\n"),
+      elapsed: timed.length ? timed.reduce((a, p) => a + (p.elapsed || 0), 0) : undefined, // no duration known: plain "Thought"
+      tokens: parts.reduce((a, p) => a + (p.tokens || 0), 0) || undefined,
+    },
+    end: j,
+  };
+}
+
 function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinking" }>; isLast: boolean; busy: boolean }) {
   // Live means: last item, no block_end yet, and the conversation is actually busy. Before the third
   // condition a stale block at the end of a dead turn ticked from its start time forever.
@@ -2740,6 +2764,7 @@ function App() {
     // (rich activity card); TodoWrite is hidden here (the pinned checklist replaces it).
     const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name) && !isSpawnTabTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input); // a spawn call stays standalone so its tab button shows
     let lastUserIdx = -1; for (let k = items.length - 1; k >= 0; k--) if (items[k].kind === "user") { lastUserIdx = k; break; }
+    const liveThinkIdx = busy && items[items.length - 1]?.kind === "thinking" ? items.length - 1 : -1; // the block still streaming
     // Work that collapses together: plain tools, thinking, background-task lines.
     const isWork = (t: Item) => isPlainTool(t) || t.kind === "thinking" || (t.kind === "notice" && t.noticeKind === "task");
     // A task's "started" line once a later line reports how it ended: only the outcome is shown.
@@ -2758,9 +2783,11 @@ function App() {
         // A run of work: tools, the thinking between them, background-task lines. Collapsed into one
         // row once it holds a tool and something else. While the turn is live, trailing thinking stays
         // outside so its text still streams in view.
-        let j = i; const run: { it: Item; i: number }[] = [];
+        let j = i; const run: { it: Item; i: number; merged?: ThinkingItem }[] = [];
         while (j < items.length && (isWork(items[j]) || (items[j].kind === "tool" && isTodoTool((items[j] as Extract<Item, { kind: "tool" }>).name)))) {
           const it = items[j];
+          const tr = thinkingRun(items, j, liveThinkIdx);
+          if (tr) { run.push({ it, i: j, merged: tr.merged }); j = tr.end; continue; }
           if (!(it.kind === "tool" && isTodoTool((it as Extract<Item, { kind: "tool" }>).name)) && !(it.kind === "notice" && settledTasks.has(j))) run.push({ it, i: j });
           j++;
         }
@@ -2768,11 +2795,13 @@ function App() {
         while (live && run.length && run[run.length - 1].it.kind === "thinking") { run.pop(); j--; }
         const toolCount = run.filter((e) => e.it.kind === "tool").length;
         if (toolCount >= 1 && run.length >= 2) {
-          const render = (k: number) => <MessageBlock items={items} i={k} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} />;
+          const render = (k: number, merged?: ThinkingItem) => merged ? <ThinkingCard it={merged} isLast={false} busy={busy} /> : <MessageBlock items={items} i={k} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} />;
           nodes.push(<ToolGroup key={"tg" + i} entries={run} live={live} render={render} />);
           i = j - 1; continue;
         }
       }
+      const tr = thinkingRun(items, i, liveThinkIdx);
+      if (tr) { nodes.push(<ThinkingCard key={"th" + i} it={tr.merged} isLast={false} busy={busy} />); i = tr.end - 1; continue; }
       nodes.push(<MessageBlock key={i} items={items} i={i} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
     }
     return nodes;
