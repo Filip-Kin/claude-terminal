@@ -17,6 +17,7 @@ import { buildCostReport } from "./cost.ts";
 import { Connections } from "./connections.ts";
 import { appRoutes, type AppCtx } from "./app-server.ts";
 import { initSubscriptionResume } from "./subscription-resume.ts";
+import { installRestartWake } from "./restart-wake.ts";
 import { startStatusPush, type StatusPayload } from "./status-push.ts";
 import { liveActivity } from "./app-runner.ts";
 import { initBstats, recordSample, countEvent, buildReport } from "./battery-stats.ts";
@@ -1232,5 +1233,11 @@ setInterval(() => {
 try {
   initSubscriptionResume({ file: join(STATE_DIR, "claude-app-subscription-resume.json"), port: PORT, owner: OWNER });
 } catch (e) { console.error("subscription-resume init failed", e); }
+
+// A restart no longer waits for every chat to go idle: on SIGTERM the chats it cuts off are written
+// down, and on start each is sent a turn to pick its work back up (restart-wake.ts).
+try {
+  installRestartWake({ file: join(STATE_DIR, "claude-app-restart-wake.json"), port: PORT, owner: OWNER });
+} catch (e) { console.error("restart-wake init failed", e); }
 
 console.log(`claude-terminal listening on http://${server.hostname}:${server.port} (owner=${OWNER}, db=${DB_PATH})`);

@@ -439,9 +439,19 @@ export const RESUME_PROMPT = [
   "Read your last few messages to see what you were doing, then continue that work from where it stopped.",
   "Do not reply \"No response requested\", do not ask whether to continue, and do not summarise what happened unless the work itself needs it.",
 ].join(" ");
+// Sent by restart-wake.ts to a chat that was idle but holding background work when the service
+// restarted: the turn itself was done, the watchers/crons/wakeups it had were killed.
+export const HOLD_PROMPT = [
+  "The service hosting this conversation restarted. Your last turn had finished, but every background task, watcher, cron job and scheduled wakeup you had running was killed with the old process.",
+  "Recreate the ones that are still needed, the same way you set them up, then stop.",
+  "Do not redo finished work, do not reply \"No response requested\", and do not summarise what happened.",
+].join(" ");
 // The injected turn is marked isMeta in the transcript. Render it as a notice, not as a message the
 // user never typed. Matches both our prompt and the CLI's default, for transcripts written before this.
 const RESUME_PROMPT_RE = /^(The service hosting this conversation restarted|Continue from where you left off)/;
+// restart-wake sends these as real turns (not isMeta), so match the full opening, not a prefix a person could type.
+const WAKE_TEXT_RE = /^The service hosting this conversation restarted/;
+const WAKE_NOTICE = "Resumed after a service restart.";
 
 // An exhausted subscription does NOT always arrive as a rate_limit_event. The CLI also injects a
 // SYNTHETIC assistant message whose entire text is "You've hit your session limit · resets 2:30pm
@@ -770,7 +780,8 @@ export class Conversation {
     const midTurn = this.running; // folded into the running turn by the SDK, not a turn of its own
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
     const uuid = messageId(cid);
-    this.emit({ t: "user", text, uuid, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
+    if (WAKE_TEXT_RE.test(text)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
+    else this.emit({ t: "user", text, uuid, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
     const msg: SDKUserMessage = { type: "user", uuid: uuid as any, message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
@@ -1019,7 +1030,8 @@ export class Conversation {
       this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
       this.runStart = this.log.length; // first turn's replay boundary
       const uuid = messageId(cid);
-      this.emit({ t: "user", text: first, uuid, ...(cid ? { cid } : {}) });
+      if (WAKE_TEXT_RE.test(first)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
+      else this.emit({ t: "user", text: first, uuid, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
       this.titleScan = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
       yield { type: "user", uuid: uuid as any, message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
@@ -1438,6 +1450,20 @@ function cliSessionStatuses(): Record<string, LiveStatus> {
   return map;
 }
 
+// Chats a restart right now would cut off: mid-turn (or parked on a question, whose answer would be
+// lost), or idle but holding background work. restart-wake.ts records these on SIGTERM.
+export function wakeSnapshot(): { convId: string; interrupted: boolean; holds: boolean }[] {
+  const out: { convId: string; interrupted: boolean; holds: boolean }[] = [];
+  for (const c of new Set(conversations.values())) {
+    if (c.isClosed()) continue;
+    const s = c.statusInfo();
+    const interrupted = s.busy || s.waiting;
+    const holds = c.holdsWork();
+    if (interrupted || holds) out.push({ convId: c.id, interrupted, holds });
+  }
+  return out;
+}
+
 // Every conversation with a running query, newest first: the MCP sign-in and the needs-auth dot work
 // from any of them, since a sign-in is stored once for all chats.
 export function runningConversations(): Conversation[] {
@@ -1621,6 +1647,7 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
       const sk = skillLoadName(txt);
       if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
       else if (o.isMeta && RESUME_PROMPT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: "Resumed after a service restart. The interrupted turn was picked up automatically." });
+      else if (WAKE_TEXT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: WAKE_NOTICE });
       else if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; apiErrors = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
