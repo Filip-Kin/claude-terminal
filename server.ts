@@ -304,6 +304,9 @@ function buildLeaderboard() {
   // split, the monthly chart) counts only the billed row.
   const present = new Set((qUsers.all() as any[]).map((r) => r.user as string));
   const bases = [...new Set([...present].map((u) => (isWorkUser(u) ? u.slice(0, -WORK_SUFFIX.length) : u)))];
+  // Retired agents (cfg.leaderboardHide, stonkbot shut down 2026-11-06) get no card. Their output
+  // still goes into byMonth, so the monthly split and its bills stay as they were.
+  const hide = new Set<string>(cfg.leaderboardHide || []);
   for (const user of bases) {
     const hours = new Map<string, any>();
     let outTotal = 0, tokTotal = 0, sessions = 0, last: string | null = null, monthOutput = 0, monthWeighted = 0;
@@ -330,6 +333,7 @@ function buildLeaderboard() {
     }
     let active = false;
     if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
+    if (hide.has(user)) continue;
     users.push({
       user,
       name: cfg.names?.[user] || titleCase(user),
