@@ -158,6 +158,14 @@ async function saveTitles(file: string) { if (titleMap) await Bun.write(file, JS
 
 const enc = (s: string) => encodeURIComponent(s);
 
+// A finished sign-in only stores the token; every running chat still holds the server as needs-auth
+// until it reconnects, so the status and the red dot stayed stale. Reconnect it everywhere.
+async function reconnectEverywhere(name: string): Promise<string[]> {
+  const errors: string[] = [];
+  for (const c of runningConversations()) { try { await c.mcpReconnect(name); } catch (e: any) { errors.push(String(e?.message || e)); } }
+  return errors;
+}
+
 // MCP sign-ins in flight, by the OAuth state in their URL: which chat started it, for which server.
 // In memory: a restart drops them, and the sign-in is simply started again.
 const mcpAuthPending = new Map<string, { conv: string; name: string; at: number }>();
@@ -499,6 +507,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     try {
       await conv.mcpSubmitCallback(p.name, full);
       mcpAuthPending.delete(u.searchParams.get("state") || "");
+      await reconnectEverywhere(p.name);
       tlog("mcp-auth-done", { conv: conv.id, name: p.name });
       return page(`${esc(p.name)} connected`, true);
     } catch (e: any) { return page(`Sign-in failed: ${esc(String(e?.message || e))}`, false); }
@@ -511,7 +520,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const convId = mcpAuthPending.get(state)?.conv || mcpAuthLast.get(name);
     const conv = convId ? get(convId) : undefined;
     if (!conv) return jsonRes({ error: "no sign-in in progress" }, ctx, req, 409);
-    try { await conv.mcpSubmitCallback(name, url); mcpAuthPending.delete(state); return jsonRes({ ok: true }, ctx, req); }
+    try { await conv.mcpSubmitCallback(name, url); mcpAuthPending.delete(state); await reconnectEverywhere(name); return jsonRes({ ok: true }, ctx, req); }
     catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 502); }
   }
   // Reconnect one server in every running chat (after a claude.ai connector sign-in, which has no
@@ -520,8 +529,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     let b: any = {}; try { b = await req.json(); } catch {}
     const name = String(b.name || "");
     if (!name) return jsonRes({ error: "name required" }, ctx, req, 400);
-    const errors: string[] = [];
-    for (const c of runningConversations()) { try { await c.mcpReconnect(name); } catch (e: any) { errors.push(String(e?.message || e)); } }
+    const errors = await reconnectEverywhere(name);
     return jsonRes({ ok: !errors.length, errors }, ctx, req);
   }
   // Add or update a server: { name, config, applyTo? }. Takes effect on the next new chat; pass
