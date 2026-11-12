@@ -542,6 +542,16 @@ export class Conversation {
   // watcher" after a few minutes; it then dropped out of busy, and the sweeper closed the chat and
   // killed the watcher (RustDesk cart chat, 2026-10-24 06:19, launched 03:25, busy=0 from 03:40).
   private liveTasks = new Set<string>();
+  // What the chat is running, for the restart and OOM push notifications (restart-wake.ts): the live
+  // background tasks by type + description, and the last top-level tool call of the current turn.
+  private liveTaskInfo: { type: string; description: string; ambient: boolean }[] = [];
+  private lastToolDesc = "";
+  workSummary(): string[] {
+    const out: string[] = [];
+    if (this.phase !== "idle") out.push(this.lastToolDesc || this.phase);
+    for (const t of this.liveTaskInfo) if (!t.ambient) out.push(`${t.type === "local_agent" ? "agent" : t.type === "local_bash" ? "bash" : t.type}: ${t.description}`.slice(0, 120));
+    return out;
+  }
   // Session cron jobs and /loop wakeups live in the CLI process too and send no task signal at all,
   // so they are tracked from the tool calls: CronCreate holds for 7 days (the CLI expires recurring
   // jobs then), a matching number of CronDelete calls releases it, ScheduleWakeup holds until a
@@ -1219,6 +1229,7 @@ export class Conversation {
           const all = new Set<string>();
           for (const t of (anyM.tasks as any[]) || []) if (t && t.task_id) { all.add(String(t.task_id)); if (!t.ambient) next.add(String(t.task_id)); }
           this.liveTasks = all;
+          this.liveTaskInfo = ((anyM.tasks as any[]) || []).filter((t) => t && t.task_id).map((t) => ({ type: String(t.task_type || "task"), description: String(t.description || ""), ambient: !!t.ambient }));
           const wasBusy = this.busy;
           this.bgTasks = next;
           if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy });
@@ -1306,6 +1317,7 @@ export class Conversation {
           if (b?.type !== "tool_use") continue;
           if (b.name === "mcp__app-ui__ask_user") { this.askToolUseIds.add(b.id); continue; } // the ask card renders this, not a raw tool card
           this.noteScheduling(b.name, b.input);
+          if (!anyM.parent_tool_use_id) { const i = b.input || {}; this.lastToolDesc = `${b.name}: ${String(i.description || i.command || i.prompt || i.file_path || i.url || "").replace(/\s+/g, " ")}`.slice(0, 120); }
           this.emit({ t: "tool_use", id: b.id, name: b.name, input: b.input });
         }
         break;
@@ -1452,14 +1464,14 @@ function cliSessionStatuses(): Record<string, LiveStatus> {
 
 // Chats a restart right now would cut off: mid-turn (or parked on a question, whose answer would be
 // lost), or idle but holding background work. restart-wake.ts records these on SIGTERM.
-export function wakeSnapshot(): { convId: string; interrupted: boolean; holds: boolean }[] {
-  const out: { convId: string; interrupted: boolean; holds: boolean }[] = [];
+export function wakeSnapshot(): { convId: string; interrupted: boolean; holds: boolean; work: string[]; cwd: string }[] {
+  const out: { convId: string; interrupted: boolean; holds: boolean; work: string[]; cwd: string }[] = [];
   for (const c of new Set(conversations.values())) {
     if (c.isClosed()) continue;
     const s = c.statusInfo();
     const interrupted = s.busy || s.waiting;
     const holds = c.holdsWork();
-    if (interrupted || holds) out.push({ convId: c.id, interrupted, holds });
+    if (interrupted || holds) out.push({ convId: c.id, interrupted, holds, work: c.workSummary(), cwd: c.cwd });
   }
   return out;
 }

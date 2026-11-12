@@ -1237,7 +1237,15 @@ try {
 // A restart no longer waits for every chat to go idle: on SIGTERM the chats it cuts off are written
 // down, and on start each is sent a turn to pick its work back up (restart-wake.ts).
 try {
-  installRestartWake({ file: join(STATE_DIR, "claude-app-restart-wake.json"), port: PORT, owner: OWNER });
+  installRestartWake({
+    file: join(STATE_DIR, "claude-app-restart-wake.json"), port: PORT, owner: OWNER,
+    // An /app chat's title, from its transcript wherever its project folder is.
+    titleFor: async (id) => {
+      const root = join(process.env.HOME || "/home/filip", ".claude", "projects");
+      for (const d of readdirSync(root)) { const tp = join(root, d, `${id}.jsonl`); if (existsSync(tp)) return lastAiTitle(tp); }
+      return null;
+    },
+  });
 } catch (e) { console.error("restart-wake init failed", e); }
 
 console.log(`claude-terminal listening on http://${server.hostname}:${server.port} (owner=${OWNER}, db=${DB_PATH})`);
