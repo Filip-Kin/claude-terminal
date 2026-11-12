@@ -1313,7 +1313,7 @@ export class Conversation {
       case "user": {
         // tool_result blocks come back as a user message
         const c = anyM.message?.content;
-        if (Array.isArray(c)) for (const b of c) if (b?.type === "tool_result") { if (this.askToolUseIds.has(b.tool_use_id)) continue; this.emit({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error }); }
+        if (Array.isArray(c)) for (const b of c) if (b?.type === "tool_result") { if (this.askToolUseIds.has(b.tool_use_id)) continue; this.emit({ t: "tool_result", id: b.tool_use_id, content: stripImageData(b.content), isError: !!b.is_error }); }
         if (!anyM.parent_tool_use_id && Array.isArray(c) && c.some((b: any) => b?.type === "tool_result") && this.phase === "tool") this.setPhase("waiting"); // results are in; the model is being called again
         // A loaded skill is injected as a user text message ("Base directory for this skill: ...");
         // surface it as a compact card instead of dumping the whole skill file into the thread.
@@ -1540,20 +1540,43 @@ setInterval(() => {
 // minutes after a restart with a 17 MB JS heap, and 64 GB after a week, which took the box down.
 // An unchanged transcript is now parsed once. Bounded by source bytes, LRU beyond that; files over
 // the per-file cap are parsed on demand and not kept.
-const REPLAY_CACHE_MAX_FILE = 64 * 1048576;
-const REPLAY_CACHE_MAX_TOTAL = 160 * 1048576;
-const replayCache = new Map<string, { size: number; mtimeMs: number; events: AppEvent[] }>();
+// 2026-11-12: a 220 MB coc-bot transcript (86 MB of it base64 screenshots) was over the per-file cap,
+// so every poll re-parsed it whole. Concurrent parses took the service past its 12 GB MemoryMax and
+// the OOM killer restarted it four times in 45 minutes. Three changes: image data is dropped at parse
+// time (the app renders only text blocks of a tool result, so it never showed them), the cache counts
+// the bytes it actually keeps (file size minus dropped image data), and concurrent calls for the same
+// file share one parse instead of each running their own.
+const REPLAY_CACHE_MAX_FILE = 256 * 1048576;
+const REPLAY_CACHE_MAX_TOTAL = 320 * 1048576;
+const replayInflight = new Map<string, Promise<{ events: AppEvent[]; kept: number }>>();
+const replayCache = new Map<string, { size: number; mtimeMs: number; events: AppEvent[]; kept: number }>();
 let replayCacheBytes = 0;
-function replayCacheRemember(path: string, size: number, mtimeMs: number, events: AppEvent[]) {
-  if (size > REPLAY_CACHE_MAX_FILE) return;
+function replayCacheRemember(path: string, size: number, mtimeMs: number, events: AppEvent[], kept: number) {
+  if (kept > REPLAY_CACHE_MAX_FILE) return;
   const prev = replayCache.get(path);
-  if (prev) { replayCache.delete(path); replayCacheBytes -= prev.size; }
-  replayCache.set(path, { size, mtimeMs, events });
-  replayCacheBytes += size;
+  if (prev) { replayCache.delete(path); replayCacheBytes -= prev.kept; }
+  replayCache.set(path, { size, mtimeMs, events, kept });
+  replayCacheBytes += kept;
   for (const [k, v] of replayCache) {
     if (replayCacheBytes <= REPLAY_CACHE_MAX_TOTAL) break;
-    replayCache.delete(k); replayCacheBytes -= v.size;
+    replayCache.delete(k); replayCacheBytes -= v.kept;
   }
+}
+
+// Image blocks keep their type and media_type, lose the base64 payload. Nested arrays (a tool result
+// holding text + image blocks) are walked one level, which is the only shape the CLI writes.
+function stripImageData(content: any, stats?: { imageBytes: number }): any {
+  if (!Array.isArray(content)) return content;
+  let changed = false;
+  const out = content.map((b: any) => {
+    if (b?.type === "image" && b.source && typeof b.source.data === "string") {
+      changed = true;
+      if (stats) stats.imageBytes += b.source.data.length;
+      return { type: "image", source: { type: b.source.type, media_type: b.source.media_type } };
+    }
+    return b;
+  });
+  return changed ? out : content;
 }
 
 // Parses a session .jsonl into the normalized events the front-end already renders. Callers get
@@ -1573,13 +1596,23 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
     replayCache.delete(path); replayCache.set(path, hit); // LRU touch
     return hit.events.slice();
   }
-  const out = await parseTranscript(path);
+  const key = `${path}\0${size}\0${mtimeMs}`;
+  let p = replayInflight.get(key);
+  if (!p) {
+    p = (async () => {
+      const stats = { imageBytes: 0 };
+      const events = await parseTranscript(path, stats);
+      return { events, kept: Math.max(0, size - stats.imageBytes) };
+    })().finally(() => replayInflight.delete(key));
+    replayInflight.set(key, p);
+  }
+  const { events: out, kept } = await p;
   // An empty result from a non-empty file is a failed or racing read, not a parse: do not pin it.
-  if (size >= 0 && (out.length > 0 || size === 0)) replayCacheRemember(path, size, mtimeMs, out);
+  if (size >= 0 && (out.length > 0 || size === 0)) replayCacheRemember(path, size, mtimeMs, out, kept);
   return out.slice();
 }
 
-async function parseTranscript(path: string): Promise<AppEvent[]> {
+async function parseTranscript(path: string, stats: { imageBytes: number } = { imageBytes: 0 }): Promise<AppEvent[]> {
   const out: AppEvent[] = [];
   const askToolIds = new Set<string>(); // tool_use ids of ask_user calls -> render as ask cards, not raw tool cards
   // Per-turn accumulators so the reloaded footer matches the live one: a turn can span several
@@ -1637,7 +1670,7 @@ async function parseTranscript(path: string): Promise<AppEvent[]> {
         if (toolResults.length) {
           for (const b of toolResults) {
             if (askToolIds.has(b.tool_use_id)) out.push({ t: "ask_done", askId: b.tool_use_id, answer: textOfContent(b.content) }); // the answer to an ask_user
-            else out.push({ t: "tool_result", id: b.tool_use_id, content: b.content, isError: !!b.is_error });
+            else out.push({ t: "tool_result", id: b.tool_use_id, content: stripImageData(b.content, stats), isError: !!b.is_error });
           }
           continue;
         }
