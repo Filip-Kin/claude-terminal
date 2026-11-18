@@ -1,0 +1,14 @@
+[Unit]
+Description=claude-terminal nightly update: agent SDK (filip /app) + guests, with bypass checks
+After=network-online.target media-nas.mount docker.service
+Wants=network-online.target
+Requires=media-nas.mount
+
+[Service]
+Type=oneshot
+User=filip
+UMask=0002
+WorkingDirectory=/media/nas/filip/ncdata/filip/files/Projects/claude-terminal
+ExecStart=/media/nas/filip/ncdata/filip/files/Projects/claude-terminal/bin/ct-auto-update
+# waits up to 3 h for busy chats, then up to 3 h for busy guests
+TimeoutStartSec=7h

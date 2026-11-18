@@ -1,0 +1,123 @@
+#!/bin/bash
+# ct-auto-update — nightly: keep the /app agent SDK current for Filip and the guests, and prove
+# bypassPermissions still works before and after every bump. Run by ct-auto-update.timer (04:30).
+#
+# Why this exists: /app chats run the CLI BUNDLED with @anthropic-ai/claude-agent-sdk
+# (node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude), not ~/.local/bin/claude, so the
+# terminal CLI's own auto-updater never updates /app. Guests also need the image rebuilt, because
+# the sidecar's node_modules are baked into guest-claude:latest.
+#
+# Steps:
+#   1. npm has a newer SDK -> install it in a scratch dir and run bin/bypass-check.ts against it.
+#      Fails -> nothing changes, push notification, exit.
+#   2. Wait (up to WAIT_S) until no /app chat of Filip's is busy, bump package.json + bun.lock,
+#      commit, restart claude-terminal.service, re-run the bypass check through the LIVE /app.
+#      Fails -> git revert, reinstall, restart, push notification. Passes -> git push.
+#   3. update-guests.sh: rebuild the image when the SDK changed or the image is a week old, `claude
+#      update` every guest, recreate only idle guests (busy ones wait for the next night).
+#   4. One push notification when something changed or failed; silence on a no-op night.
+#
+# The terminal CLI (~/.local/bin/claude) self-updates (native installer) and is not touched here.
+set -uo pipefail
+REPO=/media/nas/filip/ncdata/filip/files/Projects/claude-terminal
+GUESTS=/home/filip/guest-claude
+WORK=/media/nas/filip/ct-auto-update
+SIDECAR=http://127.0.0.1:7682
+PKG=@anthropic-ai/claude-agent-sdk
+WAIT_S=${WAIT_S:-10800}            # how long to wait for busy chats / guests before giving up for tonight
+export PATH="/home/filip/.local/bin:/usr/local/bin:/usr/bin:/bin"
+mkdir -p "$WORK"
+cd "$REPO" || exit 1
+
+log() { echo "[ct-auto-update] $*"; }
+notify() { log "notify: $1 | $2"; claude-notify "$1" "$2" >/dev/null 2>&1 || true; }
+fail() { notify "claude-terminal update failed" "$1"; exit 1; }
+restart_and_wait() {
+  sudo -n systemctl restart claude-terminal.service || return 1
+  for _ in $(seq 1 90); do
+    curl -sf -m 3 "$SIDECAR/app/api/version" -H "Remote-User: filip" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+# busy = an /app chat (terminal:false) mid-turn. Terminal tabs live in tmux, a restart does not touch them.
+app_busy() {
+  curl -s -m 5 "$SIDECAR/app/api/statuses" -H "Remote-User: filip" | python3 -c '
+import json, sys
+d = json.load(sys.stdin).get("statuses", {})
+sys.exit(0 if any(v.get("busy") and not v.get("terminal") for v in d.values()) else 1)'
+}
+# run one throwaway /app chat that must run Bash under bypass, then delete it
+live_check() {
+  local dir="$WORK/live" id ok=1
+  mkdir -p "$dir"; rm -f "$dir/bypass-ok"
+  id=$(curl -s -m 15 -X POST "$SIDECAR/app/api/start" -H "Remote-User: filip" -H "content-type: application/json" \
+    -d "$(jq -cn --arg d "$dir" '{text:("Run exactly this bash command and reply only with its output: touch "+$d+"/bypass-ok && echo BYPASS_OK"), model:"haiku", cwd:$d}')" | jq -r '.id // empty')
+  [ -n "$id" ] || { log "live check: /app/api/start returned no id"; return 1; }
+  for _ in $(seq 1 60); do [ -f "$dir/bypass-ok" ] && { ok=0; break; }; sleep 2; done
+  curl -s -m 10 -X POST "$SIDECAR/app/api/delete" -H "Remote-User: filip" -H "content-type: application/json" -d "{\"id\":\"$id\"}" >/dev/null
+  rm -f "$dir/bypass-ok"
+  return $ok
+}
+
+cur=$(jq -r ".dependencies[\"$PKG\"]" package.json)
+new=$(npm view "$PKG" version 2>/dev/null)
+[ -n "$new" ] || fail "npm view $PKG returned nothing"
+summary=""
+sdk_changed=0
+
+if [ "$cur" != "$new" ] && [ "$(printf '%s\n%s\n' "$cur" "$new" | sort -V | tail -1)" = "$new" ]; then
+  log "SDK $cur -> $new"
+  # --- 1. scratch test of the new SDK, service untouched ---
+  rm -rf "$WORK/scratch" && mkdir -p "$WORK/scratch" "$WORK/check"
+  cp package.json bun.lock "$WORK/scratch/" && cp bin/bypass-check.ts "$WORK/scratch/"
+  (cd "$WORK/scratch" && jq --arg v "$new" ".dependencies[\"$PKG\"]=\$v" package.json > p.json && mv p.json package.json && bun install) \
+    || fail "bun install of SDK $new failed in scratch"
+  out=$(cd "$WORK/scratch" && timeout 150 bun run bypass-check.ts "$WORK/check" 2>&1 | tail -1)
+  log "scratch: $out"
+  [[ "$out" == BYPASS_OK* ]] || fail "SDK $new: bypass check failed before deploy, nothing changed ($out)"
+
+  # --- 2. bump the repo, restart, live check ---
+  [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || fail "repo not on main, SDK $new not deployed"
+  git diff --quiet -- package.json bun.lock && git diff --cached --quiet -- package.json bun.lock \
+    || fail "uncommitted package.json/bun.lock edits, SDK $new not deployed"
+  git fetch -q origin
+  [ "$(git rev-list --count HEAD..origin/main)" = 0 ] || fail "local main is behind origin/main, SDK $new not deployed"
+  deadline=$(( $(date +%s) + WAIT_S ))
+  while app_busy; do
+    [ "$(date +%s)" -ge "$deadline" ] && { notify "claude-terminal update waiting" "SDK $new tested OK, /app busy all night, retry tomorrow"; exit 0; }
+    sleep 120
+  done
+  jq --arg v "$new" ".dependencies[\"$PKG\"]=\$v" package.json > package.json.tmp && mv package.json.tmp package.json
+  bun install >/dev/null 2>&1 || { git checkout -- package.json bun.lock; bun install >/dev/null 2>&1; fail "bun install of SDK $new failed in the repo, reverted"; }
+  git commit -q -m "app: update agent SDK to $new (auto)
+
+ct-auto-update: bypass check passed against $new in a scratch install before deploy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" -- package.json bun.lock || fail "git commit failed"
+  if restart_and_wait && sleep 3 && live_check; then
+    git push -q origin main || notify "claude-terminal update" "SDK $new live, git push failed"
+    sdk_changed=1
+    summary="SDK $cur -> $new, bypass OK"
+  else
+    git revert --no-edit HEAD >/dev/null && bun install >/dev/null 2>&1 && restart_and_wait
+    fail "SDK $new: live /app bypass check failed after restart, reverted to $cur"
+  fi
+fi
+
+# --- 3. guests ---
+img_created=$(docker image inspect -f '{{.Created}}' guest-claude:latest 2>/dev/null)
+img_age=$(( $(date +%s) - $(date -d "${img_created:-1970-01-01}" +%s) ))
+build_flag=--no-build
+{ [ "$sdk_changed" = 1 ] || [ "$img_age" -ge 604800 ]; } && build_flag=""
+gout=$("$GUESTS/update-guests.sh" $build_flag --wait "$WAIT_S" 2>&1); grc=$?
+echo "$gout"
+[ "$grc" = 0 ] || fail "update-guests.sh exit $grc: $(echo "$gout" | tail -1)"
+recreated=$(echo "$gout" | sed -n 's/^--- recreating guest \(.*\) ---$/\1/p' | sort -u | tr '\n' ' ')
+updated=$(echo "$gout" | grep -c "Successfully updated")
+pending=$(echo "$gout" | sed -n 's/^PENDING \([0-9]*\).*/\1/p')
+[ -n "$recreated" ] && summary="${summary:+$summary; }guests recreated: $recreated"
+[ "$updated" -gt 0 ] && summary="${summary:+$summary; }guest CLI updated x$updated"
+[ -n "$pending" ] && summary="${summary:+$summary; }$pending guest(s) busy, next night"
+[ -n "$summary" ] && notify "claude-terminal updated" "$summary"
+log "done: ${summary:-nothing to do}"
