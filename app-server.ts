@@ -11,7 +11,7 @@ import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync,
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
-import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, onAppSession, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -97,6 +97,32 @@ function ensureModelChoices(ctx: AppCtx) {
       return Bun.write(file, JSON.stringify(m));
     }).catch(() => {});
   });
+}
+// #endregion
+
+// #region app sessions: which SDK transcripts are chats
+// Apps on this box (email agent, classifiers, wiki sync) run their own SDK or `claude -p` sessions.
+// Their transcripts stay in ~/.claude/projects because the usage leaderboard bills the owner from
+// there, so hiding them by folder (extraUsers) would also move the billing. Instead a transcript is a
+// chat when it is an interactive terminal tab (entrypoint "cli"), has no entrypoint (older CLI), or
+// its session id was started by this runner (recorded here at init, forks included).
+let appSessions: Set<string> | null = null;
+let appSessionsFile = "";
+function loadAppSessions(ctx: AppCtx): Set<string> {
+  if (appSessions) return appSessions;
+  appSessionsFile = join(dirname(ctx.mcpFile), "claude-app-sessions.json"); // beside the other claude-app-* state
+  try { const a = JSON.parse(readFileSync(appSessionsFile, "utf8")); appSessions = new Set(Array.isArray(a) ? a.map(String) : []); }
+  catch { appSessions = new Set(); }
+  onAppSession((id) => {
+    const s = loadAppSessions(ctx);
+    if (s.has(id)) return;
+    s.add(id);
+    try { writeFileSync(appSessionsFile, JSON.stringify([...s])); } catch (e) { console.error("[app-sessions] write failed:", e); }
+  });
+  return appSessions;
+}
+function isChat(id: string, entry: string | null | undefined, ctx: AppCtx): boolean {
+  return !entry || entry === "cli" || loadAppSessions(ctx).has(id);
 }
 // #endregion
 
@@ -247,7 +273,7 @@ async function listConversations(ctx: AppCtx): Promise<{ path: string; sessionId
 // for up to 40 files on every refresh and the conversation route on every delta fetch, and each
 // call read and JSON-parsed the whole file (see the replay cache note in app-runner.ts for what
 // that churn did to the process). One small object per file, so no bound is needed.
-type ConvMeta = { title: string | null; cwd: string | null; first?: string | null; aiTitle?: string | null };
+type ConvMeta = { title: string | null; cwd: string | null; first?: string | null; aiTitle?: string | null; entry?: string | null };
 const metaCache = new Map<string, { size: number; mtimeMs: number; meta: ConvMeta }>();
 async function convMeta(path: string): Promise<ConvMeta> {
   let size = -1, mtimeMs = -1;
@@ -263,12 +289,14 @@ async function readConvMeta(path: string): Promise<ConvMeta> {
   let cwd: string | null = null;
   let first: string | null = null;      // stripped first user text, for the fallback title + AI-title seed
   let aiTitle: string | null = null; // the <title> the first assistant reply emits
+  let entry: string | null = null;   // entrypoint of the first user row: "cli" tab, "sdk-ts"/"sdk-cli" program
   let text: string;
-  try { text = await Bun.file(path).text(); } catch { return { title, cwd, first, aiTitle }; }
+  try { text = await Bun.file(path).text(); } catch { return { title, cwd, first, aiTitle, entry }; }
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     let o: any; try { o = JSON.parse(line); } catch { continue; }
     if (!cwd && o.cwd) cwd = o.cwd;
+    if (!entry && o.type === "user" && o.entrypoint) entry = String(o.entrypoint);
     if (o.type === "summary" && o.summary) { title = String(o.summary).slice(0, 100); }
     if (!first && o.type === "user" && o.message) {
       const c = o.message.content;
@@ -283,7 +311,7 @@ async function readConvMeta(path: string): Promise<ConvMeta> {
       if (m && m[1].trim()) aiTitle = m[1].replace(/\s+/g, " ").trim().slice(0, 80);
     }
   }
-  return { title, cwd, first, aiTitle };
+  return { title, cwd, first, aiTitle, entry };
 }
 
 function findTranscript(ctx: AppCtx, sessionId: string): { path: string; project: string } | null {
@@ -397,6 +425,7 @@ const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js
 
 export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promise<Response | null> {
   ensureModelChoices(ctx);
+  loadAppSessions(ctx); // registers the init hook before any chat can start
   // normalize: allow both /app* (router, no strip) and a stray /_ct/app* (prefix strip)
   if (path.startsWith("/_ct/app")) path = path.slice(4);
   if (path !== "/app" && !path.startsWith("/app/")) return null;
@@ -796,6 +825,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       const r = rows[i];
       const meta = await convMeta(r.path);
       if (ctx.historyHide.some((h) => (meta.cwd || "").startsWith(h))) continue;
+      if (!isChat(r.sessionId, meta.entry, ctx) && !titles[r.sessionId]) continue; // another app's SDK run
       const title = pickTitle(r.sessionId, meta, titles, autoTitles);
       if (!title) continue;
       out.push({ sessionId: r.sessionId, title, cwd: meta.cwd, mtime: r.mtime, project: r.project });

@@ -520,6 +520,11 @@ export const BUILTIN_MCP_NAMES = Object.keys(BUILTIN_MCP);
 // the concrete model every turn ran on, so without this a reopened chat could only show that.
 let modelChoiceHook: ((id: string, model: string) => void) | null = null;
 export function onModelChoice(fn: (id: string, model: string) => void) { modelChoiceHook = fn; }
+// Every session id this runner starts or forks into (the init message). The chat list shows only
+// these plus interactive terminal tabs, so SDK runs from other apps (email agent, classifiers) that
+// share ~/.claude/projects for usage billing never appear as chats (Filip 2026-11-18).
+let appSessionHook: ((id: string) => void) | null = null;
+export function onAppSession(fn: (id: string) => void) { appSessionHook = fn; }
 
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
@@ -1184,6 +1189,7 @@ export class Conversation {
           // showed 4.8. A resume that passed no model runs the CLI default, i.e. "default".
           const chosen = this.model || "default";
           this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: chosen, cwd: anyM.cwd });
+          appSessionHook?.(String(anyM.session_id || this.id));
           this.emit({ t: "model", model: chosen });
           if (this.model && anyM.session_id) modelChoiceHook?.(anyM.session_id, this.model);
           if (this.phase === "starting") this.setPhase("waiting");
