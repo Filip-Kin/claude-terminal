@@ -1240,11 +1240,19 @@ export class Conversation {
           const u = anyM.usage || {};
           this.emit({ t: "agent_progress", id: String(anyM.tool_use_id), tokens: u.total_tokens, toolUses: u.tool_uses, durationMs: u.duration_ms, lastTool: anyM.last_tool_name, subagentType: anyM.subagent_type, description: anyM.description });
         }
-        else if (anyM.subtype === "task_started") this.emit({ t: "notice", kind: "task", text: String(anyM.description || "background task"), status: "started" });
+        // A task with a tool_use_id has its own card (the Agent / background Bash tool card), which
+        // shows start, progress and agent_done. A notice row for it as well was a duplicate "started"
+        // line (Filip 2026-11-18). Only a task with no card gets a notice row. The transcript replay
+        // (agent_done only) already behaves this way.
+        else if (anyM.subtype === "task_started") {
+          if (!anyM.tool_use_id) this.emit({ t: "notice", kind: "task", text: String(anyM.description || "background task"), status: "started" });
+        }
         else if (anyM.subtype === "task_notification") {
-          const extra = anyM.usage ? ` (${anyM.usage.total_tokens || 0} tokens, ${anyM.usage.tool_uses || 0} tools)` : "";
-          this.emit({ t: "notice", kind: "task", text: String(anyM.summary || "background task") + extra, status: String(anyM.status || "done") });
           if (anyM.tool_use_id) this.emit({ t: "agent_done", id: String(anyM.tool_use_id), status: anyM.status || "completed", summary: anyM.summary ? String(anyM.summary).slice(0, 400) : undefined });
+          else {
+            const extra = anyM.usage ? ` (${anyM.usage.total_tokens || 0} tokens, ${anyM.usage.tool_uses || 0} tools)` : "";
+            this.emit({ t: "notice", kind: "task", text: String(anyM.summary || "background task") + extra, status: String(anyM.status || "done") });
+          }
         }
         else if (anyM.subtype === "notification") {
           const isPeer = anyM.triggeredBy === "peer-send-message" || anyM.provenance === "peer-send-message";
