@@ -452,6 +452,10 @@ const RESUME_PROMPT_RE = /^(The service hosting this conversation restarted|Cont
 // restart-wake sends these as real turns (not isMeta), so match the full opening, not a prefix a person could type.
 const WAKE_TEXT_RE = /^The service hosting this conversation restarted/;
 const WAKE_NOTICE = "Resumed after a service restart.";
+// ct-redeploy resumes the chat that deployed with a "[auto] ..." turn. Like the wake text it is a
+// machine message, not something the user typed, so it renders as the same one-line notice.
+const AUTO_TEXT_RE = /^\[auto\]/;
+const isMachineTurn = (t: string) => WAKE_TEXT_RE.test(t) || AUTO_TEXT_RE.test(t);
 
 // An exhausted subscription does NOT always arrive as a rate_limit_event. The CLI also injects a
 // SYNTHETIC assistant message whose entire text is "You've hit your session limit · resets 2:30pm
@@ -795,7 +799,7 @@ export class Conversation {
     const midTurn = this.running; // folded into the running turn by the SDK, not a turn of its own
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
     const uuid = messageId(cid);
-    if (WAKE_TEXT_RE.test(text)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
+    if (isMachineTurn(text)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
     else this.emit({ t: "user", text, uuid, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
     const msg: SDKUserMessage = { type: "user", uuid: uuid as any, message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
@@ -1045,7 +1049,7 @@ export class Conversation {
       this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
       this.runStart = this.log.length; // first turn's replay boundary
       const uuid = messageId(cid);
-      if (WAKE_TEXT_RE.test(first)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
+      if (isMachineTurn(first)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
       else this.emit({ t: "user", text: first, uuid, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
       this.titleScan = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
@@ -1706,7 +1710,7 @@ async function parseTranscript(path: string, stats: { imageBytes: number } = { i
       const sk = skillLoadName(txt);
       if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
       else if (o.isMeta && RESUME_PROMPT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: "Resumed after a service restart. The interrupted turn was picked up automatically." });
-      else if (WAKE_TEXT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: WAKE_NOTICE });
+      else if (isMachineTurn(txt.trim())) out.push({ t: "notice", kind: "info", text: WAKE_NOTICE });
       else if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; apiErrors = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
@@ -1760,7 +1764,9 @@ async function parseTranscript(path: string, stats: { imageBytes: number } = { i
       // Not a turn boundary (the accumulators keep running) and not an edit target, hence midTurn.
       const a = o.attachment;
       const txt = textOfContent(a.prompt).replace(HIDDEN_STRIP, "");
-      if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt, midTurn: true, ...(a.source_uuid ? { uuid: String(a.source_uuid) } : {}) });
+      // A wake or [auto] turn that landed mid-turn arrives here, not as a user row.
+      if (isMachineTurn(txt.trim())) out.push({ t: "notice", kind: "info", text: WAKE_NOTICE });
+      else if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt, midTurn: true, ...(a.source_uuid ? { uuid: String(a.source_uuid) } : {}) });
     } else if (o.type === "system" && o.subtype === "task_notification" && o.tool_use_id) {
       out.push({ t: "agent_done", id: String(o.tool_use_id), status: o.status || "completed", summary: o.summary ? String(o.summary).slice(0, 400) : undefined });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
