@@ -958,6 +958,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const dup = dedupSeen(b.cid); // a redelivery of an already-processed turn -> ack, do not send again
     if (dup) { tlog("dedup", { route: "start", conv: dup.id, cid: shortCid(b.cid) }); return jsonRes({ id: dup.id, deduped: true }, ctx, req); }
     const text = b.voice ? decorateVoiceTurn(rawText) : rawText; // voice mode -> append the brief/TTS directive
+    // Only the browser sends human:true. Every other caller (restart-wake, the redeploy script,
+    // subscription-resume, ct-auto-update, any future script) is automated by default and renders
+    // as a grey notice, so a new sender can never show as the user (user-rows.ts).
+    const human = b.human === true;
     const resume: string | undefined = b.resume && /^[A-Za-z0-9-]{6,}$/.test(b.resume) ? b.resume : undefined;
     let cwd: string = ctx.defaultCwd;
     if (resume) { const found = findTranscript(ctx, resume); if (found) { const m = await convMeta(found.path); if (m.cwd) cwd = m.cwd; } }
@@ -965,11 +969,11 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const model: string | undefined = typeof b.model === "string" && b.model ? b.model : undefined;
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
-    if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.setClientTz(b.tz); existing.send(text, typeof b.cid === "string" ? b.cid : undefined); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
+    if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.setClientTz(b.tz); existing.send(text, typeof b.cid === "string" ? b.cid : undefined, human); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
     const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile });
     tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
     conv.setClientTz(b.tz);
-    void conv.run(text, typeof b.cid === "string" ? b.cid : undefined);
+    void conv.run(text, typeof b.cid === "string" ? b.cid : undefined, human);
     dedupRecord(b.cid, conv.id);
     return jsonRes({ id: conv.id, cwd, model: model || null, epoch: conv.epoch }, ctx, req);
   }
@@ -984,7 +988,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (dedupSeen(b.cid)) { tlog("dedup", { route: "send", conv: conv.id, cid: shortCid(b.cid) }); return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); } // redelivery -> ack, don't re-send
     tlog("accept", { route: "send", conv: conv.id, cid: shortCid(b.cid), chars: rawText.length });
     conv.setClientTz(b.tz);
-    conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText, typeof b.cid === "string" ? b.cid : undefined); // voice mode -> append the brief/TTS directive
+    conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText, typeof b.cid === "string" ? b.cid : undefined, b.human === true); // voice mode -> append the brief/TTS directive
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
   }

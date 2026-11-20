@@ -258,9 +258,9 @@ const api = {
   conversation: (id: string, since?: number) =>
     withTimeout(fetch(`/app/api/conversation/${encodeURIComponent(id)}${since && since > 0 ? `?since=${since}` : ""}`).then(J)),
   start: (b: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean }) =>
-    fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
+    fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, human: true, tz: clientTz() }) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
-    fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
+    fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, human: true, tz: clientTz() }) }).then(J),
   deleteFrom: (b: { id: string; uuid: string }) =>
     fetch("/app/api/delete-from", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   edit: (b: { id: string; uuid: string; text: string; cid: string; model?: string }) =>

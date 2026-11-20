@@ -292,7 +292,7 @@ export async function drainQueue(): Promise<number> {
   let sent = 0;
   for (const it of items) {
     try {
-      const r = await fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(it.body) });
+      const r = await fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...it.body, human: true }) }); // queued only from the composer: a person typed it
       if (!r.ok) break; // server reachable but rejected — stop to avoid a hot loop; leave queued
       if (it.qid != null) await removeQueued(it.qid);
       sent++;

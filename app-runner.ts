@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
+import { classifyUserRow, noticeText, type RowState } from "./user-rows.ts";
 
 // Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
 // done/error/closed is a turn the runner swallowed; a done with the user still seeing nothing points at
@@ -369,9 +370,6 @@ const APP_UI_SYSTEM_APPEND = [
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.
-// The CLI's note after the model reads an image ("[Image: original 2856x1280, displayed at ...]") is
-// an isMeta user row. Never shown live; on reload it rendered as a user bubble.
-const IMAGE_NOTE_RE = /^\[Image: original \d+x\d+/;
 const HIDDEN_STRIP = /\s*<(voice-mode|turn-context|title-request)>[\s\S]*?<\/\1>\s*/g;
 const TITLE_TAG = /<title>[\s\S]*?<\/title>\s*/i; // the conversation-title tag the first reply opens with
 // #endregion
@@ -449,13 +447,17 @@ export const HOLD_PROMPT = [
 // The injected turn is marked isMeta in the transcript. Render it as a notice, not as a message the
 // user never typed. Matches both our prompt and the CLI's default, for transcripts written before this.
 const RESUME_PROMPT_RE = /^(The service hosting this conversation restarted|Continue from where you left off)/;
-// restart-wake sends these as real turns (not isMeta), so match the full opening, not a prefix a person could type.
+// Who sent a turn is decided by the sender, never by matching its text (see user-rows.ts). Only the
+// browser marks a turn human; restart-wake, ct-redeploy, subscription-resume and ct-auto-update send
+// automated turns, which render as one grey line.
 const WAKE_TEXT_RE = /^The service hosting this conversation restarted/;
 const WAKE_NOTICE = "Resumed after a service restart.";
-// ct-redeploy resumes the chat that deployed with a "[auto] ..." turn. Like the wake text it is a
-// machine message, not something the user typed, so it renders as the same one-line notice.
-const AUTO_TEXT_RE = /^\[auto\]/;
-const isMachineTurn = (t: string) => WAKE_TEXT_RE.test(t) || AUTO_TEXT_RE.test(t);
+const machineNotice = (t: string) => (WAKE_TEXT_RE.test(t.trim()) ? WAKE_NOTICE : "Automated: " + noticeText(t));
+// A person's turn carries origin {kind:"human"} into the transcript row, which is what replay trusts.
+const userMsg = (content: string, human: boolean, uuid?: string): SDKUserMessage => ({
+  type: "user", ...(uuid ? { uuid: uuid as any } : {}), message: { role: "user", content }, parent_tool_use_id: null,
+  ...(human ? { origin: { kind: "human" as const } } : {}),
+});
 
 // An exhausted subscription does NOT always arrive as a rate_limit_event. The CLI also injects a
 // SYNTHETIC assistant message whose entire text is "You've hit your session limit · resets 2:30pm
@@ -619,6 +621,7 @@ export class Conversation {
   // from the transcript). Otherwise reopening a live conversation replays every prior turn.
   private seqCounter = 0; // stable per-conversation sequence so a reconnect can dedupe
   private currentTurnText = ""; // text of the in-flight user turn — re-sent if the limit cuts it off
+  private currentTurnHuman = false; // whether a person typed it, kept for the re-send
   private pendingRateLimit: { resumeAt: number; type?: string } | null = null; // set when a turn is rejected by the subscription limit
   private forkAt?: string;      // resumeSessionAt for the next (forked) run — the kept history's last entry
   private forkNext = false;     // one-shot: the next run() should fork the session (edit-and-rerun)
@@ -779,7 +782,7 @@ export class Conversation {
     return `<turn-context>Local time is now ${stamp}. ${gap} Use these figures for anything time-related; do not estimate elapsed time any other way.</turn-context>`;
   }
 
-  send(text: string, cid?: string) {
+  send(text: string, cid?: string, human = false) {
     // A closed conversation can still be in the map: the reaper skips one that has a watcher, and a
     // client tab reconnects to it. Dropping the turn here meant messages were "accepted" and then
     // silently never ran (a chat closed overnight would not start in the morning). Reopen instead:
@@ -793,16 +796,17 @@ export class Conversation {
     }
     this.lastActivity = Date.now();
     this.currentTurnText = text; // remember it so a subscription-limit rejection can re-run this turn
+    this.currentTurnHuman = human;
     // The user is actively driving this conversation, so any auto-resume we had queued for it is
     // no longer wanted (this counts as the "easy cancel" for the default-on behaviour).
     try { cancelResume(this.id); } catch { /* */ }
     const midTurn = this.running; // folded into the running turn by the SDK, not a turn of its own
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
     const uuid = messageId(cid);
-    if (isMachineTurn(text)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
+    if (!human) this.emit({ t: "notice", kind: "info", text: machineNotice(text) });
     else this.emit({ t: "user", text, uuid, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
-    const msg: SDKUserMessage = { type: "user", uuid: uuid as any, message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+    const msg = userMsg(text + "\n\n" + this.turnContext(), human, uuid);
     // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
     // nor the queue, and its dead inputGen is parked exactly at the waiter below, so the healthy-path
     // early return must be covered too. handle() clears this the instant any real message arrives.
@@ -851,7 +855,7 @@ export class Conversation {
     // The hung query usually swallowed the turn into its dead waiter, leaving the queue empty; only
     // re-inject when nothing is queued, so a turn still sitting in the queue is never double-sent.
     if (pending && this.queue.length === 0) {
-      this.queue.push({ type: "user", message: { role: "user", content: pending + "\n\n" + this.turnContext() }, parent_tool_use_id: null });
+      this.queue.push(userMsg(pending + "\n\n" + this.turnContext(), this.currentTurnHuman));
     }
     void this.run();
     this.armHungWatch();           // the fresh query must answer too, or recycle again (now rate-limited)
@@ -966,7 +970,7 @@ export class Conversation {
     if (forkAtUuid) { this.resume = this.id; this.forkAt = forkAtUuid; this.forkNext = true; }
     else { this.resume = undefined; this.forkAt = undefined; this.forkNext = false; } // editing the first turn -> fresh session
     this.closed = false;
-    void this.run(text, cid);                    // bumps runGen, starts the forked query, emits the edited user turn
+    void this.run(text, cid, true);              // the edit box is a person typing; bumps runGen, starts the forked query, emits the edited user turn
     try { oldQ?.close(); } catch { /* the old run's finally is superseded (older gen) -> stays silent */ }
     return rewind;
   }
@@ -1044,16 +1048,17 @@ export class Conversation {
     this.emit({ t: "closed" });
   }
 
-  private async *inputGen(first?: string, cid?: string): AsyncGenerator<SDKUserMessage> {
+  private async *inputGen(first?: string, cid?: string, human = false): AsyncGenerator<SDKUserMessage> {
     if (first !== undefined) {
       this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
+      this.currentTurnHuman = human;
       this.runStart = this.log.length; // first turn's replay boundary
       const uuid = messageId(cid);
-      if (isMachineTurn(first)) this.emit({ t: "notice", kind: "info", text: WAKE_NOTICE });
+      if (!human) this.emit({ t: "notice", kind: "info", text: machineNotice(first) });
       else this.emit({ t: "user", text: first, uuid, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
       this.titleScan = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
-      yield { type: "user", uuid: uuid as any, message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+      yield userMsg(first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext(), human, uuid);
     }
     while (!this.closed) {
       const next = this.queue.shift() ?? (await new Promise<SDKUserMessage | null>((res) => { this.waiter = res; }));
@@ -1064,7 +1069,7 @@ export class Conversation {
 
   // Start the SDK query. `first` is the opening user turn for a brand-new chat;
   // omit it when resuming (the client sends the next turn via send()).
-  async run(first?: string, cid?: string) {
+  async run(first?: string, cid?: string, human = false) {
     // A refork tears down the current query and starts a fresh one; each run() gets a generation
     // token so the OLD run's finally (fired when its query ends) knows it was superseded and stays
     // quiet — otherwise it would emit a spurious closed/busy:false that drops the client's stream.
@@ -1079,7 +1084,7 @@ export class Conversation {
     let stored: Record<string, McpServerConfig> = {};
     if (this.mcpFile) { try { stored = await mcpServersForQuery(this.mcpFile); } catch {} }
     this.q = query({
-      prompt: this.inputGen(first, cid),
+      prompt: this.inputGen(first, cid, human),
       options: {
         cwd: this.cwd,
         // Replace Claude Code's bare "Continue from where you left off." with a prompt that says a
@@ -1316,8 +1321,8 @@ export class Conversation {
           // streams as deltas, so the live path dropped it and the chat showed nothing at all until
           // a reload replayed the transcript. Surface it now: failures as a notice, the rest as text.
           if (t.trim()) {
-            if (API_ERROR_RE.test(t.trim())) this.emit({ t: "notice", kind: "info", text: t.trim() });
-            else this.emit({ t: "text", text: t });
+            // Synthetic text is never Claude's own words, so it is never rendered as Claude's reply.
+            this.emit({ t: "notice", kind: "info", text: API_ERROR_RE.test(t.trim()) ? t.trim() : noticeText(t) });
             break;
           }
         }
@@ -1651,6 +1656,7 @@ async function parseTranscript(path: string, stats: { imageBytes: number } = { i
   // take context from the last response. Reset at each user/compact boundary. turnStartTs powers a
   // real "Worked for" from transcript timestamps (live has duration_ms; replay doesn't).
   let turnOut = 0, turnThink = 0, turnStartTs = 0, apiErrors = 0;
+  const rowState: RowState = { stamped: false }; // set once a human-stamped row is seen (user-rows.ts)
   let lastModel = ""; // the model of the last real assistant message: what the selector should show for a cold conversation
   let text: string;
   try { text = await Bun.file(path).text(); } catch { return out; }
@@ -1706,12 +1712,12 @@ async function parseTranscript(path: string, stats: { imageBytes: number } = { i
         }
       }
       const txt = textOfContent(c).replace(HIDDEN_STRIP, ""); // hide the appended voice-mode directive
-      if (o.isMeta && IMAGE_NOTE_RE.test(txt.trim())) continue;
       const sk = skillLoadName(txt);
-      if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
-      else if (o.isMeta && RESUME_PROMPT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: "Resumed after a service restart. The interrupted turn was picked up automatically." });
-      else if (isMachineTurn(txt.trim())) out.push({ t: "notice", kind: "info", text: WAKE_NOTICE });
-      else if (txt.trim() && !txt.startsWith("<")) {
+      if (sk) { out.push({ t: "notice", kind: "skill", text: sk }); continue; } // loaded skill -> compact card, not the raw file
+      if (o.isMeta && RESUME_PROMPT_RE.test(txt.trim())) { out.push({ t: "notice", kind: "info", text: "Resumed after a service restart. The interrupted turn was picked up automatically." }); continue; }
+      const v = classifyUserRow(txt, o.origin, !!o.isMeta, rowState);
+      if (v.kind === "notice") out.push({ t: "notice", kind: "info", text: v.text });
+      else if (v.kind === "user") {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; apiErrors = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
         out.push({ t: "user", text: txt, ...(o.uuid ? { uuid: String(o.uuid) } : {}) }); // uuid: edit/delete target this exact entry
@@ -1727,7 +1733,8 @@ async function parseTranscript(path: string, stats: { imageBytes: number } = { i
           out.push({ t: "notice", kind: "info", text: limitNoticeText(at) });
           continue;
         }
-        if (API_ERROR_RE.test(t.trim())) { out.push({ t: "notice", kind: "info", text: t.trim() }); continue; }
+        // Any other synthetic text is not Claude's words either: one grey line, never a reply.
+        if (t.trim()) { out.push({ t: "notice", kind: "info", text: API_ERROR_RE.test(t.trim()) ? t.trim() : noticeText(t) }); continue; }
       }
       if (msg.model && msg.model !== "<synthetic>") lastModel = String(msg.model);
       const blocks = (msg.content as any[]) || [];
@@ -1765,8 +1772,9 @@ async function parseTranscript(path: string, stats: { imageBytes: number } = { i
       const a = o.attachment;
       const txt = textOfContent(a.prompt).replace(HIDDEN_STRIP, "");
       // A wake or [auto] turn that landed mid-turn arrives here, not as a user row.
-      if (isMachineTurn(txt.trim())) out.push({ t: "notice", kind: "info", text: WAKE_NOTICE });
-      else if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt, midTurn: true, ...(a.source_uuid ? { uuid: String(a.source_uuid) } : {}) });
+      const v = classifyUserRow(txt, a.origin ?? o.origin, !!(a.isMeta ?? o.isMeta), rowState);
+      if (v.kind === "notice") out.push({ t: "notice", kind: "info", text: v.text });
+      else if (v.kind === "user") out.push({ t: "user", text: txt, midTurn: true, ...(a.source_uuid ? { uuid: String(a.source_uuid) } : {}) });
     } else if (o.type === "system" && o.subtype === "task_notification" && o.tool_use_id) {
       out.push({ t: "agent_done", id: String(o.tool_use_id), status: o.status || "completed", summary: o.summary ? String(o.summary).slice(0, 400) : undefined });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
