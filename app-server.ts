@@ -8,6 +8,7 @@
 import { dirname, join, resolve } from "path";
 import { homedir } from "os";
 import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync, mkdirSync, truncateSync } from "fs";
+import { readOrSeedAppSessions } from "./app-sessions";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
@@ -105,14 +106,14 @@ function ensureModelChoices(ctx: AppCtx) {
 // Their transcripts stay in ~/.claude/projects because the usage leaderboard bills the owner from
 // there, so hiding them by folder (extraUsers) would also move the billing. Instead a transcript is a
 // chat when it is an interactive terminal tab (entrypoint "cli"), has no entrypoint (older CLI), or
-// its session id was started by this runner (recorded here at init, forks included).
+// its session id was started by this runner (recorded here at init, forks included). A missing list
+// is seeded with every existing transcript (app-sessions.ts).
 let appSessions: Set<string> | null = null;
 let appSessionsFile = "";
 function loadAppSessions(ctx: AppCtx): Set<string> {
   if (appSessions) return appSessions;
   appSessionsFile = join(dirname(ctx.mcpFile), "claude-app-sessions.json"); // beside the other claude-app-* state
-  try { const a = JSON.parse(readFileSync(appSessionsFile, "utf8")); appSessions = new Set(Array.isArray(a) ? a.map(String) : []); }
-  catch { appSessions = new Set(); }
+  appSessions = readOrSeedAppSessions(appSessionsFile, ctx.dataDir);
   onAppSession((id) => {
     const s = loadAppSessions(ctx);
     if (s.has(id)) return;
