@@ -1718,7 +1718,13 @@ function App() {
     api.models().then((d) => {
       if (!d.models?.length) throw new Error("no models");
       modelsTry.current = 0;
-      setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); { const def = d.defaultModel || d.models?.[0]?.id; if (!localStorage.getItem("ct-app-model") && def) setDefaultModel(def); }
+      { // Menu: aliases only (latest of each family). Pinned "claude-*" versions go to the Other dialog.
+        const all: Model[] = d.models || [];
+        const quick = all.filter((m) => !m.id.startsWith("claude-"));
+        const pinned = all.filter((m) => m.id.startsWith("claude-"));
+        const seen = new Set(pinned.flatMap((m) => [baseModelId(m.id), m.label]));
+        setModels(quick.length ? quick : all);
+        setMoreModels(quick.length ? [...pinned, ...(d.moreModels || []).filter((m: Model) => !seen.has(baseModelId(m.id)) && !seen.has(m.label))] : d.moreModels || []); } setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); { const def = d.defaultModel || d.models?.[0]?.id; if (!localStorage.getItem("ct-app-model") && def) setDefaultModel(def); }
     }).catch(() => { if (++modelsTry.current <= 6) setTimeout(() => loadModelsRef.current(), 5000); });
   };
   useEffect(() => {
