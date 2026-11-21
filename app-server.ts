@@ -8,7 +8,7 @@
 import { dirname, join, resolve } from "path";
 import { homedir } from "os";
 import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync, mkdirSync, truncateSync } from "fs";
-import { readOrSeedAppSessions } from "./app-sessions";
+import { readOrSeedAppSessions, startCwd } from "./app-sessions";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
@@ -970,9 +970,9 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       const held = sessionHolders(resume);
       if (held.length) { tlog("reject", { route: "start", conv: resume, cid: shortCid(b.cid), why: "held", pid: held[0].pid, entrypoint: held[0].entrypoint }); return jsonRes({ error: heldMessage(held[0]), code: "held", pid: held[0].pid }, ctx, req, 409); }
     }
-    let cwd: string = ctx.defaultCwd;
-    if (resume) { const found = findTranscript(ctx, resume); if (found) { const m = await convMeta(found.path); if (m.cwd) cwd = m.cwd; } }
-    if (typeof b.cwd === "string" && b.cwd.startsWith("/")) cwd = b.cwd;
+    let transcriptCwd: string | null = null;
+    if (resume) { const found = findTranscript(ctx, resume); if (found) transcriptCwd = (await convMeta(found.path)).cwd || null; }
+    const cwd = startCwd({ resume: !!resume, transcriptCwd, clientCwd: b.cwd, defaultCwd: ctx.defaultCwd });
     const model: string | undefined = typeof b.model === "string" && b.model ? b.model : undefined;
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;

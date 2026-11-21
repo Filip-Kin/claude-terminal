@@ -40,12 +40,13 @@ restart_and_wait() {
   done
   return 1
 }
-# busy = an /app chat (terminal:false) mid-turn. Terminal tabs live in tmux, a restart does not touch them.
+# busy = an /app chat mid-turn. Terminal tabs live in tmux, a restart does not touch them. `app` marks
+# a turn this server runs, also when a terminal tab runs the same session id (2026-11-21, a336eb2d).
 app_busy() {
   curl -s -m 5 "$SIDECAR/app/api/statuses" -H "Remote-User: filip" | python3 -c '
 import json, sys
 d = json.load(sys.stdin).get("statuses", {})
-sys.exit(0 if any(v.get("busy") and not v.get("terminal") for v in d.values()) else 1)'
+sys.exit(0 if any(v.get("app") or (v.get("busy") and not v.get("terminal")) for v in d.values()) else 1)'
 }
 # run one throwaway /app chat that must run Bash under bypass, then delete it
 live_check() {

@@ -16,6 +16,7 @@ import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
 import { classifyUserRow, noticeText, type RowState } from "./user-rows.ts";
 import { sessionHolders, heldMessage } from "./session-lock.ts";
+import { mergeStatus, type LiveStatus } from "./app-sessions.ts";
 
 // Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
 // done/error/closed is a turn the runner swallowed; a done with the user still seeing nothing points at
@@ -1464,7 +1465,7 @@ export function discard(key: string): void {
 // transcript mtime, fell through to the unread test, and showed an unread dot instead of "thinking".
 // (Measured: three busy worktree tabs reported status "busy" here while /app reported nothing at all
 // for two of them and busy=false for the third.)
-export type LiveStatus = { busy: boolean; waiting: boolean; terminal?: boolean };
+export type { LiveStatus } from "./app-sessions.ts";
 const SESSIONS_DIR = join(homedir(), ".claude", "sessions");
 let sessCache: { at: number; map: Record<string, LiveStatus> } = { at: 0, map: {} };
 function cliSessionStatuses(): Record<string, LiveStatus> {
@@ -1528,7 +1529,7 @@ export function liveStatuses(): Record<string, LiveStatus> {
     const cli = out[c.id];
     // OR them: this process is authoritative for its own turn, but a CLI tab on the same session id
     // can be mid-tool while we have nothing running.
-    out[c.id] = { busy: mine.busy || !!cli?.busy, waiting: mine.waiting, terminal: !!cli?.terminal };
+    out[c.id] = mergeStatus(mine, cli);
   }
   return out;
 }

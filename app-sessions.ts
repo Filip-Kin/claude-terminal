@@ -34,3 +34,21 @@ export function readOrSeedAppSessions(file: string, dataDir: string): Set<string
   catch (e) { console.error("[app-sessions] seed write failed:", e); }
   return s;
 }
+
+// The directory a chat's process starts in. A resumed chat runs where its transcript says it ran:
+// the page sends the cwd of whatever it has selected, and on 2026-11-21 that moved a resumed coc-bot
+// session to /home/filip (other project rules, no scratchpad). The page's cwd is for a new chat, and
+// for a resume whose transcript names no cwd.
+export function startCwd(o: { resume: boolean; transcriptCwd?: string | null; clientCwd?: unknown; defaultCwd: string }): string {
+  if (o.resume && o.transcriptCwd) return o.transcriptCwd;
+  if (typeof o.clientCwd === "string" && o.clientCwd.startsWith("/")) return o.clientCwd;
+  return o.defaultCwd;
+}
+
+// One row of /app/api/statuses: this server's own conversation merged with the terminal registry.
+// `app` = this server runs a turn of it now, so a backend restart would cut it, also when a terminal
+// tab runs the same id (ct-auto-update reads it).
+export type LiveStatus = { busy: boolean; waiting: boolean; terminal?: boolean; app?: boolean };
+export function mergeStatus(mine: { busy: boolean; waiting: boolean }, cli?: LiveStatus): LiveStatus {
+  return { busy: mine.busy || !!cli?.busy, waiting: mine.waiting, terminal: !!cli?.terminal, app: mine.busy || mine.waiting };
+}
