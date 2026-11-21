@@ -144,7 +144,7 @@ async function drainWith(db) {
   for (const it of all) {
     try {
       const r = await fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...it.body, human: true }) }); // queued only from the composer: a person typed it
-      if (!r.ok) break; // reachable but rejected — stop; leave queued
+      if (r.status !== 409 && !r.ok) break; // reachable but rejected — stop; leave queued. 409 = another process runs the session: drop it, never send it later
       await new Promise((res) => { const t = db.transaction("queue", "readwrite"); t.objectStore("queue").delete(it.qid); t.oncomplete = () => res(); t.onerror = () => res(); });
     } catch { break; } // still offline
   }

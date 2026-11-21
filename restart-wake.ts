@@ -110,6 +110,7 @@ export function installRestartWake(opts: { file: string; port: number; owner: st
           body: JSON.stringify({ resume: e.convId, text: e.interrupted ? RESUME_PROMPT : HOLD_PROMPT, cid: `restart-wake-${e.convId}-${e.at}` }),
           signal: AbortSignal.timeout(30_000),
         });
+        if (res.status === 409) { log(`not waking ${e.convId}: ${(await res.text()).slice(0, 200)}`); return; } // another process runs it (session-lock.ts)
         if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
         log(`woke ${e.convId} (${e.interrupted ? "interrupted turn" : "background work"})`);
       } catch (err) {

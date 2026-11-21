@@ -15,6 +15,7 @@ import { z } from "zod";
 import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
 import { classifyUserRow, noticeText, type RowState } from "./user-rows.ts";
+import { sessionHolders, heldMessage } from "./session-lock.ts";
 
 // Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
 // done/error/closed is a turn the runner swallowed; a done with the user still seeing nothing points at
@@ -1070,6 +1071,19 @@ export class Conversation {
   // Start the SDK query. `first` is the opening user turn for a brand-new chat;
   // omit it when resuming (the client sends the next turn via send()).
   async run(first?: string, cid?: string, human = false) {
+    // One process per session id (session-lock.ts). A plain resume of an id that a terminal tab or
+    // another process runs is refused here, whichever path asked: start, reopen, requery, recycle,
+    // restart-wake, auto-resume. A fork is let through: it only reads the transcript and runs under a new id.
+    if (this.resume && !this.forkNext) {
+      const held = sessionHolders(this.resume);
+      if (held.length) {
+        tlog("refuse", { conv: this.id, why: "held", pid: held[0].pid, entrypoint: held[0].entrypoint });
+        this.queue = []; // never deliver this turn later, into a session the user did not mean
+        this.emit({ t: "error", message: heldMessage(held[0]) });
+        this.setPhase("idle");
+        return;
+      }
+    }
     // A refork tears down the current query and starts a fresh one; each run() gets a generation
     // token so the OLD run's finally (fired when its query ends) knows it was superseded and stays
     // quiet — otherwise it would emit a spurious closed/busy:false that drops the client's stream.

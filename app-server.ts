@@ -13,6 +13,7 @@ import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-m
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
 import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, onAppSession, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
+import { sessionHolders, heldMessage } from "./session-lock";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -963,6 +964,12 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // as a grey notice, so a new sender can never show as the user (user-rows.ts).
     const human = b.human === true;
     const resume: string | undefined = b.resume && /^[A-Za-z0-9-]{6,}$/.test(b.resume) ? b.resume : undefined;
+    // One process per session id: a session a terminal tab (or any other process) runs is never
+    // resumed in a second process here (session-lock.ts; 2026-11-21, session a336eb2d ran twice).
+    if (resume) {
+      const held = sessionHolders(resume);
+      if (held.length) { tlog("reject", { route: "start", conv: resume, cid: shortCid(b.cid), why: "held", pid: held[0].pid, entrypoint: held[0].entrypoint }); return jsonRes({ error: heldMessage(held[0]), code: "held", pid: held[0].pid }, ctx, req, 409); }
+    }
     let cwd: string = ctx.defaultCwd;
     if (resume) { const found = findTranscript(ctx, resume); if (found) { const m = await convMeta(found.path); if (m.cwd) cwd = m.cwd; } }
     if (typeof b.cwd === "string" && b.cwd.startsWith("/")) cwd = b.cwd;
@@ -1010,6 +1017,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!points) { tlog("reject", { route: "edit", conv: id, uuid, why: "no such message" }); return jsonRes({ error: "message not found" }, ctx, req, 404); }
     const meta = await convMeta(found.path);
     let conv = get(id);
+    if (!conv) { // booting it for the rewind would resume the id next to the process that runs it
+      const held = sessionHolders(id);
+      if (held.length) { tlog("reject", { route: "edit", conv: id, why: "held", pid: held[0].pid, entrypoint: held[0].entrypoint }); return jsonRes({ error: heldMessage(held[0]), code: "held", pid: held[0].pid }, ctx, req, 409); }
+    }
     if (!conv) { conv = getOrCreate(id, { cwd: meta.cwd || ctx.defaultCwd, model: b.model || undefined, resume: id, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile }); await conv.bootForRewind(); }
     const text = b.voice ? decorateVoiceTurn(rawText) : rawText;
     tlog("accept", { route: "edit", conv: conv.id, cid: shortCid(b.cid), chars: text.length, uuid });

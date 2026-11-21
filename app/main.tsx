@@ -644,6 +644,8 @@ class ConvStore {
   // now (so the send is visibly acknowledged) but pinned BELOW the reply that is still streaming
   // instead of splitting it. doEdit passes false, because a rewind cancels the running turn and its rerun
   // must appear under the edited bubble, not above it.
+  // The server refused the turn (e.g. the session runs in a terminal tab): show its one line under the bubble.
+  sendRefused(message: string) { this.pendingEcho = []; this.busy = false; this.sendState = null; this.items = [...freezeOpen(this.items), { kind: "assistant", text: "\n\n_" + message + "_" }]; this.touch(); }
   addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text, ...(cid ? { uuid: cid } : {}), ...(this.busy ? { midTurn: true } : {}) }); this.busy = true; this.setSendState("sending"); this.touch(); }
   // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
   // below), and restore the pre-edit view if the server rejects the edit.
@@ -2165,7 +2167,7 @@ function App() {
         const cid = newId();
         s.addOptimisticUser(text, cid); // now renders below the compaction divider (card already applied)
         const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: (s.id.startsWith("new-") ? modelRef.current : s.model) || undefined, cwd: cwdRef.current || undefined };
-        try { if (s.connected) await api.send({ id: s.id, text, cid }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
+        try { if (s.connected) await api.send({ id: s.id, text, cid }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } else if (r?.error) s.sendRefused(String(r.error)); } }
         catch { await offline.enqueueSend(body); void refreshQueue(); }
       }
     })();
@@ -2319,6 +2321,7 @@ function App() {
         const r = await api.start(it.body);
         if (it.qid != null) await offline.removeQueued(it.qid);
         if (r?.id) { lastId = r.id; settleQueued(it.body, r.id); }
+        else if (r?.error) ((it.body.resume ? manager.get(it.body.resume) : null) || manager.findQueuedNewChat(it.body.text))?.sendRefused(String(r.error));
       } catch { break; } // dropped offline again — leave the rest queued
     }
     await refreshQueue();
@@ -2422,7 +2425,8 @@ function App() {
       if (s!.connected && !s!.id.startsWith("new-")) { await withTimeout(api.send({ id: s!.id, text, cid })); if (s!.sendState === "sending") s!.setSendState("delivered"); return s!.id; }
       const r = await withTimeout(api.start(body));
       if (r?.id) { manager.rebind(s!, r.id); activeIdRef.current = r.id; s!.connect(false); if (s!.sendState === "sending") s!.setSendState("delivered"); return r.id; }
-      s!.setBusy(false); return null;
+      if (r?.error) s!.sendRefused(String(r.error)); else s!.setBusy(false);
+      return null;
     } catch { await queue(); return null; } // network died / timed out mid-send -> queue for reconnect
   }, []);
 
