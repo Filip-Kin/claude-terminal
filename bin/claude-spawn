@@ -1,43 +1,32 @@
 #!/bin/bash
-# claude-spawn: spin off a NEW claude-terminal tab that runs a fresh, detached Claude
-# on a given task. The tab shows up in the browser tab bar; open it any time to watch
-# the spawned session work (it keeps going whether or not anyone is looking).
+# claude-spawn: start a NEW Claude on a given task, detached, as a chat in the claude-terminal
+# chat page (/app). It starts working at once and keeps going whether or not anyone looks.
 #
-# It creates a detached tmux session on the same socket the tab bar enumerates, running
-#   claude "<prompt>" --dangerously-skip-permissions
-# in the given directory. The ttyd wrapper attaches to that already-running session with
-# `new-session -A` when you open the tab, so opening it never restarts the work.
-#
-# Two facts this relies on, both verified against the live Claude CLI:
-#   1. `claude "<prompt>"` in an interactive pty AUTO-SUBMITS the prompt (it doesn't just
-#      pre-fill the box), so the spawned session starts working on its own.
-#   2. The workspace trust dialog is NOT skipped in interactive mode, so a cwd with no
-#      trusted ancestor would sit on that prompt forever. We pre-seed trust for the cwd
-#      before launching (same thing the guest entrypoint does for /workspace).
+# It asks the claude-terminal server to start the chat (POST /sessions/spawn). The server owns
+# the one process of that session, so the chat page can be used to read it and to talk to it.
+# (Until 2026-11-21 a spawn was a terminal tab in tmux; a message typed for it in the chat page
+# started a second process on the same session.)
 #
 # Usage:
-#   claude-spawn --prompt "do the thing" [--name NAME] [--cwd DIR]
+#   claude-spawn --prompt "do the thing" [--name NAME] [--cwd DIR] [--model MODEL]
 #   claude-spawn --prompt-file /path/to/prompt.txt [--name NAME] [--cwd DIR]
 #
 # Options:
-#   -p, --prompt TEXT        the task (auto-submitted to the fresh Claude). Required
-#                            unless --prompt-file is given.
+#   -p, --prompt TEXT        the task. Required unless --prompt-file is given.
 #   -f, --prompt-file FILE   read the prompt from FILE (preferred for long/multi-line
 #                            prompts). Use "-" to read stdin.
-#   -n, --name NAME          tab/tmux session name AND the spawned Claude's display name
-#                            (what peers see in ListAgents / a cross-session message header),
-#                            so a task-descriptive name shows instead of a derived one.
+#   -n, --name NAME          the spawned Claude's display name (what peers see in ListAgents /
+#                            a cross-session message header) and its CLAUDE_SPAWNED_TAB.
 #                            Sanitised to [A-Za-z0-9_-]. Default: a generated
 #                            "spawn-<time>-<rand>" id.
 #   -c, --cwd DIR            working directory for the spawned Claude. Default: $PWD.
-#   -m, --model MODEL        model for the spawned Claude, passed straight through as
-#                            --model. Accepts the CLI's short aliases (opus, sonnet,
-#                            haiku, fable) or a full id (claude-fable-5-1). Omitted when
-#                            not given, so the default model is unchanged.
+#   -m, --model MODEL        model alias (opus, sonnet, haiku, fable) or a full id. Omitted
+#                            when not given, so the default model is unchanged.
 #   -h, --help               this help.
 #
-# Prints the tmux session name (= the tab id) on stdout.
-# Env: TMUX_TMPDIR selects the tmux socket dir (default /tmp, matching the sidecar).
+# Prints the spawn name on stdout, nothing else.
+# Env: CT_SPAWN_URL (default http://127.0.0.1:7682/sessions/spawn), CT_OWNER (the Remote-User
+#      the server expects, default: $GUEST_USER in a guest container, else the current user).
 set -uo pipefail
 
 die() { echo "claude-spawn: $*" >&2; exit 1; }
@@ -55,7 +44,7 @@ while [ $# -gt 0 ]; do
         -m|--model)       model="${2:-}"; shift 2 ;;
         -p|--prompt)      prompt="${2:-}"; shift 2 ;;
         -f|--prompt-file) prompt_file="${2:-}"; shift 2 ;;
-        -h|--help)        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)        sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -74,81 +63,30 @@ fi
 # cwd default = caller's cwd; must exist.
 [ -n "$cwd" ] || cwd="$PWD"
 [ -d "$cwd" ] || die "cwd is not a directory: $cwd"
-cwd="$(cd "$cwd" && pwd -P)"   # canonicalise (realpath), matching the trust key
+cwd="$(cd "$cwd" && pwd -P)"
 
-# Name: sanitise to the same charset the tab bar / ttyd wrapper allow. Generate one
-# if not supplied.
-if [ -z "$name" ]; then
-    name="spawn-$(date +%H%M%S)-$RANDOM"
-fi
 name="${name//[^A-Za-z0-9_-]/}"
-[ -n "$name" ] || die "name reduced to empty after sanitising"
 
-sockdir="${TMUX_TMPDIR:-/tmp}"
+url="${CT_SPAWN_URL:-http://127.0.0.1:7682/sessions/spawn}"
+owner="${CT_OWNER:-${GUEST_USER:-$(id -un)}}"   # a guest container's server expects the guest's name
 
-# Refuse to clobber an existing session (would otherwise silently attach to unrelated
-# work). The caller can retry with a different name.
-if TMUX_TMPDIR="$sockdir" tmux has-session -t "=$name" 2>/dev/null; then
-    die "a tmux session named '$name' already exists (pick another --name)"
-fi
+# The prompt goes through the environment into json.dumps: no argv limit worth the name, no quoting.
+payload="$(CS_PROMPT="$prompt" CS_NAME="$name" CS_CWD="$cwd" CS_MODEL="$model" python3 -c '
+import json, os
+b = {"prompt": os.environ["CS_PROMPT"], "cwd": os.environ["CS_CWD"]}
+if os.environ["CS_NAME"]: b["name"] = os.environ["CS_NAME"]
+if os.environ["CS_MODEL"]: b["model"] = os.environ["CS_MODEL"]
+print(json.dumps(b))')" || die "could not build the request"
 
-# Pre-seed workspace trust for the cwd so the spawned Claude never blocks on the trust
-# dialog. No-op if the cwd or any ancestor is already trusted, so a default spawn into
-# an already-trusted tree (files root / /workspace) writes nothing. Uses a lock + atomic
-# rename; a concurrent Claude rewriting ~/.claude.json is a tiny race and the seed only
-# needs to survive the second until the spawned Claude reads it at startup.
-CLAUDE_SPAWN_CWD="$cwd" python3 - <<'PY' || die "could not pre-seed folder trust"
-import json, os, sys, tempfile
-try:
-    import fcntl
-except Exception:
-    fcntl = None
-cwd = os.path.realpath(os.environ["CLAUDE_SPAWN_CWD"])
-p = os.path.join(os.path.expanduser("~"), ".claude.json")
-lock = open(p + ".spawnlock", "w")
-if fcntl:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-try:
-    try:
-        d = json.load(open(p))
-    except FileNotFoundError:
-        d = {}
-    projs = d.setdefault("projects", {})
-    def has_trusted_ancestor(path):
-        cur = path
-        while True:
-            e = projs.get(cur)
-            if isinstance(e, dict) and e.get("hasTrustDialogAccepted"):
-                return True
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                return False
-            cur = parent
-    if not has_trusted_ancestor(cwd):
-        entry = projs.setdefault(cwd, {})
-        entry["hasTrustDialogAccepted"] = True
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p) or ".")
-        with os.fdopen(fd, "w") as f:
-            json.dump(d, f)
-        os.replace(tmp, p)
-finally:
-    if fcntl:
-        fcntl.flock(lock, fcntl.LOCK_UN)
-PY
+out="$(mktemp)"; trap 'rm -f "$out"' EXIT
+code="$(printf '%s' "$payload" | curl -s --max-time 30 -o "$out" -w '%{http_code}' -X POST "$url" \
+    -H 'content-type: application/json' -H "Remote-User: $owner" --data-binary @-)" \
+    || die "claude-terminal server not reachable at $url"
+[ "$code" = "200" ] || die "spawn refused (HTTP $code): $(head -c 300 "$out")"
 
-# Launch detached. tmux execs a MULTI-arg command directly (no shell), so the prompt is
-# passed as one literal argv element ($1) with zero quoting hazard, and naming /bin/bash
-# explicitly dodges the uid-33 nologin trap in guest containers. The wrapper prepends
-# ~/.local/bin so the spawned Claude finds its tools (claude-notify, gh, ...) even when
-# the tmux server's inherited PATH is bare, and resolves `claude` via PATH so it works on
-# the host (~/.local/bin/claude) and inside guests (/config/.local/bin/claude) alike.
-# CLAUDE_SPAWNED_TAB marks the session as spawned: ~/.claude/hooks/spawned-ask-stop.py uses it to stop an
-# unwatched tab from ending its turn on "Go ahead?" for work it was ordered to do.
-# The tab name is also passed as the spawned Claude's --name, so its cross-session/peer
-# identity is task-descriptive (the name peers see) instead of a derived cwd-based one.
-TMUX_TMPDIR="$sockdir" tmux new-session -d -s "$name" -c "$cwd" \
-    /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH" CLAUDE_SPAWNED_TAB="$2"; model_args=(); [ -n "$3" ] && model_args=(--model "$3"); exec claude "$1" --name "$2" "${model_args[@]}" --dangerously-skip-permissions' \
-    claude-spawn "$prompt" "$name" "$model" \
-    || die "tmux new-session failed"
-
-echo "$name"
+python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+# A server from before 2026-11-21 answers {id} only and has started a terminal tab, not a chat.
+if not d.get("sessionId"): sys.exit("claude-spawn: server answered without a sessionId: " + json.dumps(d)[:200])
+print(d["id"])' "$out"

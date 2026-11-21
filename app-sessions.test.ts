@@ -4,7 +4,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { readOrSeedAppSessions, startCwd, mergeStatus } from "./app-sessions";
+import { readOrSeedAppSessions, startCwd, mergeStatus, spawnName, spawnQueryOpts } from "./app-sessions";
 
 function setup() {
   const root = mkdtempSync(join(tmpdir(), "ct-appsess-"));
@@ -53,4 +53,18 @@ test("a turn this server runs is marked app, also when a terminal runs the same 
   expect(mergeStatus({ busy: true, waiting: false }, { busy: true, waiting: false, terminal: true })).toEqual({ busy: true, waiting: false, terminal: true, app: true });
   expect(mergeStatus({ busy: false, waiting: false }, { busy: true, waiting: false, terminal: true })).toEqual({ busy: true, waiting: false, terminal: true, app: false });
   expect(mergeStatus({ busy: false, waiting: true }, undefined)).toEqual({ busy: false, waiting: true, terminal: false, app: true });
+});
+
+// 2026-11-21: a spawn was a terminal tab the chat page could not own. A spawn is now an /app chat
+// that keeps the two things a tab had: its name and the CLAUDE_SPAWNED_TAB marker.
+test("spawn name: sanitised, generated when missing", () => {
+  expect(spawnName("coc overhaul!")).toBe("cocoverhaul");
+  expect(spawnName("two-procs_bug")).toBe("two-procs_bug");
+  expect(spawnName(undefined, new Date(2026, 10, 21, 12, 5, 9), () => 0.5)).toBe("spawn-120509-16384");
+  expect(spawnName("!!!", new Date(2026, 10, 21, 1, 2, 3), () => 0)).toBe("spawn-010203-0");
+});
+test("a spawned chat's process gets the marker on every run and --name on the first", () => {
+  expect(spawnQueryOpts("coc-overhaul", false)).toEqual({ env: { CLAUDE_SPAWNED_TAB: "coc-overhaul" }, extraArgs: { name: "coc-overhaul" } });
+  expect(spawnQueryOpts("coc-overhaul", true)).toEqual({ env: { CLAUDE_SPAWNED_TAB: "coc-overhaul" } });
+  expect(spawnQueryOpts(undefined, false)).toEqual({ env: {} });
 });

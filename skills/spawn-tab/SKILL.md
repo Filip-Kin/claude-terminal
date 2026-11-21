@@ -4,11 +4,13 @@ description: Use whenever the user asks to "spawn", "open", or "start" a new tab
 ---
 
 When the user says "spawn a tab" (or worker / session / "run this in a new tab" / "do
-that in the background"), they mean: create a new terminal tab in the claude-terminal web
-UI running a fresh, detached Claude on a prompt. It is a real tab they can click open and
-watch — do NOT interpret this as an in-process subagent.
+that in the background"), they mean: start a fresh, detached Claude on a prompt as its own chat
+in the claude-terminal chat page (/app). It is a real chat they can open, read and type into: do
+NOT interpret this as an in-process subagent.
 
-Spawn means `claude-spawn` into a real tab (in a worktree for code work), never the Agent tool.
+Spawn means `claude-spawn` into its own chat (in a worktree for code work), never the Agent tool.
+The server owns the spawned process, so a backend restart of claude-terminal cuts it like any
+other chat (restart-wake resumes it).
 
 Do it with `claude-spawn`:
 
@@ -16,9 +18,9 @@ Do it with `claude-spawn`:
 claude-spawn --prompt "the task for the new tab's Claude" --cwd /workspace --name short-name --model opus
 ```
 
-- `--prompt` is the task the new tab's Claude starts working on immediately (auto-submits).
+- `--prompt` is the task the new chat's Claude starts working on immediately.
 - `--cwd` defaults to `/workspace`; set it if the task belongs elsewhere.
-- `--name` is an optional short label for the tab.
+- `--name` is an optional short name for the spawned Claude (what peers see).
 - `--model` picks the spawned Claude's model: a CLI alias (`opus`, `sonnet`, `haiku`, `fable`) or a
   full id (`claude-fable-5-1`). Leave it out to keep the default. Pass it when the user names a
   model, or when the job is bulk/mechanical and a cheaper model will do.
@@ -30,6 +32,6 @@ No approval step Filip did not ask for: hook `spawn-brief-gate.py` refuses a bri
 asked to see something first, quote him on its own line: `Gate (Filip's words): "<his words>"`.
 The tab then stops there and his phone gets a push.
 
-It prints the new session id; tell the user the tab is open (it appears in their tab bar).
+It prints the spawn name; tell the user the chat is open (it appears in their chat list).
 Use this to parallelise work or hand a long job to its own tab instead of blocking the
 current session.

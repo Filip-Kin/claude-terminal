@@ -8,7 +8,7 @@
 import { dirname, join, resolve } from "path";
 import { homedir } from "os";
 import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync, mkdirSync, truncateSync } from "fs";
-import { readOrSeedAppSessions, startCwd } from "./app-sessions";
+import { readOrSeedAppSessions, startCwd, spawnName } from "./app-sessions";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
@@ -123,6 +123,33 @@ function loadAppSessions(ctx: AppCtx): Set<string> {
   });
   return appSessions;
 }
+// #region spawned chats — claude-spawn starts an ordinary /app chat (POST /sessions/spawn)
+// Until 2026-11-21 a spawn was a terminal tab in tmux. The chat page listed it and, on a typed
+// message, resumed its id in a second process. Now the server owns the only process from the start.
+// id -> spawn name, kept so a resume (restart-wake, a reopen) runs with CLAUDE_SPAWNED_TAB again.
+let spawned: Record<string, string> | null = null;
+const spawnedFile = (ctx: AppCtx) => join(dirname(ctx.mcpFile), "claude-app-spawned.json"); // beside the other claude-app-* state
+function loadSpawned(ctx: AppCtx): Record<string, string> {
+  if (spawned) return spawned;
+  spawned = {};
+  try { const o: unknown = JSON.parse(readFileSync(spawnedFile(ctx), "utf8")); if (o && typeof o === "object" && !Array.isArray(o)) spawned = o as Record<string, string>; }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") console.error("[app-spawned] read failed:", e); }
+  return spawned;
+}
+export function startSpawned(ctx: AppCtx, o: { prompt: string; cwd: string; name?: unknown; model?: string }): { id: string; name: string } {
+  loadAppSessions(ctx); // registers the hook that lists this chat
+  ensureModelChoices(ctx);
+  const name = spawnName(o.name);
+  const conv = getOrCreate(null, { cwd: o.cwd, model: o.model, spawnName: name, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile });
+  const m = loadSpawned(ctx);
+  m[conv.id] = name;
+  try { writeFileSync(spawnedFile(ctx), JSON.stringify(m)); } catch (e) { console.error("[app-spawned] write failed:", e); }
+  tlog("accept", { route: "spawn", conv: conv.id, name, chars: o.prompt.length, cwd: o.cwd });
+  void conv.run(o.prompt, undefined, false); // a brief is not a person typing: it renders as a notice
+  return { id: conv.id, name };
+}
+// #endregion
+
 function isChat(id: string, entry: string | null | undefined, ctx: AppCtx): boolean {
   return !entry || entry === "cli" || loadAppSessions(ctx).has(id);
 }
@@ -977,7 +1004,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
     if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.setClientTz(b.tz); existing.send(text, typeof b.cid === "string" ? b.cid : undefined, human); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
-    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile });
+    const conv = getOrCreate(resume || null, { cwd, model, resume, spawnName: resume ? loadSpawned(ctx)[resume] : undefined, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile });
     tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
     conv.setClientTz(b.tz);
     void conv.run(text, typeof b.cid === "string" ? b.cid : undefined, human);

@@ -16,7 +16,7 @@ import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
 import { classifyUserRow, noticeText, type RowState } from "./user-rows.ts";
 import { sessionHolders, heldMessage } from "./session-lock.ts";
-import { mergeStatus, type LiveStatus } from "./app-sessions.ts";
+import { mergeStatus, spawnQueryOpts, type LiveStatus } from "./app-sessions.ts";
 
 // Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
 // done/error/closed is a turn the runner swallowed; a done with the user still seeing nothing points at
@@ -424,6 +424,7 @@ export interface ConvOpts {
   notifier?: AskNotifier; // notify the owner about an unwatched ask_user prompt
   mcpFile?: string; // STATE_DIR/claude-app-mcp.json — persisted MCP servers to connect for this chat
   skills?: string[] | "all"; // which skills this chat may use (the SDK `skills` option); omit for CLI defaults
+  spawnName?: string; // set for a chat started by claude-spawn: its name and its CLAUDE_SPAWNED_TAB
 }
 
 // Metadata for a still-open ask_user prompt, so a reconnecting client can re-render it.
@@ -593,6 +594,7 @@ export class Conversation {
   private ctxMax = 0;    // context window for this model, fetched once after init
   lastActivity = Date.now();
   private resume?: string;
+  private spawnName?: string;
   private notifier?: AskNotifier;
   private mcpFile?: string;
   private skills?: string[] | "all";
@@ -646,6 +648,7 @@ export class Conversation {
     this.cwd = opts.cwd;
     this.model = opts.model;
     this.resume = opts.resume;
+    this.spawnName = opts.spawnName;
     this.notifier = opts.notifier;
     this.mcpFile = opts.mcpFile;
     this.skills = opts.skills;
@@ -1098,13 +1101,15 @@ export class Conversation {
     // in-process ask_user server. A missing/empty file just yields {}.
     let stored: Record<string, McpServerConfig> = {};
     if (this.mcpFile) { try { stored = await mcpServersForQuery(this.mcpFile); } catch {} }
+    const spawn = spawnQueryOpts(this.spawnName, !!this.resume);
     this.q = query({
       prompt: this.inputGen(first, cid, human),
       options: {
         cwd: this.cwd,
         // Replace Claude Code's bare "Continue from where you left off." with a prompt that says a
         // restart interrupted the turn and to pick the work back up (see RESUME_PROMPT).
-        env: { ...(process.env as Record<string, string>), CLAUDE_CODE_RESUME_PROMPT: RESUME_PROMPT },
+        env: { ...(process.env as Record<string, string>), CLAUDE_CODE_RESUME_PROMPT: RESUME_PROMPT, ...spawn.env },
+        ...(spawn.extraArgs ? { extraArgs: spawn.extraArgs } : {}),
         ...(this.model ? { model: this.model } : {}),
         ...(this.resume ? { resume: this.resume } : {}),
         // A brand-new chat runs under the id it was created with (a UUID made at /app/api/start), so

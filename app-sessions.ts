@@ -52,3 +52,22 @@ export type LiveStatus = { busy: boolean; waiting: boolean; terminal?: boolean; 
 export function mergeStatus(mine: { busy: boolean; waiting: boolean }, cli?: LiveStatus): LiveStatus {
   return { busy: mine.busy || !!cli?.busy, waiting: mine.waiting, terminal: !!cli?.terminal, app: mine.busy || mine.waiting };
 }
+
+// #region spawned chats (claude-spawn, POST /sessions/spawn)
+// A spawned chat's name: what peers see, what the parent's spawn card links by (spawned.ts), and
+// the value of CLAUDE_SPAWNED_TAB. Same charset as before; a missing name gets a generated one.
+export function spawnName(raw: unknown, now: Date = new Date(), rand: () => number = Math.random): string {
+  const clean = typeof raw === "string" ? raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) : "";
+  if (clean) return clean;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `spawn-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}-${Math.floor(rand() * 32768)}`;
+}
+
+// What a spawned chat's process gets on top of an ordinary chat's. CLAUDE_SPAWNED_TAB marks it as
+// ordered work nobody watches (hook spawned-ask-stop.py); it is set on every run, resumes included.
+// --name goes on the first run only: a resume reads the name back from the transcript.
+export function spawnQueryOpts(name: string | undefined, resuming: boolean): { env: Record<string, string>; extraArgs?: Record<string, string | null> } {
+  if (!name) return { env: {} };
+  return { env: { CLAUDE_SPAWNED_TAB: name }, ...(resuming ? {} : { extraArgs: { name } }) };
+}
+// #endregion

@@ -15,7 +15,7 @@ import { Database } from "bun:sqlite";
 import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
 import { Connections } from "./connections.ts";
-import { appRoutes, type AppCtx } from "./app-server.ts";
+import { appRoutes, startSpawned, type AppCtx } from "./app-server.ts";
 import { initSubscriptionResume } from "./subscription-resume.ts";
 import { installRestartWake } from "./restart-wake.ts";
 import { startStatusPush, type StatusPayload } from "./status-push.ts";
@@ -699,38 +699,11 @@ function cors(req: Request): Record<string, string> {
 }
 // #endregion
 
-// #region spawn a detached worker tab (POST /sessions/spawn)
-// Both the `claude-spawn` CLI and this endpoint go through the same helper script, so the
-// tricky bits (workspace-trust pre-seed, safe prompt quoting, PATH, tmux socket) live in
-// exactly one place. Guests own session creation via their in-container sidecar, so this
-// endpoint is how a guest's Claude spins off a task tab too.
-const SPAWN_HELPER: string =
-  cfg.spawnHelper ||
-  (existsSync(join(HOME, ".local/bin/claude-spawn")) ? join(HOME, ".local/bin/claude-spawn") : "/usr/local/bin/claude-spawn");
-// Default working dir when a spawn names none: an already-trusted root (the host's files
-// root, a guest's /workspace). Falls back to HOME.
+// #region spawn a detached worker (POST /sessions/spawn)
+// A spawn is an /app chat (app-server.ts startSpawned): one process, owned by this server, listed in
+// the chat page. `claude-spawn` is a thin client of this route. Default working dir when a spawn
+// names none: the host's files root or a guest's /workspace (cfg.spawnCwd). Falls back to HOME.
 const SPAWN_CWD: string = cfg.spawnCwd || HOME;
-
-async function spawnWorker(name: string | undefined, cwd: string, prompt: string, model?: string): Promise<{ id: string } | { error: string }> {
-  const args = [SPAWN_HELPER, "--cwd", cwd, "--prompt-file", "-"]; // prompt over stdin: no argv limit, no quoting
-  if (name) args.push("--name", name);
-  if (model) args.push("--model", model); // straight through to `claude --model`; omitted = the CLI's default
-  try {
-    const proc = Bun.spawn(args, {
-      env: { ...process.env, TMUX_TMPDIR: process.env.TMUX_TMPDIR || "/tmp" },
-      stdin: "pipe", stdout: "pipe", stderr: "pipe",
-    });
-    proc.stdin.write(prompt);
-    await proc.stdin.end();
-    const out = (await new Response(proc.stdout).text()).trim();
-    const err = (await new Response(proc.stderr).text()).trim();
-    const code = await proc.exited;
-    if (code !== 0 || !out) return { error: err || `claude-spawn exited ${code}` };
-    return { id: out.split("\n").pop()!.trim() };
-  } catch (e: any) {
-    return { error: `could not run ${SPAWN_HELPER}: ${e?.message || e}` };
-  }
-}
 // #endregion
 
 // External network connections (OpenVPN + Tailscale). Inert unless cfg.netApplyHelper
@@ -1131,9 +1104,7 @@ const server = Bun.serve({
       pending.set(id, Math.floor(Date.now() / 1000)); // show it immediately
       return Response.json({ id }, { headers: cors(req) });
     }
-    // Spin off a NEW detached tab running a fresh Claude on a task. The session is
-    // created immediately (unlike /sessions/new, which defers creation to when the tab
-    // is opened); pending still registers it so the chip shows without a /sessions poll.
+    // Spin off a NEW chat running a fresh Claude on a task. It is an /app chat, not a terminal tab.
     if (req.method === "POST" && path === "/sessions/spawn") {
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });
       let body: any = {}; try { body = await req.json(); } catch {}
@@ -1143,10 +1114,10 @@ const server = Bun.serve({
       const name = body.name ? String(body.name).replace(/[^A-Za-z0-9_-]/g, "") : undefined;
       // Model alias or full id (opus, fable, claude-fable-5-1). Same charset the CLI accepts.
       const model = body.model ? String(body.model).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 64) : undefined;
-      const res = await spawnWorker(name || undefined, cwd, prompt, model || undefined);
-      if ("error" in res) return new Response(res.error, { status: 500 });
-      pending.set(res.id, Math.floor(Date.now() / 1000)); // show the tab instantly
-      return Response.json({ id: res.id }, { headers: cors(req) });
+      if (!existsSync(cwd) || !statSync(cwd).isDirectory()) return new Response(`cwd is not a directory: ${cwd}`, { status: 400 });
+      const res = startSpawned(appCtx, { prompt, cwd, name, model: model || undefined });
+      // id = the spawn name (what claude-spawn prints and the parent's spawn card links by).
+      return Response.json({ id: res.name, sessionId: res.id }, { headers: cors(req) });
     }
     if (req.method === "POST" && path === "/sessions/close") {
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });

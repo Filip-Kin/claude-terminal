@@ -15,10 +15,10 @@ A companion for running [Claude Code](https://claude.com/claude-code) in the bro
    window. A bell in the tab bar turns on Web Push (VAPID, no third-party service), and you get a
    notification when a prompt finishes or is waiting for your input — even when the app is closed.
    The same push channel is a generic notification path any of your own tools can post to.
-4. **Spawnable task tabs.** From inside one session you can spin off a NEW tab that runs a fresh
-   Claude on a task, detached. It starts working on its own; open the tab whenever you want to
-   watch it. There's a `claude-spawn` CLI and a `POST /sessions/spawn` endpoint (see below), so a
-   Claude session can hand work to a sibling mid-conversation.
+4. **Spawnable task chats.** From inside one session you can spin off a NEW chat that runs a fresh
+   Claude on a task, detached. It starts working on its own; open it in the chat page whenever you
+   want to read it or talk to it. There's a `claude-spawn` CLI and a `POST /sessions/spawn`
+   endpoint (see below), so a Claude session can hand work to a sibling mid-conversation.
 
 It is config-driven: a single-person install is a few lines of JSON. You can also track extra
 "users" (separate agents, bots, or sandboxed guests) so their usage shows as its own row.
@@ -78,8 +78,7 @@ Minimal `config.json`:
 | `themeColor` / `bgColor` | PWA theme + background colors |
 | `vapidSubject` | `mailto:` contact for the VAPID keypair (push identification) |
 | `stateDir` | where the VAPID keypair + push subscriptions are stored (default `~/.claude`) |
-| `spawnCwd` | default working dir for a spawned task tab when the request names none (default `$HOME`; set it to an already-trusted root like a files root or `/workspace`) |
-| `spawnHelper` | path to the `claude-spawn` script the spawn endpoint shells out to (default: `~/.local/bin/claude-spawn`, else `/usr/local/bin/claude-spawn`) |
+| `spawnCwd` | default working dir for a spawned task chat when the request names none (default `$HOME`) |
 
 VAPID keys are generated on first run into `stateDir/claude-terminal-vapid.json` (keep this — regenerating orphans every subscribed device). Push subscriptions live in `stateDir/claude-terminal-push.json`. Neither belongs in the repo.
 
@@ -146,52 +145,31 @@ Endpoints (all under the terminal prefix; owner-gated except where noted): `GET 
 `GET /sw.js`, `GET /pwa/<icon>`, `GET /vapidPublicKey`, `POST /subscribe`, `POST /unsubscribe`,
 `POST /active`, `POST /notify` (owner **or** loopback), `POST /notify/session` (owner or loopback).
 
-## Spawning a task into a new tab
+## Spawning a task into a new chat
 
-You can spin off a NEW tab that runs a fresh, detached Claude on a task. The tab appears in the
-tab bar; open it any time to watch, and it keeps working whether or not anyone is looking. Because
-each tab is just a tmux session and the ttyd wrapper attaches with `new-session -A`, opening the
-tab attaches to the already-running session, it never restarts the work.
-
-There are two ways in, both backed by the same `bin/claude-spawn` script (install it to
-`~/.local/bin/claude-spawn`):
+You can spin off a NEW chat that runs a fresh, detached Claude on a task. It is an ordinary chat in
+the chat page (`/app`): the server starts its one process, so you can read it and type into it
+there. A spawn is not a terminal tab. (It was one until 2026-11-21; the chat page then resumed the
+tab's session in a second process when a message was typed for it.)
 
 ```bash
-# CLI: from your own shell, or from inside a Claude session via its Bash tool
+# CLI: from your own shell, or from inside a Claude session via its Bash tool.
+# Install bin/claude-spawn to ~/.local/bin/claude-spawn. It is a thin client of the route below.
 claude-spawn --prompt "port the auth module to the new API and run the tests"
 claude-spawn --name deploy --cwd /srv/app --prompt-file ./task.md
 ```
 
 ```bash
-# HTTP: owner-gated, same as the other terminal endpoints. This is what lets it work
-# inside guest containers, where the in-container sidecar owns session creation.
+# HTTP: owner-gated, same as the other endpoints.
 curl -s -X POST http://127.0.0.1:7682/sessions/spawn \
-  -H 'content-type: application/json' \
+  -H 'content-type: application/json' -H 'Remote-User: me' \
   -d '{"prompt":"run the full test suite and fix any failures","name":"tests","cwd":"/srv/app"}'
-# -> {"id":"tests"}   (the tab id; open /?arg=tests to watch it)
+# -> {"id":"tests","sessionId":"<uuid>"}   (open /app?c=<uuid>)
 ```
 
-`name` and `cwd` are optional (`name` defaults to a generated `spawn-<time>-<rand>` id; `cwd`
-defaults to `spawnCwd`, else `$HOME`). The reply's `id` is registered as a pending tab so the chip
-shows instantly.
-
-Two things the script handles that make this reliable:
-
-- **It auto-submits.** `claude "<prompt>"` in an interactive pty submits the prompt on its own
-  (it doesn't just pre-fill the input box), so the spawned session starts working with no
-  keystroke injection.
-- **It pre-seeds workspace trust.** The trust dialog is not skipped in interactive mode, so a cwd
-  with no trusted ancestor would otherwise block forever on "Is this a project you trust?". The
-  script seeds `hasTrustDialogAccepted` for the cwd in `~/.claude.json` before launching (a no-op
-  when the cwd or an ancestor is already trusted). The spawned Claude runs with
-  `--dangerously-skip-permissions`, so pre-trusting the cwd is consistent with that autonomy.
-
-The prompt is passed to tmux as a single literal argv element (tmux execs a multi-arg command
-directly, no shell), so there's no quoting hazard even for long multi-line prompts, and the pane
-command is `/bin/bash -c '…'` (naming the interpreter explicitly) so it works under a `nologin`
-runtime user too. PATH is prepended with `~/.local/bin` inside that wrapper so the spawned Claude
-finds its own tools, and `claude` is resolved via PATH so the same script works on a host and
-inside a container. The tmux socket follows `TMUX_TMPDIR` (default `/tmp`, matching the sidecar).
+`name`, `cwd` and `model` are optional (`name` defaults to a generated `spawn-<time>-<rand>` id;
+`cwd` defaults to `spawnCwd`, else `$HOME`). The spawned process runs with `--name <name>` and
+`CLAUDE_SPAWNED_TAB=<name>` in its environment, also after a resume.
 
 ## Chat app (`/app`)
 
