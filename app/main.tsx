@@ -1921,30 +1921,33 @@ function App() {
   }, []);
   const flushCompactRef = useRef<(target?: ConvStore) => void>(() => {}); // assigned once the stores/hooks are wired
 
-  // PWA update check: poll the server build id; if it changed since load, offer a reload.
-  // Content-hashed assets + no-store index mean the reload gets everything fresh.
+  // PWA auto-update: the page always runs the current build. The baseline is the build this page
+  // actually runs (the hash in its own main-<hash>.js tag), not the first poll: the service worker
+  // serves a cached shell first, so a page can start on an old build while the server is already
+  // on a new one. A first poll as baseline hid exactly that case (2026-11-22: a Firefox tab ran the
+  // 11-11 build for hours and its turns lost the human mark). Any mismatch reloads at once, unless
+  // there is an unsent draft; then the toast shows and the next check reloads once the box is empty.
   useEffect(() => {
-    let baseline: string | null = null;
+    const own = document.querySelector<HTMLScriptElement>('script[src*="/app/assets/main-"]')?.src.match(/main-([A-Za-z0-9]+)\.js/)?.[1] ?? null;
+    let baseline: string | null = own;
     let stop = false;
-    const check = async (foreground = false) => {
+    const check = async () => {
       try {
         const v = (await (await fetch("/app/api/version", { cache: "no-store" })).text()).trim();
-        if (!v) return;
+        if (!v || v === "dev") return;
         if (baseline === null) { baseline = v; return; }
         if (v !== baseline) {
-          // Cache the NEW build's shell + assets NOW (before the reload) so the post-update launch is
-          // offline-safe too, not just the build we loaded with.
+          console.info("[update] build", baseline, "->", v);
+          if (!(taRef.current?.value || "").trim()) { void hardRefresh(); return; }
+          // Cache the NEW build's shell + assets now, so the reload after the draft is sent is offline-safe.
           try { navigator.serviceWorker?.ready.then((reg) => (reg.active || navigator.serviceWorker.controller)?.postMessage({ type: "ct-precache" })).catch(() => {}); } catch { /* */ }
-          // On returning to the foreground (app was backgrounded/asleep), auto-update immediately —
-          // unless there's an unsent draft, in which case just offer the reload toast.
-          if (foreground && !(taRef.current?.value || "").trim()) { void hardRefresh(); return; }
           setUpdateAvail(true);
         }
       } catch { /* offline / transient — ignore */ }
     };
     check();
     const iv = setInterval(() => { if (!stop) check(); }, 60_000);
-    const onVis = () => { if (document.visibilityState === "visible") void check(true); }; // check the moment it's reopened
+    const onVis = () => { if (document.visibilityState === "visible") void check(); }; // check the moment it's reopened
     document.addEventListener("visibilitychange", onVis);
     return () => { stop = true; clearInterval(iv); document.removeEventListener("visibilitychange", onVis); };
   }, []);
