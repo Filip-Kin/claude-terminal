@@ -3022,6 +3022,10 @@ function App() {
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.6" /><path d="M8 10l2.5 2L8 14M12.5 14H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
             Terminal
           </a>
+          <a className="term-link" href="/_phone/">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M6.5 3.5h3l1.5 4-2 1.500a11 11 0 0 0 6 6l1.5-2 4 1.500v3a2 2 0 0 1-2.200 2A16 16 0 0 1 4.500 5.700a2 2 0 0 1 2-2.200z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" /></svg>
+            Phone
+          </a>
         </div>
       </aside>
 
