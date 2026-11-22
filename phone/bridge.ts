@@ -8,9 +8,11 @@ import {
   admit, gather, HANGUP, isGoodbye, LINES, loadConfig, pause, play, redirect, say, signatureOk, spoken,
   startStream, twiml, voiceVerdict, type PhoneConfig, type PhoneUser, type VoiceCheck,
 } from "./lib";
+import { startSetup } from "./setup";
 
 const STATE = process.env.PHONE_STATE || "/var/lib/claude-phone";
-const cfg: PhoneConfig = loadConfig(join(STATE, "config.json"));
+let cfg: PhoneConfig = loadConfig(join(STATE, "config.json"));
+const reloadCfg = () => { cfg = loadConfig(join(STATE, "config.json")); }; // users change from the setup page
 const SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const AUDIO_DIR = join(STATE, "audio");
@@ -199,6 +201,7 @@ async function route(path: string, q: URLSearchParams, p: Params): Promise<strin
   }
 
   if (path === "/twilio/voice") {
+    reloadCfg();
     const from = p.From || "", stir = p.StirVerstat || "-";
     const a = admit(cfg, from, stir);
     log("incoming", from, "stir", stir, a.ok ? a.user.name : a.why);
@@ -326,6 +329,11 @@ if (import.meta.main) {
         }
       },
     },
+  });
+  startSetup({
+    state: STATE, port: cfg.port + 1, owner: process.env.PHONE_OWNER || "filip",
+    guestsTsv: process.env.GUESTS_TSV || "/home/filip/guest-claude/guests.tsv",
+    origin: process.env.PHONE_SETUP_ORIGIN || "https://claude.filipkin.com", cfg: () => cfg, reload: reloadCfg,
   });
   log(`listening on 127.0.0.1:${cfg.port}`, `users: ${cfg.users.map((u) => u.name).join(", ") || "none"}`);
 }

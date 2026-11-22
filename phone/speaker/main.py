@@ -138,6 +138,24 @@ def users():
     return out
 
 
+class Who(BaseModel):
+    user: str
+
+
+@app.post("/forget")
+def forget(w: Who):
+    """Remove a user's voiceprints and kept call audio."""
+    if not USER_OK.match(w.user):
+        return {"ok": False}
+    (PRINTS / f"{w.user}.json").unlink(missing_ok=True)
+    d = CALLS / w.user
+    if d.exists():
+        for f in d.iterdir():
+            f.unlink()
+        d.rmdir()
+    return {"ok": True}
+
+
 @app.post("/enroll")
 def enroll(c: Clip):
     if not USER_OK.match(c.user) or not USER_OK.match(c.label):

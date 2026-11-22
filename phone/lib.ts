@@ -1,7 +1,7 @@
 // Phone bridge, pure parts: config, Twilio signature, TwiML, caller routing, spoken text.
 // Ported from Brandon McDonald's deploy/phone/bridge.py (brandmcd/claude-terminal 178451b).
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 //#region config
 export type PhoneUser = {
@@ -48,6 +48,33 @@ export const DEFAULTS: PhoneConfig = {
 export function loadConfig(path: string): PhoneConfig {
   const file = existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as Partial<PhoneConfig>) : {};
   return { ...DEFAULTS, ...file };
+}
+
+/** Rewrite one key of config.json, keeping the rest. Atomic, so a reader never sees half a file. */
+export function saveConfigKey<K extends keyof PhoneConfig>(path: string, key: K, value: PhoneConfig[K]): void {
+  const file = existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as Partial<PhoneConfig>) : {};
+  writeFileSync(path + ".tmp", JSON.stringify({ ...file, [key]: value }, null, 2) + "\n");
+  renameSync(path + ".tmp", path);
+}
+
+/** The owner's sidecar is 7682; a guest's is its ttyd port + 100 (add-guest.sh). null = not a user. */
+export function sidecarFor(user: string, owner: string, guestsTsv: string): string | null {
+  if (user === owner) return "http://127.0.0.1:7682";
+  if (!existsSync(guestsTsv)) return null;
+  const row = readFileSync(guestsTsv, "utf8").split("\n").map((l) => l.trim().split(/\s+/)).find((r) => r[0] === user);
+  const port = row ? Number(row[1]) : NaN;
+  return Number.isInteger(port) ? `http://127.0.0.1:${port + 100}` : null;
+}
+
+export type LinkResult = { ok: true; users: PhoneUser[] } | { ok: false; why: "not-a-number" | "in-use" | "own-number" };
+
+/** One number per user, one user per number. Linking replaces the user's earlier number. */
+export function linkNumber(cfg: PhoneConfig, user: string, sidecar: string, raw: string): LinkResult {
+  const n = e164(raw);
+  if (!n) return { ok: false, why: "not-a-number" };
+  if (n === e164(cfg.from)) return { ok: false, why: "own-number" };
+  if (cfg.users.some((u) => u.name !== user && u.numbers.some((x) => e164(x) === n))) return { ok: false, why: "in-use" };
+  return { ok: true, users: [...cfg.users.filter((u) => u.name !== user), { name: user, numbers: [n], sidecar }] };
 }
 //#endregion
 

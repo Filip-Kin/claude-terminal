@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { admit, DEFAULTS, e164, gather, isGoodbye, signatureOk, spoken, startStream, twilioSignature, userForCaller, voiceVerdict, type PhoneConfig } from "./lib";
+import { admit, DEFAULTS, e164, gather, isGoodbye, linkNumber, sidecarFor, signatureOk, spoken, startStream, twilioSignature, userForCaller, voiceVerdict, type PhoneConfig } from "./lib";
 
 const cfg: PhoneConfig = {
   ...DEFAULTS, from: "+15550001111",
@@ -84,5 +84,29 @@ describe("spoken text", () => {
   test("goodbye words end the call", () => {
     expect(isGoodbye("No thanks.")).toBe(true);
     expect(isGoodbye("no, check the garage")).toBe(false);
+  });
+});
+
+describe("self-setup", () => {
+  test("a user links one number and it replaces their earlier one", () => {
+    const r = linkNumber(cfg, "ian", "http://127.0.0.1:7783", "(313) 555-0142");
+    expect(r.ok && r.users.find((u) => u.name === "ian")?.numbers).toEqual(["+13135550142"]);
+    expect(r.ok && r.users.length).toBe(2);
+  });
+  // The guard: a guest must never route another user's number (or the owner's) to their own chat.
+  test("a number that belongs to someone else is refused", () => {
+    expect(linkNumber(cfg, "ian", "http://127.0.0.1:7783", "+1 248 555 0100")).toEqual({ ok: false, why: "in-use" });
+    expect(linkNumber(cfg, "zach", "http://127.0.0.1:7787", "3135550199")).toEqual({ ok: false, why: "in-use" });
+  });
+  test("the Claude line itself and junk are refused", () => {
+    expect(linkNumber(cfg, "ian", "x", "+15550001111")).toEqual({ ok: false, why: "own-number" });
+    expect(linkNumber(cfg, "ian", "x", "hello")).toEqual({ ok: false, why: "not-a-number" });
+  });
+  test("sidecar lookup: owner, guest by tsv port + 100, unknown user", async () => {
+    const tsv = "/tmp/phone-test-guests.tsv";
+    await Bun.write(tsv, "ian\t7683\nmichel\t7685\n");
+    expect(sidecarFor("filip", "filip", tsv)).toBe("http://127.0.0.1:7682");
+    expect(sidecarFor("michel", "filip", tsv)).toBe("http://127.0.0.1:7785");
+    expect(sidecarFor("mallory", "filip", tsv)).toBeNull();
   });
 });

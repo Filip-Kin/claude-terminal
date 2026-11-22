@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f5f2; --panel: #fff; --ink: #1c1b19; --mute: #6b6861; --line: #dedbd3; --accent: #b4552d; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #171614; --panel: #201f1c; --ink: #ecebe6; --mute: #9b978e; --line: #34322d; --accent: #e08a5f; --bad: #f2b8b5; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.4 system-ui, sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 20px 16px 40px; display: grid; gap: 14px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; }
+  h1 { font-size: 22px; margin: 0; }
+  header a { color: var(--mute); font-size: 14px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; display: grid; gap: 10px; }
+  h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--mute); text-transform: uppercase; letter-spacing: .04em; }
+  .big { font-size: 24px; font-weight: 600; color: var(--accent); text-decoration: none; font-variant-numeric: tabular-nums; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row > .grow { flex: 1 1 160px; min-width: 0; }
+  input, select, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); min-height: 44px; }
+  input { width: 100%; }
+  button { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+  button.plain { background: transparent; color: var(--bad); border-color: var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  li { display: flex; justify-content: space-between; }
+  li span:last-child, .mute { color: var(--mute); }
+  .status { font-weight: 600; }
+  .error { color: var(--bad); min-height: 1.4em; margin: 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>Phone</h1><a href="/app">Chat</a></header>
+  <p id="loading" class="mute">Loading</p>
+  <p id="error" class="error" role="alert" hidden></p>
+
+  <section id="line" hidden>
+    <h2>Claude line</h2>
+    <a id="claude" class="big" href="#"></a>
+  </section>
+
+  <section id="num" hidden>
+    <h2>Phone number</h2>
+    <div id="num-set" class="row" hidden>
+      <span id="number" class="grow status"></span>
+      <button id="remove" class="plain" type="button">Remove</button>
+    </div>
+    <form id="num-form" class="row" hidden>
+      <label class="grow"><input id="number-input" type="tel" inputmode="tel" autocomplete="tel" aria-label="Phone number" required></label>
+      <button type="submit">Save</button>
+    </form>
+  </section>
+
+  <section id="voice" hidden>
+    <h2>Voiceprint</h2>
+    <ul id="prints"></ul>
+    <p id="open" class="status" hidden></p>
+    <form id="enroll-form" class="row">
+      <label class="grow"><select id="label" aria-label="Device"></select></label>
+      <button type="submit">Open enrolment call</button>
+    </form>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const pretty = (n) => { const m = /^\+1(\d{3})(\d{3})(\d{4})$/.exec(n || ""); return m ? `+1 ${m[1]} ${m[2]} ${m[3]}` : n || ""; };
+const cap = (s) => s[0].toUpperCase() + s.slice(1);
+let timer = null;
+
+function show(me) {
+  $("loading").hidden = true;
+  $("line").hidden = $("num").hidden = false;
+  $("claude").textContent = pretty(me.claudeNumber); $("claude").href = "tel:" + me.claudeNumber;
+  $("num-set").hidden = !me.number; $("num-form").hidden = !!me.number;
+  $("number").textContent = pretty(me.number);
+  $("voice").hidden = !me.number;
+  const rows = Object.entries(me.voiceprint);
+  $("prints").innerHTML = "";
+  for (const [label, n] of rows.length ? rows : [["No voiceprint", ""]]) {
+    const li = document.createElement("li"), a = document.createElement("span"), b = document.createElement("span");
+    a.textContent = rows.length ? cap(label) : label; b.textContent = rows.length ? `${n} ${n === 1 ? "sample" : "samples"}` : "";
+    li.append(a, b); $("prints").append(li);
+  }
+  if (!$("label").options.length) for (const l of me.labels) $("label").add(new Option(cap(l), l));
+  const e = me.enrolment;
+  $("open").hidden = !e;
+  if (e) $("open").textContent = `${cap(e.label)} enrolment call open until ${new Date(e.until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+  clearTimeout(timer);
+  if (e) timer = setTimeout(load, 5000); // the sample count changes while the call runs
+}
+
+async function call(path, body) {
+  $("error").hidden = true;
+  try {
+    const r = await fetch("/_phone/api/" + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Request failed: " + r.status);
+    show(j);
+  } catch (err) {
+    console.error("[phone]", path, err);
+    $("loading").hidden = true; $("error").hidden = false; $("error").textContent = err.message;
+  }
+}
+const load = () => call("me");
+$("num-form").addEventListener("submit", (e) => { e.preventDefault(); call("number", { number: $("number-input").value }); });
+$("remove").addEventListener("click", () => call("remove", {}));
+$("enroll-form").addEventListener("submit", (e) => { e.preventDefault(); call("enroll", { label: $("label").value }); });
+load();
+</script>
+</body>
+</html>
