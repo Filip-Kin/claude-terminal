@@ -345,10 +345,12 @@ export async function getSupportedModels(): Promise<AppModel[]> {
 // rendering (it otherwise defaults to terminal-style plain text). The UI renders these inline.
 const APP_UI_SYSTEM_APPEND = [
   "You are replying inside a rich chat UI (not a terminal), so use its rendering:",
-  "- Images/plots/screenshots you create render inline. Reference a file you wrote under the working",
-  "  directory with markdown, e.g. ![chart](chart.png), and it shows in the chat. Prefer this over",
-  "  describing an image or dumping base64.",
-  "- Any file you save under the working directory is served for download automatically. To hand the",
+  "- Images/plots/screenshots render inline. Reference the file with markdown, e.g. ![chart](chart.png)",
+  "  or ![x](/abs/path/x.jpg), and it shows in the chat. Prefer this over describing an image or",
+  "  dumping base64. A relative path resolves from the working directory. An absolute path works for",
+  "  any file the chat page can read: anywhere on the box in the owner's chats, only the working",
+  "  directory in a guest chat. A path with spaces needs %20 or <angle brackets>.",
+  "- Any file you save is served for download automatically. To hand the",
   "  user a file of ANY type (CSV, PDF, zip, image, SVG, ...), just link its path in markdown, e.g.",
   "  [results.csv](out/results.csv) or [wiring.svg](wiring.svg); it renders as a download card. The",
   "  link to the saved path IS the download: do not git-commit the file, upload it anywhere, convert",
