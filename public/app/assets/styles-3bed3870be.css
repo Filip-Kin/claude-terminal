@@ -146,9 +146,9 @@ a { color: var(--accent-2); }
 .conv-item.pending { opacity: .85; }
 .conv-item.pending .conv-ic { color: var(--warning, #F59E0B); }
 .conv-pending-tag { flex: 0 0 auto; font-size: 10px; font-weight: 600; letter-spacing: .04em; color: var(--warning, #F59E0B); border: 1px solid var(--warning, #F59E0B); border-radius: 5px; padding: 1px 5px; opacity: .85; }
-.sb-foot { padding: 10px 12px; border-top: 1px solid var(--line-2); }
+.sb-foot { padding: 10px 12px; border-top: 1px solid var(--line-2); display: flex; gap: 8px; }
 .term-link {
-  display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%;
+  display: flex; align-items: center; justify-content: center; gap: 8px; flex: 1 1 0; min-width: 0;
   padding: 9px; background: transparent; color: var(--text-2); border: 1px solid var(--line);
   border-radius: 10px; font-size: 13px; text-decoration: none; transition: background .15s, color .15s;
 }
