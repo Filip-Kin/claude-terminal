@@ -1,0 +1,12 @@
+[project]
+name = "claude-speaker"
+version = "0.1.0"
+description = "Voiceprint check for the claude-terminal phone bridge (sherpa-onnx, TitaNet)."
+requires-python = ">=3.10"
+dependencies = [
+    "sherpa-onnx",
+    "numpy",
+    "scipy",
+    "fastapi",
+    "uvicorn",
+]

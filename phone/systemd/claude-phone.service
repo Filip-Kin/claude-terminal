@@ -1,0 +1,17 @@
+[Unit]
+Description=claude-terminal phone bridge (Twilio call -> the caller's /app chat)
+After=network-online.target claude-speaker.service
+Wants=network-online.target claude-speaker.service
+
+[Service]
+Type=simple
+User=filip
+WorkingDirectory=/media/nas/filip/ncdata/filip/files/Projects/claude-terminal
+Environment=PHONE_STATE=/var/lib/claude-phone
+# Twilio keys come from the secrets store at start; nothing on disk.
+ExecStart=/usr/local/bin/secret run twilio/account-sid=TWILIO_ACCOUNT_SID twilio/auth-token=TWILIO_AUTH_TOKEN -- /usr/local/bin/bun run phone/bridge.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
