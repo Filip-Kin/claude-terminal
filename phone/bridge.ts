@@ -296,6 +296,7 @@ if (import.meta.main) {
     async fetch(req, server) {
       const url = new URL(req.url);
       if (url.pathname === "/twilio/media") return server.upgrade(req, { data: { call: null } }) ? undefined : new Response("upgrade required", { status: 426 });
+      if (req.method === "GET" && url.pathname === "/health") reloadCfg();
       if (req.method === "GET" && url.pathname === "/health") return Response.json({ ok: true, calls: calls.size, users: cfg.users.map((u) => u.name) });
       if (req.method === "GET" && url.pathname.startsWith("/twilio/audio/")) {
         const name = url.pathname.slice("/twilio/audio/".length).replace(/\.wav$/, "");
