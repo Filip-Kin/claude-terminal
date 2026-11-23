@@ -969,10 +969,19 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const sinceRaw = new URL(req.url).searchParams.get("since");
     const since = sinceRaw == null ? -1 : parseInt(sinceRaw, 10);
     const delta = Number.isInteger(since) && since >= 0 && since <= events.length;
+    // A full snapshot of a running turn also carries its half-written blocks (read after the
+    // transcript, in the same tick as `seq`), so the client's items and stream cursor agree. A block
+    // the transcript already holds word for word is skipped. Not added to a delta: those must stay
+    // pure transcript events. `partial` tells the client its cursor is not a transcript cursor.
+    let partial: AppEvent[] = [];
+    if (!delta && live?.busy) {
+      const done = new Set(events.filter((e) => e.t === "text" || e.t === "thinking").slice(-20).map((e) => (e as { text: string }).text));
+      partial = live.openBlocks().filter((e) => !done.has((e as { text: string }).text));
+    }
     return jsonRes({
       sessionId: id, cwd: meta.cwd, title: meta.aiTitle || meta.title || meta.first,
-      events: delta ? events.slice(since) : events,
-      delta, evTotal: events.length,
+      events: delta ? events.slice(since) : partial.length ? [...events, ...partial] : events,
+      delta, evTotal: events.length, partial: partial.length > 0,
       live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [],
       epoch: live?.epoch ?? null, seq: live?.seq ?? -1, phase: live?.phase ?? "idle", model: live?.model ?? chosen ?? null,
     }, ctx, req);

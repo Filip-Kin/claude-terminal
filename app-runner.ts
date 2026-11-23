@@ -596,6 +596,12 @@ export class Conversation {
   }
   get seq(): number { return this.seqCounter - 1; } // highest _seq handed out so far (-1 = none)
   private curMsgId = ""; // id of the assistant message being streamed: block ids are <msg>:<index>
+  // Text and thinking blocks streamed so far that the transcript does not hold yet. A block reaches
+  // the transcript only once the SDK hands back its finished message, so a chat reopened mid-reply
+  // got a transcript without the half-written block and a stream cursor past its first tokens: the
+  // rest of the reply arrived as a new bubble with no opening fence and showed as raw text
+  // (2026-11-23, voiceprint chat). /app/api/conversation adds these to its snapshot (openBlocks).
+  private open = new Map<string, { kind: "text" | "thinking"; text: string; closed: boolean }>();
   private ctxMax = 0;    // context window for this model, fetched once after init
   lastActivity = Date.now();
   private resume?: string;
@@ -723,8 +729,20 @@ export class Conversation {
   // (server-assigned) askId so its answer actually unblocks the tool.
   listPendingAsks(): PendingAsk[] { return [...this.pendingAskMeta.values()]; }
 
+  // Half-written blocks of the running turn, as the events a finished transcript would hold.
+  openBlocks(): AppEvent[] {
+    const out: AppEvent[] = [];
+    for (const [bid, b] of this.open) if (b.text) out.push(b.kind === "text" ? { t: "text", text: b.text, bid } : { t: "thinking", text: b.text, bid });
+    return out;
+  }
+
   private emit(e: AppEvent) {
     (e as any)._seq = this.seqCounter++;
+    if ((e.t === "text_delta" || e.t === "thinking_delta") && e.bid) {
+      const kind = e.t === "text_delta" ? "text" : "thinking";
+      const b = this.open.get(e.bid);
+      if (b) b.text += e.text; else this.open.set(e.bid, { kind, text: e.text, closed: false });
+    } else if (e.t === "block_end") { const b = this.open.get(e.bid); if (b) b.closed = true; }
     this.lastActivity = Date.now(); // any output counts as activity: a long turn with no attached
     // client must not look idle to the sweeper (it only used to be bumped on send()).
     this.log.push(e);
@@ -1358,6 +1376,8 @@ export class Conversation {
           const used = u ? (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0) : 0;
           if (used > 0) this.emit({ t: "context", used, ...(this.ctxMax ? { max: this.ctxMax } : {}) });
         }
+        // The finished message is in the transcript now: its closed blocks are no longer open.
+        if (!anyM.parent_tool_use_id) for (const [bid, b] of this.open) if (b.closed) this.open.delete(bid);
         // text + thinking are streamed above via stream_event; from the aggregated
         // message we only need tool_use (its input is complete here).
         const blocks = (anyM.message?.content as any[]) || [];
@@ -1421,6 +1441,7 @@ export class Conversation {
         const usage: TurnUsage = { input, output, thinking, cacheCreate, cacheRead, context, total: context + output, costUsd: anyM.total_cost_usd || 0, durationMs: anyM.duration_ms || 0 };
         this.lastUsage = usage;
         this.emit({ t: "result", subtype: anyM.subtype, sessionId: anyM.session_id || this.id, costUsd: usage.costUsd, usage });
+        this.open.clear(); // the turn is over: every block is in the transcript
         if (context > 0) this.emit({ t: "context", used: context, ...(this.ctxMax ? { max: this.ctxMax } : {}) });
         break;
       }

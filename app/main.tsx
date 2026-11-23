@@ -721,9 +721,11 @@ class ConvStore {
   }
   // Server transcript is truth for committed history. We keep our own tail when it's AHEAD of the
   // server (live tokens, or a just-sent turn not yet in the transcript) so nothing flickers away.
-  reconcile(items: Item[], meta: { busy: boolean; cwd: string | null; evCount?: number; epoch?: string | null; seq?: number }) {
+  reconcile(items: Item[], meta: { busy: boolean; cwd: string | null; evCount?: number; epoch?: string | null; seq?: number; partial?: boolean }) {
     this.cwd = meta.cwd; this.hydrated = true;
-    if (meta.evCount != null) { this.evCount = meta.evCount; this.evDirty = false; }
+    // `partial`: the snapshot also holds the running turn's half-written blocks, which are not
+    // transcript events, so the cursor cannot serve a later delta fetch.
+    if (meta.evCount != null) { this.evCount = meta.evCount; this.evDirty = !!meta.partial; }
     // Expire orphaned optimistic echoes BEFORE computing localAhead below. The server emits the user
     // echo within a second of accepting a turn, so one this old is never arriving (dead turn, backend
     // restart). Left in place it pins localAhead true forever, and the client then discards the server
@@ -2246,7 +2248,7 @@ function App() {
         for (let i = serverItems.length - 1; i >= 0; i--) if (serverItems[i].kind === "ask" && (serverItems[i] as any).answered === undefined) serverItems.splice(i, 1);
         for (const a of d.pendingAsks) serverItems.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
       }
-      s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd, evCount: d.evTotal, epoch: d.epoch, seq: d.seq });
+      s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd, evCount: d.evTotal, epoch: d.epoch, seq: d.seq, partial: !!d.partial });
       if (d.live) s.connect(true); // stream follow-up events; connect() is a no-op if already connected
     } catch {
       if (!s.items.length && activeStoreRef.current === s) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]);
@@ -2262,12 +2264,15 @@ function App() {
     let last = 0;
     // Focus coming back from one of our own iframes (the artifact preview) is not a return to the
     // app. Reloading the thread on it replaced the cards between mousedown and click, so a second
-    // artifact would not open and the card hover flickered.
-    let inFrame = false;
-    const onBlur = () => { setTimeout(() => { inFrame = document.activeElement?.tagName === "IFRAME"; }, 0); };
+    // artifact would not open and the card hover flickered. A window focus counts only after a blur
+    // that really left the page: document.hasFocus() stays true while focus is inside our iframe.
+    // (Firefox fires no window blur at all when focus enters the iframe, only the focus on the way
+    // back, so the old "was the iframe active at blur" check never armed there.)
+    let away = false;
+    const onBlur = () => { setTimeout(() => { away = !document.hasFocus(); }, 0); };
     const resync = (ev?: Event) => {
-      if (ev?.type === "focus" && inFrame) { inFrame = false; return; }
-      inFrame = false;
+      if (ev?.type === "focus" && !away) return;
+      away = false;
       if (document.visibilityState !== "visible" || !navigator.onLine) return;
       const now = Date.now();
       if (now - last < 3000) return; // visibilitychange and focus fire together
