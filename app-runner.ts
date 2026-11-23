@@ -288,8 +288,11 @@ export async function cleanDictation(raw: string, timeoutMs = 15000): Promise<st
 // When a turn comes from hands-free voice mode, we append a hidden instruction so Claude keeps the
 // reply short and TTS-friendly (it's read aloud to someone driving). It's wrapped in a sentinel tag
 // so replay strips it from the visible transcript; the live UI already renders the user's own words.
-const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; your reply will be read aloud by text-to-speech. Keep it brief and conversational: lead with the answer in one or two spoken sentences. Do not use markdown, bullet or numbered lists, tables, code blocks, headings, or URLs unless explicitly asked. Write times and numbers as words a voice would say (for example 'five thirty PM', not '5:30 PM'). Only expand if the user asks for detail.";
-export function decorateVoiceTurn(text: string): string { return `${text}\n\n<voice-mode>${VOICE_DIRECTIVE}</voice-mode>`; }
+const VOICE_RULES = "Keep it brief and conversational: lead with the answer in one or two spoken sentences. Do not use markdown, bullet or numbered lists, tables, code blocks, headings, or URLs unless explicitly asked. Write times and numbers as words a voice would say (for example 'five thirty PM', not '5:30 PM'). Only expand if the user asks for detail.";
+const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; your reply will be read aloud by text-to-speech. " + VOICE_RULES;
+// The phone bridge (phone/bridge.ts) sends voice: "phone": same rules, but the caller may be anywhere.
+const PHONE_DIRECTIVE = "The user is on a phone call with you; your reply will be read aloud by text-to-speech. Where the user is and what they are doing is unknown. " + VOICE_RULES;
+export function decorateVoiceTurn(text: string, voice: unknown = true): string { return `${text}\n\n<voice-mode>${voice === "phone" ? PHONE_DIRECTIVE : VOICE_DIRECTIVE}</voice-mode>`; }
 // Appended to the FIRST turn of a new chat so the sidebar gets a real title without a second query.
 // The model opens its reply with <title>3-6 words</title>; the runner strips that off the live stream
 // and the client strips it on replay, so the user never sees it, and convMeta reads it back off the

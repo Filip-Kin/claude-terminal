@@ -131,7 +131,7 @@ async function runTurn(c: Call, t: Turn, heard: string) {
     }
     text = "(phone call) " + text;
     const cid = crypto.randomUUID();
-    const turn = { text, voice: true, human: true, cid };
+    const turn = { text, voice: "phone", human: true, cid }; // "phone" = short spoken reply, no driving assumption
     let streamId = c.conv;
     let sent = c.conv ? await sidecar(c.user, "POST", "/app/api/send", { id: c.conv, ...turn }) : null;
     if (!sent || sent.error) { // no chat yet, or it was closed: start one (resume by id when there is one)

@@ -985,7 +985,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
     const dup = dedupSeen(b.cid); // a redelivery of an already-processed turn -> ack, do not send again
     if (dup) { tlog("dedup", { route: "start", conv: dup.id, cid: shortCid(b.cid) }); return jsonRes({ id: dup.id, deduped: true }, ctx, req); }
-    const text = b.voice ? decorateVoiceTurn(rawText) : rawText; // voice mode -> append the brief/TTS directive
+    const text = b.voice ? decorateVoiceTurn(rawText, b.voice) : rawText; // voice mode -> append the brief/TTS directive
     // Only the browser sends human:true. Every other caller (restart-wake, the redeploy script,
     // subscription-resume, ct-auto-update, any future script) is automated by default and renders
     // as a grey notice, so a new sender can never show as the user (user-rows.ts).
@@ -1022,7 +1022,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (dedupSeen(b.cid)) { tlog("dedup", { route: "send", conv: conv.id, cid: shortCid(b.cid) }); return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); } // redelivery -> ack, don't re-send
     tlog("accept", { route: "send", conv: conv.id, cid: shortCid(b.cid), chars: rawText.length });
     conv.setClientTz(b.tz);
-    conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText, typeof b.cid === "string" ? b.cid : undefined, b.human === true); // voice mode -> append the brief/TTS directive
+    conv.send(b.voice ? decorateVoiceTurn(rawText, b.voice) : rawText, typeof b.cid === "string" ? b.cid : undefined, b.human === true); // voice mode -> append the brief/TTS directive
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
   }
@@ -1049,7 +1049,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       if (held.length) { tlog("reject", { route: "edit", conv: id, why: "held", pid: held[0].pid, entrypoint: held[0].entrypoint }); return jsonRes({ error: heldMessage(held[0]), code: "held", pid: held[0].pid }, ctx, req, 409); }
     }
     if (!conv) { conv = getOrCreate(id, { cwd: meta.cwd || ctx.defaultCwd, model: b.model || undefined, resume: id, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile }); await conv.bootForRewind(); }
-    const text = b.voice ? decorateVoiceTurn(rawText) : rawText;
+    const text = b.voice ? decorateVoiceTurn(rawText, b.voice) : rawText;
     tlog("accept", { route: "edit", conv: conv.id, cid: shortCid(b.cid), chars: text.length, uuid });
     conv.setClientTz(b.tz);
     const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text, typeof b.cid === "string" ? b.cid : undefined);
