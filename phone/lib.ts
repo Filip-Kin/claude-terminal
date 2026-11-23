@@ -198,10 +198,10 @@ export const LINES: Record<string, string> = {
  *  the caller repeats it after the tone. Clip names: enroll_p1 .. enroll_pN. */
 export const PHRASES: string[] = [
   "The quick brown fox jumps over the lazy dog near the quiet river bank.",
-  "She sells fresh orange juice and thick vanilla shakes at the garage every Thursday.",
+  "She sells fresh orange juice and thick vanilla shakes at the market every Thursday.",
   "My father bought a huge yellow television which usually works with a joyful noise.",
   "Seven zebras chased through the treasure maze while the judge watched the show.",
-  "Open the garage, check the weather, and tell me how my fantasy team is doing.",
+  "Check the weather, read me the news, and remind me to call home at five.",
 ];
 PHRASES.forEach((p, i) => { LINES[`enroll_p${i + 1}`] = p; });
 
