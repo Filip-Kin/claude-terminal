@@ -5,8 +5,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  admit, enrollStep, gather, HANGUP, isGoodbye, LINES, loadConfig, pause, play, redirect, say, signatureOk, spoken,
-  startStream, TONES, twiml, voiceVerdict, type EnrollState, type PhoneConfig, type PhoneUser, type VoiceCheck,
+  admit, enrollStep, gather, HANGUP, isGoodbye, LINES, loadConfig, pause, play, redirect, say, signatureOk, spoken, userForCaller,
+  startStream, TONES, twiml, voiceStep, voiceVerdict, type EnrollState, type PhoneConfig, type PhoneUser, type VoiceCheck,
 } from "./lib";
 import { startSetup } from "./setup";
 
@@ -29,7 +29,7 @@ type Turn = {
 type Call = {
   sid: string; user: PhoneUser; from: string; conv: string | null; turn: string | null; model?: string;
   token: string; audio: Uint8Array[]; audioBytes: number;
-  verified: boolean; shortTries: number;
+  verified: boolean; shortTries: number; retried: boolean; pending: string | null; // pending = the question said before a voice retry
   enroll: EnrollState | null;
 };
 const calls = new Map<string, Call>();
@@ -177,8 +177,9 @@ function armedEnrollment(user: string): string | null {
   return label || "phone";
 }
 
-function notifyOwner(title: string, body: string) {
-  void fetch("http://127.0.0.1:7682/notify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title, body }) })
+/** Push to the user the call belongs to: each sidecar serves /notify for its own devices. */
+function notifyUser(user: PhoneUser, title: string, body: string) {
+  void fetch(user.sidecar + "/notify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title, body, url: "/_phone/", tag: "phone-refused" }) })
     .catch((e) => log("notify error", String(e)));
 }
 //#endregion
@@ -208,13 +209,14 @@ async function route(path: string, q: URLSearchParams, p: Params): Promise<strin
     const a = admit(cfg, from, stir);
     log("incoming", from, "stir", stir, a.ok ? a.user.name : a.why);
     if (!a.ok) {
-      if (a.why === "attestation") notifyOwner("Phone call refused", `Caller id ${from}, attestation ${stir}`);
+      const u = userForCaller(cfg, from);
+      if (a.why === "attestation" && u) notifyUser(u, "Phone call refused", `Caller id ${from}, attestation ${stir}`);
       return twiml(play(cfg, "private"), HANGUP);
     }
     const label = armedEnrollment(a.user.name);
     const c: Call = {
       sid, user: a.user, from, conv: null, turn: null, token: crypto.randomUUID(), audio: [], audioBytes: 0,
-      verified: false, shortTries: 0, enroll: label ? { label, done: 0, misses: 0 } : null,
+      verified: false, shortTries: 0, retried: false, pending: null, enroll: label ? { label, done: 0, misses: 0 } : null,
     };
     calls.set(sid, c); byToken.set(c.token, c);
     if (c.enroll) return twiml(startStream(cfg, c.token), play(cfg, "enroll_intro"), sayAfterMe(0));
@@ -225,7 +227,7 @@ async function route(path: string, q: URLSearchParams, p: Params): Promise<strin
     const t = turns.get(q.get("turn") || "");
     if (!t) return twiml(play(cfg, "result_in_app"), HANGUP);
     // We dialled the number on file and the answer belongs to a turn that passed the voice check.
-    const c: Call = { sid, user: t.user, from: t.to, conv: t.conv, turn: null, token: crypto.randomUUID(), audio: [], audioBytes: 0, verified: false, shortTries: 0, enroll: null };
+    const c: Call = { sid, user: t.user, from: t.to, conv: t.conv, turn: null, token: crypto.randomUUID(), audio: [], audioBytes: 0, verified: false, shortTries: 0, retried: false, pending: null, enroll: null };
     calls.set(sid, c); byToken.set(c.token, c);
     return twiml(startStream(cfg, c.token), play(cfg, "answer_intro"), say(cfg, t.answer), gather(cfg, play(cfg, "anything_else")), GOODBYE());
   }
@@ -254,22 +256,30 @@ async function route(path: string, q: URLSearchParams, p: Params): Promise<strin
 
     if (!text) return c.conv ? twiml(GOODBYE()) : twiml(gather(cfg, play(cfg, "sorry_catch")), GOODBYE());
 
+    let ask = text;
     if (!c.verified) {
-      const r = await speaker("/verify", c.user.name, audio, { call: sid });
+      const r = await speaker("/verify", c.user.name, audio, { call: sid, learnAt: cfg.learnScore, maxSamples: cfg.maxSamples });
       const check: VoiceCheck = { enrolled: r.enrolled === true, score: typeof r.score === "number" ? r.score : null, speechMs: Number(r.speechMs) || 0 };
       const verdict = voiceVerdict(cfg, check);
-      log("voice", c.user.name, verdict, "score", check.score?.toFixed(3) ?? "-", `${check.speechMs} ms`);
-      if (verdict === "short" && c.shortTries++ < 1) return twiml(gather(cfg, play(cfg, "say_more")), GOODBYE());
-      if (verdict !== "pass") {
-        notifyOwner("Phone call refused", `${c.user.name}: voice ${verdict}, score ${check.score?.toFixed(2) ?? "none"}`);
+      const step = voiceStep(verdict, c);
+      log("voice", c.user.name, verdict, "score", check.score?.toFixed(3) ?? "-", `${check.speechMs} ms`, r.label ?? "", r.learned ? "learned" : "", step);
+      if (step === "say-more") { c.shortTries++; return twiml(gather(cfg, play(cfg, "say_more")), GOODBYE()); }
+      if (step === "retry") {
+        // One more sample before refusal: the line reads a sentence and the caller repeats it.
+        c.retried = true; c.pending = text;
+        return twiml(play(cfg, "retry_intro"), play(cfg, "enroll_p1"), gather(cfg, play(cfg, "tone"), { timeout: 8 }), GOODBYE());
+      }
+      if (step === "refuse") {
+        notifyUser(c.user, "Phone call refused", `Voice score ${check.score?.toFixed(2) ?? "none"}`);
         endCall(sid);
         return twiml(play(cfg, verdict === "not-enrolled" ? "not_enrolled" : "not_recognised"), HANGUP);
       }
       c.verified = true;
+      if (c.pending) { ask = c.pending; c.pending = null; } // the retry sentence is not the question
     }
 
-    if (isGoodbye(text)) return twiml(GOODBYE());
-    startTurn(c, text);
+    if (isGoodbye(ask)) return twiml(GOODBYE());
+    startTurn(c, ask);
     return twiml(play(cfg, "on_it"), redirect("/twilio/wait"));
   }
 

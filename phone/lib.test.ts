@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { admit, DEFAULTS, e164, enrollStep, PHRASES, LINES, gather, isGoodbye, linkNumber, sidecarFor, signatureOk, spoken, startStream, twilioSignature, userForCaller, voiceVerdict, type PhoneConfig } from "./lib";
+import { admit, DEFAULTS, e164, enrollStep, refusedCalls, voiceStep, PHRASES, LINES, gather, isGoodbye, linkNumber, sidecarFor, signatureOk, spoken, startStream, twilioSignature, userForCaller, voiceVerdict, type PhoneConfig } from "./lib";
 
 const cfg: PhoneConfig = {
   ...DEFAULTS, from: "+15550001111",
@@ -131,5 +131,41 @@ describe("prompted enrolment", () => {
   });
   test("three misses end the call instead of looping", () => {
     expect(enrollStep({ label: "phone", done: 1, misses: 2 }, 0, min).kind).toBe("failed");
+  });
+});
+
+describe("voice check steps", () => {
+  test("a pass passes; nothing else reaches a prompt", () => {
+    expect(voiceStep("pass", { shortTries: 0, retried: false })).toBe("pass");
+    for (const v of ["fail", "short", "not-enrolled"] as const)
+      for (const t of [{ shortTries: 0, retried: false }, { shortTries: 1, retried: true }]) expect(voiceStep(v, t)).not.toBe("pass");
+  });
+  // The fault Filip hit: one low score over a car's Bluetooth ended the call with no second sample.
+  test("a failed score gets one retry, then refusal", () => {
+    expect(voiceStep("fail", { shortTries: 0, retried: false })).toBe("retry");
+    expect(voiceStep("fail", { shortTries: 0, retried: true })).toBe("refuse");
+  });
+  test("short speech gets one say-more; no voiceprint is refused at once", () => {
+    expect(voiceStep("short", { shortTries: 0, retried: false })).toBe("say-more");
+    expect(voiceStep("short", { shortTries: 1, retried: false })).toBe("refuse");
+    expect(voiceStep("not-enrolled", { shortTries: 0, retried: false })).toBe("refuse");
+  });
+});
+
+describe("refused calls", () => {
+  const clips = [
+    { stem: "20261122-232031-676bd7d7", score: 0.139, speechMs: 4260 },
+    { stem: "20261122-232045-676bd7d7", score: 0.31, speechMs: 5000 },
+    { stem: "20261122-233000-aaaa1111", score: 0.2, speechMs: 3000 },
+    { stem: "20261122-233010-aaaa1111", score: 0.8, speechMs: 5000 },   // retry passed: not refused
+    { stem: "20261122-234000-bbbb2222", score: 0.1, speechMs: 3000, adopted: "car" },
+    { stem: "20261122-235000-cccc3333", score: null, speechMs: 300 },
+    { stem: "../../etc/passwd", score: 0, speechMs: 0 },
+  ];
+  test("lists calls with no passing clip, newest first, both clips, best score", () => {
+    const r = refusedCalls(clips, 0.6);
+    expect(r.map((x) => x.call)).toEqual(["cccc3333", "676bd7d7"]);
+    expect(r[1]).toEqual({ call: "676bd7d7", at: "2026-11-22T23:20:31", score: 0.31, clips: ["20261122-232031-676bd7d7", "20261122-232045-676bd7d7"] });
+    expect(r[0].score).toBeNull();
   });
 });

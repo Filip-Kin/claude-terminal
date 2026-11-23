@@ -25,6 +25,8 @@ export type PhoneConfig = {
   threshold: number;          // minimum voiceprint score
   minSpeechMs: number;        // voiced audio needed before a voiceprint decision
   enrollMinMs: number;        // voiced audio one enrolment sentence must hold
+  learnScore: number;         // a passed call at or above this score adds its audio to the voiceprint
+  maxSamples: number;         // voiceprint samples kept per device
   users: PhoneUser[];
 };
 
@@ -42,6 +44,8 @@ export const DEFAULTS: PhoneConfig = {
   threshold: 0.6,
   minSpeechMs: 1200,
   enrollMinMs: 2000,
+  learnScore: 0.75,
+  maxSamples: 20,
   users: [],
 };
 
@@ -176,6 +180,7 @@ export const LINES: Record<string, string> = {
   greet: "Claude here.",
   private: "This number is private.",
   not_recognised: "Voice not recognised.",
+  retry_intro: "Voice not recognised. Say this after the tone.",
   not_enrolled: "No voice print on file.",
   say_more: "Say that again, a little longer.",
   on_it: "On it.",
@@ -221,5 +226,46 @@ export function enrollStep(s: EnrollState, speechMs: number, minMs: number, tota
   }
   const state = { ...s, misses: s.misses + 1 };
   return { kind: state.misses >= ENROLL_MAX_MISSES ? "failed" : "again", state };
+}
+
+//#region voice check steps
+export type VoiceTries = { shortTries: number; retried: boolean };
+export type VoiceStep = "pass" | "say-more" | "retry" | "refuse";
+
+/** What a voice verdict does to the call. Too little speech gets one "say more"; a failed score
+ *  gets one retry on a read sentence (a longer, cleaner sample); anything else that is not a pass
+ *  ends the call. No path reaches a prompt without a pass. */
+export function voiceStep(verdict: "pass" | "fail" | "short" | "not-enrolled", t: VoiceTries): VoiceStep {
+  if (verdict === "pass") return "pass";
+  if (verdict === "short" && t.shortTries < 1) return "say-more";
+  if (verdict === "fail" && !t.retried) return "retry";
+  return "refuse";
+}
+
+/** Devices a voiceprint can belong to; each sounds different on a call. */
+export const DEVICES = ["phone", "watch", "speaker", "car"] as const;
+
+export type KeptClip = { stem: string; score: number | null; speechMs: number; adopted?: string };
+export type RefusedCall = { call: string; at: string; score: number | null; clips: string[] };
+export const CLIP_STEM = /^(\d{8})-(\d{6})-([A-Za-z0-9]{1,8})$/;
+
+/** Kept clips (calls/<user>/<stem>.json) grouped into refused calls, newest first. A call is
+ *  refused when none of its clips reached the threshold; an adopted call is no longer listed. */
+export function refusedCalls(clips: KeptClip[], threshold: number, limit = 5): RefusedCall[] {
+  const by = new Map<string, KeptClip[]>();
+  for (const c of clips) {
+    const m = CLIP_STEM.exec(c.stem);
+    if (m) by.set(m[3], [...(by.get(m[3]) ?? []), c]);
+  }
+  const out: RefusedCall[] = [];
+  for (const [call, list] of by) {
+    if (list.some((c) => c.adopted || (c.score !== null && c.score >= threshold))) continue;
+    list.sort((a, b) => a.stem.localeCompare(b.stem));
+    const scores = list.map((c) => c.score).filter((x): x is number => x !== null);
+    const m = CLIP_STEM.exec(list[0].stem)!;
+    const at = `${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6)}T${m[2].slice(0, 2)}:${m[2].slice(2, 4)}:${m[2].slice(4)}`;
+    out.push({ call, at, score: scores.length ? Math.max(...scores) : null, clips: list.map((c) => c.stem) });
+  }
+  return out.sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit);
 }
 //#endregion

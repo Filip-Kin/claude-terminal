@@ -52,12 +52,17 @@ def voiced(x: np.ndarray, sr: int) -> np.ndarray:
     return frames[keep].reshape(-1)
 
 
+def prepare_raw(raw: np.ndarray) -> tuple[np.ndarray, int]:
+    """8 kHz float audio to (voiced 16 kHz audio, voiced ms)."""
+    v = voiced(raw, SR_IN)
+    return resample_poly(v, 2, 1).astype(np.float32), int(len(v) * 1000 / SR_IN)
+
+
 def prepare(b64: str) -> tuple[np.ndarray, int, np.ndarray]:
     """Returns (voiced 16 kHz audio, voiced ms, raw 8 kHz audio)."""
     raw = mulaw_to_float(base64.b64decode(b64))
-    v = voiced(raw, SR_IN)
-    ms = int(len(v) * 1000 / SR_IN)
-    return resample_poly(v, 2, 1).astype(np.float32), ms, raw
+    x, ms = prepare_raw(raw)
+    return x, ms, raw
 # endregion
 
 # region model
@@ -85,6 +90,16 @@ def save(user: str, prints: dict[str, list[list[float]]]) -> None:
     tmp = PRINTS / f"{user}.json.tmp"
     tmp.write_text(json.dumps(prints))
     tmp.replace(PRINTS / f"{user}.json")
+
+
+ANCHORS = 5  # the enrolment samples; learned samples beyond the cap push out older learned ones
+
+
+def add_sample(prints: dict[str, list[list[float]]], label: str, e: np.ndarray, cap: int) -> None:
+    vecs = prints.setdefault(label, [])
+    vecs.append(e.tolist())
+    while len(vecs) > max(cap, ANCHORS + 1):
+        vecs.pop(ANCHORS)
 
 
 def score(prints: dict[str, list[list[float]]], e: np.ndarray) -> tuple[float, str]:
@@ -125,6 +140,8 @@ class Clip(BaseModel):
     call: str = ""
     minMs: int = 2000     # enrol: less voiced audio than this is not a sample
     reset: bool = False   # enrol: this sample starts a new voiceprint for the label
+    learnAt: float = 2.0  # verify: a score at or above this adds the audio to the matched voiceprint
+    maxSamples: int = 20
 
 
 @app.get("/health")
@@ -184,7 +201,46 @@ def verify(c: Clip):
     if ms < 500:
         s, where = None, ""
     else:
-        s, where = score(prints, embed(x))
+        e = embed(x)
+        s, where = score(prints, e)
+    learned = s is not None and s >= c.learnAt and ms >= c.minMs
+    if learned:
+        add_sample(prints, where, e, c.maxSamples)
+        save(c.user, prints)
     keep_call(c.user, c.call, raw, {"score": s, "label": where, "speechMs": ms})
-    print(f"[speaker] verify {c.user} score={s} label={where} speech={ms}ms", flush=True)
-    return {"enrolled": True, "score": s, "label": where, "speechMs": ms}
+    print(f"[speaker] verify {c.user} score={s} label={where} speech={ms}ms learned={learned}", flush=True)
+    return {"enrolled": True, "score": s, "label": where, "speechMs": ms, "learned": learned}
+
+
+class Adopt(BaseModel):
+    user: str
+    call: str             # the call part of the kept clip names
+    label: str
+    minMs: int = 1200
+    maxSamples: int = 20
+
+
+@app.post("/adopt")
+def adopt(a: Adopt):
+    """Add the kept audio of one refused call to the user's voiceprint under a device label.
+    The setup page calls this for the signed-in account owner only."""
+    if not USER_OK.match(a.user) or not USER_OK.match(a.label) or not a.call.isalnum():
+        return {"ok": False, "error": "bad request"}
+    prints, added = load(a.user), 0
+    for wav in sorted((CALLS / a.user).glob(f"*-{a.call}.wav")):
+        meta_f = wav.with_suffix(".json")
+        meta = json.loads(meta_f.read_text()) if meta_f.exists() else {}
+        if meta.get("adopted"):
+            continue
+        with wave.open(str(wav), "rb") as w:
+            raw = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+        x, ms = prepare_raw(raw)
+        if ms < a.minMs:
+            continue
+        add_sample(prints, a.label, embed(x), a.maxSamples)
+        meta_f.write_text(json.dumps({**meta, "adopted": a.label}))
+        added += 1
+    if added:
+        save(a.user, prints)
+    print(f"[speaker] adopt {a.user} call={a.call} label={a.label} added={added}", flush=True)
+    return {"ok": added > 0, "added": added}

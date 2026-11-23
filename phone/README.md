@@ -13,6 +13,9 @@ from a phone, a watch or a smart speaker. Ported from Brandon McDonald's `deploy
    is refused.
 4. The caller's audio is forked to `wss://.../twilio/media`. The first utterance goes to
    `claude-speaker` and must score at least `threshold` against the user's voiceprint.
+   A failed score gets one retry: the line reads a sentence, the caller repeats it. A second fail
+   ends the call and pushes "Phone call refused" to that user. A pass at or above `learnScore`
+   adds the audio to the matched voiceprint (at most `maxSamples` per device).
 5. Each utterance becomes a turn in an `/app` chat (`voice: true`, so the reply is short). The
    bridge follows the chat's live stream and reads the text after the last tool call aloud.
 6. A turn that runs past `holdSeconds` ends the call and phones back with the answer.
@@ -41,6 +44,10 @@ opens an enrolment call. The next call from that number within 15 minutes record
 the line says five sentences (`PHRASES` in `lib.ts`), the caller repeats each after the tone, and a
 chime confirms it. Enrolling a device again replaces that device's voiceprint. One voiceprint per device type (phone, watch, speaker), because each sounds
 different on a call.
+
+A refused call is listed on the Phone page with its audio. "Add voice" saves that audio as a
+voiceprint for the chosen device (phone, watch, speaker, car), so a new device needs no enrolment
+call. Only the signed-in account owner sees and adds their own calls.
 
 By hand: `bun phone/admin.ts add <user> <number>`, `bun phone/admin.ts enroll <user> [label]`,
 `bun phone/admin.ts list`.

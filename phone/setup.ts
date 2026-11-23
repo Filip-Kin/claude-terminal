@@ -1,11 +1,11 @@
 // Phone self-setup: claude.filipkin.com/_phone/. The router has already authenticated the request
 // with Authelia and stamps Remote-User, the same trust the sidecars rely on. A signed-in user links
 // their own number and opens an enrolment call; nobody can touch another user's entry.
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { e164, linkNumber, PHRASES, saveConfigKey, sidecarFor, type PhoneConfig } from "./lib";
+import { CLIP_STEM, DEVICES, e164, linkNumber, PHRASES, refusedCalls, saveConfigKey, sidecarFor, type KeptClip, type PhoneConfig } from "./lib";
 
-export const LABELS = ["phone", "watch", "speaker"] as const;
+export const LABELS = DEVICES;
 export const ENROLL_WINDOW_MS = 15 * 60_000;
 
 type Opts = { state: string; port: number; owner: string; guestsTsv: string; origin: string; cfg: () => PhoneConfig; reload: () => void };
@@ -24,6 +24,16 @@ function armed(state: string, user: string): { until: number; label: string } | 
   return Date.now() < Number(until) ? { until: Number(until), label: label || "phone" } : null;
 }
 
+/** The user's kept call clips (first utterance and retry of each call, written by claude-speaker). */
+function keptClips(state: string, user: string): KeptClip[] {
+  const dir = join(state, "calls", user);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => {
+    const m = JSON.parse(readFileSync(join(dir, f), "utf8")) as { score?: number | null; speechMs?: number; adopted?: string };
+    return { stem: f.slice(0, -5), score: m.score ?? null, speechMs: m.speechMs ?? 0, adopted: m.adopted };
+  });
+}
+
 export function startSetup(o: Opts) {
   const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
   const fail = (error: string, status = 400) => json({ error }, status);
@@ -34,6 +44,7 @@ export function startSetup(o: Opts) {
     return {
       user, claudeNumber: cfg.from, number: cfg.users.find((u) => u.name === user)?.numbers[0] ?? null,
       voiceprint: prints[user] ?? {}, enrolment: armed(o.state, user), labels: LABELS, phrases: PHRASES,
+      refused: refusedCalls(keptClips(o.state, user), cfg.threshold),
     };
   }
 
@@ -48,12 +59,17 @@ export function startSetup(o: Opts) {
 
       if (req.method === "GET" && path === "/") return new Response(Bun.file(join(import.meta.dir, "setup.html")), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
       if (req.method === "GET" && path === "/api/me") return json(await me(user));
+      if (req.method === "GET" && path.startsWith("/api/clip/")) { // the user's own kept call audio
+        const stem = path.slice("/api/clip/".length).replace(/\.wav$/, "");
+        const f = Bun.file(join(o.state, "calls", user, stem + ".wav"));
+        return CLIP_STEM.test(stem) && (await f.exists()) ? new Response(f, { headers: { "content-type": "audio/wav", "cache-control": "no-store" } }) : fail("Not found", 404);
+      }
       if (req.method !== "POST") return fail("Not found", 404);
 
       // A cross-site form cannot send JSON or this Origin, so another site cannot act for the user.
       const origin = req.headers.get("origin");
       if ((origin && origin !== o.origin) || !(req.headers.get("content-type") || "").startsWith("application/json")) return fail("Request refused: wrong origin", 403);
-      const body = (await req.json().catch(() => ({}))) as { number?: unknown; label?: unknown };
+      const body = (await req.json().catch(() => ({}))) as { number?: unknown; label?: unknown; call?: unknown };
       const file = join(o.state, "config.json");
 
       if (path === "/api/number") {
@@ -76,6 +92,16 @@ export function startSetup(o: Opts) {
         if (!o.cfg().users.some((u) => u.name === user)) return fail("Phone number missing");
         armEnrollment(o.state, user, label);
         console.log("setup", user, "enrolment open", label);
+        return json(await me(user));
+      }
+      if (path === "/api/adopt") { // a refused call's audio becomes a voiceprint for one device
+        const label = String(body.label ?? ""), call = String(body.call ?? "");
+        if (!(LABELS as readonly string[]).includes(label)) return fail("Device unknown");
+        const cfg = o.cfg();
+        if (!refusedCalls(keptClips(o.state, user), cfg.threshold, Infinity).some((r) => r.call === call)) return fail("Call unknown");
+        const r = (await fetch(cfg.speakerUrl + "/adopt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user, call, label, minMs: cfg.minSpeechMs, maxSamples: cfg.maxSamples }), signal: AbortSignal.timeout(15000) }).then((x) => x.json())) as { ok?: boolean };
+        console.log("setup", user, "adopt", call, label, r.ok ? "ok" : "refused");
+        if (!r.ok) return fail("Voice not added: too little speech");
         return json(await me(user));
       }
       return fail("Not found", 404);

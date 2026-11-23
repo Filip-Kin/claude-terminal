@@ -28,6 +28,10 @@
   ol { margin: 0; padding-left: 1.4em; display: grid; gap: 8px; }
   li span:last-child, .mute { color: var(--mute); }
   .status { font-weight: 600; }
+  .calls, .call { display: grid; gap: 8px; }
+  .call + .call { border-top: 1px solid var(--line); padding-top: 10px; }
+  .call > div:first-child { display: flex; justify-content: space-between; }
+  audio { width: 100%; height: 40px; }
   .error { color: var(--bad); min-height: 1.4em; margin: 0; }
   [hidden] { display: none !important; }
 </style>
@@ -65,6 +69,11 @@
     </form>
   </section>
 
+  <section id="refused" hidden>
+    <h2>Refused calls</h2>
+    <div id="refused-list" class="calls"></div>
+  </section>
+
   <section id="said" hidden>
     <h2>Enrolment sentences</h2>
     <ol id="phrases"></ol>
@@ -92,6 +101,26 @@ function show(me) {
     li.append(a, b); $("prints").append(li);
   }
   if (!$("label").options.length) for (const l of me.labels) $("label").add(new Option(cap(l), l));
+  $("refused").hidden = !me.number || !me.refused.length;
+  const sig = me.refused.map((r) => r.call).join();
+  if ($("refused-list").dataset.sig !== sig) { // rebuild only on a change, so a playing clip keeps playing
+    $("refused-list").dataset.sig = sig; $("refused-list").innerHTML = "";
+    for (const r of me.refused) {
+      const row = document.createElement("div"), head = document.createElement("div"), when = document.createElement("span"), score = document.createElement("span");
+      row.className = "call";
+      when.textContent = new Date(r.at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+      score.textContent = r.score === null ? "No score" : "Score " + r.score.toFixed(2); score.className = "mute";
+      head.append(when, score); row.append(head);
+      for (const stem of r.clips) { const a = document.createElement("audio"); a.controls = true; a.preload = "none"; a.src = "/_phone/api/clip/" + stem + ".wav"; row.append(a); }
+      const form = document.createElement("form"), lab = document.createElement("label"), sel = document.createElement("select"), btn = document.createElement("button");
+      form.className = "row"; lab.className = "grow"; sel.setAttribute("aria-label", "Device");
+      for (const l of me.labels) sel.add(new Option(cap(l), l));
+      btn.type = "submit"; btn.textContent = "Add voice";
+      lab.append(sel); form.append(lab, btn); row.append(form);
+      form.addEventListener("submit", (ev) => { ev.preventDefault(); call("adopt", { call: r.call, label: sel.value }); });
+      $("refused-list").append(row);
+    }
+  }
   const e = me.enrolment;
   $("open").hidden = !e;
   if (e) $("open").textContent = `${cap(e.label)} enrolment call open until ${new Date(e.until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
