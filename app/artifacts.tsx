@@ -12,7 +12,7 @@
 // SECURITY: preview iframes get sandbox="allow-scripts" and NEVER allow-same-origin, so artifact
 // code cannot reach the parent origin, its cookies, or localStorage. The parent-side markdown path
 // is unchanged from main.tsx (marked + the same local-ref rewrite), so it is no less safe than today.
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { marked } from "marked";
 import { extractMath } from "./mathrender";
 import hljs from "highlight.js/lib/common";
@@ -583,13 +583,12 @@ function Markdown({ text, convId, v, baseDir, onOpenArtifact }: { text: string; 
 export function AssistantContent({ text, convId, onOpenArtifact, v }: { text: string; convId?: string | null; onOpenArtifact?: (a: Artifact) => void; v?: string | number }) {
   const segs = useMemo(() => parseAssistant(text), [text]);
   const cid = convId ?? null;
-  const [light, setLight] = useState<string | null>(null);
   const files = useMemo(() => localFileLinks(segs.filter((x) => x.type === "markdown").map((x: any) => x.text).join("\n")), [segs]);
 
   // Tap an inline image to open a lightbox (images already resolve via rewriteLocalRefs).
   const onImgClick = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
-    if (t.tagName === "IMG") { const src = (t as HTMLImageElement).currentSrc || (t as HTMLImageElement).src; if (src) { e.preventDefault(); setLight(src); } }
+    if (t.tagName === "IMG") { const src = (t as HTMLImageElement).currentSrc || (t as HTMLImageElement).src; if (src) { e.preventDefault(); openLightbox(src); } }
   }, []);
 
   return (
@@ -601,19 +600,32 @@ export function AssistantContent({ text, convId, onOpenArtifact, v }: { text: st
       })}
       {files.length > 0 && (
         <div className="ct-file-row">
-          {files.map((f) => <FileCard key={f} href={downloadUrl(cid, f, v)} name={f.split("/").pop() || f} onPreview={setLight} />)}
+          {files.map((f) => <FileCard key={f} href={downloadUrl(cid, f, v)} name={f.split("/").pop() || f} onPreview={openLightbox} />)}
         </div>
       )}
-      {light && <Lightbox src={light} onClose={() => setLight(null)} />}
     </div>
   );
+}
+
+// The open image lives in a module store and renders once at the app root (LightboxHost), not inside
+// the message that owns the image: a message block re-renders or leaves the mounted window when new
+// chat or tool events arrive, and the viewer must stay open through that.
+let lightSrc: string | null = null;
+const lightSubs = new Set<() => void>();
+const setLightSrc = (src: string | null) => { lightSrc = src; lightSubs.forEach((f) => f()); };
+export const openLightbox = (src: string) => setLightSrc(src);
+const closeLightbox = () => setLightSrc(null);
+const subLight = (f: () => void) => { lightSubs.add(f); return () => { lightSubs.delete(f); }; };
+export function LightboxHost() {
+  const src = useSyncExternalStore(subLight, () => lightSrc);
+  return src ? <Lightbox key={src} src={src} onClose={closeLightbox} /> : null;
 }
 
 // Full-screen image viewer with its own pinch-zoom + pan (never the page's), and Android-back-to-close.
 // touch-action:none stops the browser from turning a pinch on the image into a page zoom; the gesture
 // math drives a CSS transform on the image instead. On open it pushes a history entry so the phone's
 // back button (a popstate) closes the viewer rather than navigating the SPA away.
-export function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const st = useRef({ s: 1, tx: 0, ty: 0 });
@@ -624,19 +636,24 @@ export function Lightbox({ src, onClose }: { src: string; onClose: () => void })
   const [zoomed, setZoomed] = useState(false);
 
   // Back button / history: closing via UI pops our pushed entry; a real back-press pops it for us.
+  // onClose is read through a ref and both effects run once per mount: the owner passes a new
+  // closure on every render (a streaming message re-renders often), and re-running the history
+  // effect would call history.back(), whose popstate then closes the viewer.
   const popped = useRef(false);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
     history.pushState({ ctLightbox: true }, "");
-    const onPop = () => { popped.current = true; onClose(); };
+    const onPop = () => { popped.current = true; closeRef.current(); };
     window.addEventListener("popstate", onPop);
     return () => { window.removeEventListener("popstate", onPop); if (!popped.current) history.back(); };
-  }, [onClose]);
+  }, []);
   // Escape to close on desktop.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeRef.current(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   const apply = () => { const el = imgRef.current; if (el) el.style.transform = `translate(${st.current.tx}px,${st.current.ty}px) scale(${st.current.s})`; };
   const clampT = () => {

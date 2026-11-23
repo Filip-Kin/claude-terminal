@@ -10,7 +10,7 @@ import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
 import * as offline from "./offline";
-import { AssistantContent, ArtifactViewer, FileCard, Lightbox, downloadUrl, type Artifact } from "./artifacts";
+import { AssistantContent, ArtifactViewer, FileCard, LightboxHost, openLightbox, downloadUrl, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer, isSpawnTabTool, SpawnTabButton, setOpenConversation } from "./agents";
 import { toolDisplay } from "./toollabels";
 import { extractShopCards, ShopGallery } from "./shopcards";
@@ -1235,18 +1235,16 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
 }
 
 // Images and files the user attached: a photo opens in the full-screen viewer, a file is a download
-// card. Its own component so the viewer's open state lives here, not in the memoized message block.
+// card. The viewer itself renders at the app root (LightboxHost).
 function UserAttachments({ images, files, convId }: { images: string[]; files: string[]; convId: string | null }) {
-  const [light, setLight] = useState<string | null>(null);
   if (!images.length && !files.length) return null;
   return (
     <>
       {images.map((p, k) => {
         const src = downloadUrl(convId, p);
-        return <img key={k} className="msg-img msg-img-zoom" loading="lazy" src={src} alt="attachment" onClick={(e) => { e.stopPropagation(); setLight(src); }} />;
+        return <img key={k} className="msg-img msg-img-zoom" loading="lazy" src={src} alt="attachment" onClick={(e) => { e.stopPropagation(); openLightbox(src); }} />;
       })}
       {files.map((p, k) => <FileCard key={k} href={downloadUrl(convId, p)} name={p.split("/").pop() || p} />)}
-      {light && <Lightbox src={light} onClose={() => setLight(null)} />}
     </>
   );
 }
@@ -3223,6 +3221,7 @@ function App() {
         </>
       )}
       <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} ttsVoice={ttsVoice || undefined} tapToTalk={tapToTalk} />
+      <LightboxHost />
     </div>
   );
 }
