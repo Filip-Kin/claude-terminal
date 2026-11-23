@@ -24,7 +24,8 @@
   button.plain { background: transparent; color: var(--bad); border-color: var(--line); }
   button:disabled { opacity: .5; cursor: default; }
   ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
-  li { display: flex; justify-content: space-between; }
+  ul li { display: flex; justify-content: space-between; }
+  ol { margin: 0; padding-left: 1.4em; display: grid; gap: 8px; }
   li span:last-child, .mute { color: var(--mute); }
   .status { font-weight: 600; }
   .error { color: var(--bad); min-height: 1.4em; margin: 0; }
@@ -63,6 +64,11 @@
       <button type="submit">Open enrolment call</button>
     </form>
   </section>
+
+  <section id="said" hidden>
+    <h2>Enrolment sentences</h2>
+    <ol id="phrases"></ol>
+  </section>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -76,7 +82,8 @@ function show(me) {
   $("claude").textContent = pretty(me.claudeNumber); $("claude").href = "tel:" + me.claudeNumber;
   $("num-set").hidden = !me.number; $("num-form").hidden = !!me.number;
   $("number").textContent = pretty(me.number);
-  $("voice").hidden = !me.number;
+  $("voice").hidden = $("said").hidden = !me.number;
+  if (!$("phrases").children.length) for (const p of me.phrases) { const li = document.createElement("li"); li.textContent = p; $("phrases").append(li); }
   const rows = Object.entries(me.voiceprint);
   $("prints").innerHTML = "";
   for (const [label, n] of rows.length ? rows : [["No voiceprint", ""]]) {

@@ -5,8 +5,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  admit, gather, HANGUP, isGoodbye, LINES, loadConfig, pause, play, redirect, say, signatureOk, spoken,
-  startStream, twiml, voiceVerdict, type PhoneConfig, type PhoneUser, type VoiceCheck,
+  admit, enrollStep, gather, HANGUP, isGoodbye, LINES, loadConfig, pause, play, redirect, say, signatureOk, spoken,
+  startStream, TONES, twiml, voiceVerdict, type EnrollState, type PhoneConfig, type PhoneUser, type VoiceCheck,
 } from "./lib";
 import { startSetup } from "./setup";
 
@@ -30,7 +30,7 @@ type Call = {
   sid: string; user: PhoneUser; from: string; conv: string | null; turn: string | null; model?: string;
   token: string; audio: Uint8Array[]; audioBytes: number;
   verified: boolean; shortTries: number;
-  enroll: { label: string; speechMs: number; n: number } | null;
+  enroll: EnrollState | null;
 };
 const calls = new Map<string, Call>();
 const byToken = new Map<string, Call>();
@@ -186,6 +186,8 @@ function notifyOwner(title: string, body: string) {
 //#region call flow
 type Params = Record<string, string>;
 const GOODBYE = () => play(cfg, "goodbye") + HANGUP;
+/** Enrolment prompt: the line says sentence i, a tone marks the caller's turn. */
+const sayAfterMe = (i: number) => play(cfg, `enroll_p${i + 1}`) + gather(cfg, play(cfg, "tone"), { timeout: 8 }) + GOODBYE();
 
 async function route(path: string, q: URLSearchParams, p: Params): Promise<string> {
   const sid = p.CallSid || "";
@@ -212,10 +214,10 @@ async function route(path: string, q: URLSearchParams, p: Params): Promise<strin
     const label = armedEnrollment(a.user.name);
     const c: Call = {
       sid, user: a.user, from, conv: null, turn: null, token: crypto.randomUUID(), audio: [], audioBytes: 0,
-      verified: false, shortTries: 0, enroll: label ? { label, speechMs: 0, n: 0 } : null,
+      verified: false, shortTries: 0, enroll: label ? { label, done: 0, misses: 0 } : null,
     };
     calls.set(sid, c); byToken.set(c.token, c);
-    if (c.enroll) return twiml(startStream(cfg, c.token), gather(cfg, play(cfg, "enroll_intro"), { timeout: 10, speechTimeout: 2 }), GOODBYE());
+    if (c.enroll) return twiml(startStream(cfg, c.token), play(cfg, "enroll_intro"), sayAfterMe(0));
     return twiml(startStream(cfg, c.token), gather(cfg, play(cfg, "greet")), GOODBYE());
   }
 
@@ -236,16 +238,18 @@ async function route(path: string, q: URLSearchParams, p: Params): Promise<strin
     const audio = takeAudio(c);
 
     if (c.enroll) {
-      if (audio.length) {
-        const r = await speaker("/enroll", c.user.name, audio, { label: c.enroll.label });
-        c.enroll.speechMs += Number(r.speechMs) || 0; c.enroll.n++;
-        log("enroll", c.user.name, c.enroll.label, `utterance ${c.enroll.n}`, `${c.enroll.speechMs} ms`);
-      }
-      if (c.enroll.speechMs >= cfg.enrollSpeechMs || c.enroll.n >= 12) {
+      // The first accepted sentence of a call replaces that device's earlier voiceprint.
+      const r = audio.length ? await speaker("/enroll", c.user.name, audio, { label: c.enroll.label, minMs: cfg.enrollMinMs, reset: c.enroll.done === 0 }) : {};
+      const speechMs = Number(r.speechMs) || 0;
+      const step = enrollStep(c.enroll, speechMs, cfg.enrollMinMs);
+      log("enroll", c.user.name, c.enroll.label, `sentence ${c.enroll.done + 1}`, `${speechMs} ms`, step.kind);
+      c.enroll = step.state;
+      if (step.kind === "done") {
         rmSync(join(ENROLL_DIR, c.user.name), { force: true });
-        return twiml(play(cfg, "enroll_done"), HANGUP);
+        return twiml(play(cfg, "chime"), play(cfg, "enroll_done"), HANGUP);
       }
-      return twiml(gather(cfg, play(cfg, "enroll_next"), { timeout: 10, speechTimeout: 2 }), GOODBYE());
+      if (step.kind === "failed") return twiml(play(cfg, "enroll_failed"), HANGUP);
+      return twiml(play(cfg, step.kind === "next" ? "chime" : "enroll_again"), sayAfterMe(step.state.done));
     }
 
     if (!text) return c.conv ? twiml(GOODBYE()) : twiml(gather(cfg, play(cfg, "sorry_catch")), GOODBYE());
@@ -301,7 +305,7 @@ if (import.meta.main) {
       if (req.method === "GET" && url.pathname.startsWith("/twilio/audio/")) {
         const name = url.pathname.slice("/twilio/audio/".length).replace(/\.wav$/, "");
         const f = Bun.file(join(AUDIO_DIR, name + ".wav"));
-        return name in LINES && (await f.exists()) ? new Response(f, { headers: { "content-type": "audio/wav", "cache-control": "public, max-age=86400" } }) : new Response("not found", { status: 404 });
+        return (name in LINES || TONES.includes(name)) && (await f.exists()) ? new Response(f, { headers: { "content-type": "audio/wav", "cache-control": "public, max-age=86400" } }) : new Response("not found", { status: 404 });
       }
       if (req.method !== "POST" || !url.pathname.startsWith("/twilio/")) return new Response("not found", { status: 404 });
       const p: Params = Object.fromEntries(new URLSearchParams(await req.text()));

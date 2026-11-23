@@ -123,6 +123,8 @@ class Clip(BaseModel):
     audio: str            # base64 mu-law 8 kHz
     label: str = "phone"  # enrol: which device type this sample came from
     call: str = ""
+    minMs: int = 2000     # enrol: less voiced audio than this is not a sample
+    reset: bool = False   # enrol: this sample starts a new voiceprint for the label
 
 
 @app.get("/health")
@@ -161,9 +163,11 @@ def enroll(c: Clip):
     if not USER_OK.match(c.user) or not USER_OK.match(c.label):
         return {"error": "bad user or label", "speechMs": 0}
     x, ms, _ = prepare(c.audio)
-    if ms < 3000:  # too little speech to be a useful sample
-        return {"speechMs": 0, "skipped": True}
+    if ms < c.minMs:
+        return {"speechMs": ms, "skipped": True}
     prints = load(c.user)
+    if c.reset:
+        prints[c.label] = []
     prints.setdefault(c.label, []).append(embed(x).tolist())
     save(c.user, prints)
     return {"speechMs": ms, "samples": len(prints[c.label])}

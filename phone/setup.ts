@@ -3,7 +3,7 @@
 // their own number and opens an enrolment call; nobody can touch another user's entry.
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { e164, linkNumber, saveConfigKey, sidecarFor, type PhoneConfig } from "./lib";
+import { e164, linkNumber, PHRASES, saveConfigKey, sidecarFor, type PhoneConfig } from "./lib";
 
 export const LABELS = ["phone", "watch", "speaker"] as const;
 export const ENROLL_WINDOW_MS = 15 * 60_000;
@@ -33,7 +33,7 @@ export function startSetup(o: Opts) {
     const prints = (await fetch(cfg.speakerUrl + "/users", { signal: AbortSignal.timeout(5000) }).then((r) => r.json()).catch(() => ({}))) as Record<string, Record<string, number>>;
     return {
       user, claudeNumber: cfg.from, number: cfg.users.find((u) => u.name === user)?.numbers[0] ?? null,
-      voiceprint: prints[user] ?? {}, enrolment: armed(o.state, user), labels: LABELS,
+      voiceprint: prints[user] ?? {}, enrolment: armed(o.state, user), labels: LABELS, phrases: PHRASES,
     };
   }
 

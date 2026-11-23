@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { admit, DEFAULTS, e164, gather, isGoodbye, linkNumber, sidecarFor, signatureOk, spoken, startStream, twilioSignature, userForCaller, voiceVerdict, type PhoneConfig } from "./lib";
+import { admit, DEFAULTS, e164, enrollStep, PHRASES, LINES, gather, isGoodbye, linkNumber, sidecarFor, signatureOk, spoken, startStream, twilioSignature, userForCaller, voiceVerdict, type PhoneConfig } from "./lib";
 
 const cfg: PhoneConfig = {
   ...DEFAULTS, from: "+15550001111",
@@ -108,5 +108,28 @@ describe("self-setup", () => {
     expect(sidecarFor("filip", "filip", tsv)).toBe("http://127.0.0.1:7682");
     expect(sidecarFor("michel", "filip", tsv)).toBe("http://127.0.0.1:7785");
     expect(sidecarFor("mallory", "filip", tsv)).toBeNull();
+  });
+});
+
+describe("prompted enrolment", () => {
+  const min = cfg.enrollMinMs;
+  test("every sentence has a clip name", () => {
+    PHRASES.forEach((p, i) => expect(LINES[`enroll_p${i + 1}`]).toBe(p));
+  });
+  test("five good sentences finish; each good one moves to the next", () => {
+    let s = { label: "phone", done: 0, misses: 0 };
+    const kinds: string[] = [];
+    for (let i = 0; i < PHRASES.length; i++) { const r = enrollStep(s, 3500, min); kinds.push(r.kind); s = r.state; }
+    expect(kinds).toEqual(["next", "next", "next", "next", "done"]);
+    expect(s.done).toBe(PHRASES.length);
+  });
+  // The fault Filip hit: silence or a missed turn must repeat the same sentence, not count as one.
+  test("too little speech repeats the same sentence and does not count", () => {
+    const r = enrollStep({ label: "phone", done: 2, misses: 0 }, min - 1, min);
+    expect(r.kind).toBe("again");
+    expect(r.state.done).toBe(2);
+  });
+  test("three misses end the call instead of looping", () => {
+    expect(enrollStep({ label: "phone", done: 1, misses: 2 }, 0, min).kind).toBe("failed");
   });
 });

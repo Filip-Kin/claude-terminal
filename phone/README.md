@@ -37,8 +37,9 @@ Twilio keys come from the secrets store at start: `twilio/account-sid`, `twilio/
 ## Setting up a person
 
 The person signs in at `claude.filipkin.com`, opens Phone in the sidebar, saves their number and
-opens an enrolment call. The next call from that number within 15 minutes records the voiceprint
-(about 40 s of speech). One voiceprint per device type (phone, watch, speaker), because each sounds
+opens an enrolment call. The next call from that number within 15 minutes records the voiceprint:
+the line says five sentences (`PHRASES` in `lib.ts`), the caller repeats each after the tone, and a
+chime confirms it. Enrolling a device again replaces that device's voiceprint. One voiceprint per device type (phone, watch, speaker), because each sounds
 different on a call.
 
 By hand: `bun phone/admin.ts add <user> <number>`, `bun phone/admin.ts enroll <user> [label]`,

@@ -24,7 +24,7 @@ export type PhoneConfig = {
   speakerUrl: string;         // voiceprint service
   threshold: number;          // minimum voiceprint score
   minSpeechMs: number;        // voiced audio needed before a voiceprint decision
-  enrollSpeechMs: number;     // voiced audio one enrolment call collects
+  enrollMinMs: number;        // voiced audio one enrolment sentence must hold
   users: PhoneUser[];
 };
 
@@ -41,7 +41,7 @@ export const DEFAULTS: PhoneConfig = {
   speakerUrl: "http://127.0.0.1:7803",
   threshold: 0.6,
   minSpeechMs: 1200,
-  enrollSpeechMs: 40000,
+  enrollMinMs: 2000,
   users: [],
 };
 
@@ -188,8 +188,38 @@ export const LINES: Record<string, string> = {
   lost_track: "Call state lost. Call again.",
   sorry_catch: "I did not catch that.",
   result_in_app: "The answer is in the app.",
-  enroll_intro: "Voice enrolment. After this, talk for ten seconds about anything.",
-  enroll_next: "Again. Ten seconds.",
+  enroll_intro: "Voice enrolment. Five sentences. Say each one after the tone.",
+  enroll_again: "Once more.",
+  enroll_failed: "Voice enrolment failed. No speech heard.",
   enroll_done: "Voice enrolment complete.",
 };
+
+/** Enrolment sentences. Between them they cover most English speech sounds; the line reads one,
+ *  the caller repeats it after the tone. Clip names: enroll_p1 .. enroll_pN. */
+export const PHRASES: string[] = [
+  "The quick brown fox jumps over the lazy dog near the quiet river bank.",
+  "She sells fresh orange juice and thick vanilla shakes at the garage every Thursday.",
+  "My father bought a huge yellow television which usually works with a joyful noise.",
+  "Seven zebras chased through the treasure maze while the judge watched the show.",
+  "Open the garage, check the weather, and tell me how my fantasy team is doing.",
+];
+PHRASES.forEach((p, i) => { LINES[`enroll_p${i + 1}`] = p; });
+
+/** Tones made by make-audio.ts: "tone" = your turn, "chime" = sentence accepted. */
+export const TONES = ["tone", "chime"];
+
+export type EnrollState = { label: string; done: number; misses: number };
+export type EnrollStep = { kind: "next" | "again" | "done" | "failed"; state: EnrollState };
+export const ENROLL_MAX_MISSES = 3;
+
+/** One heard sentence: enough speech moves on to the next sentence, too little repeats the same
+ *  one, and three misses in a call end it. state.done is also the index of the sentence to say. */
+export function enrollStep(s: EnrollState, speechMs: number, minMs: number, total = PHRASES.length): EnrollStep {
+  if (speechMs >= minMs) {
+    const state = { ...s, done: s.done + 1 };
+    return { kind: state.done >= total ? "done" : "next", state };
+  }
+  const state = { ...s, misses: s.misses + 1 };
+  return { kind: state.misses >= ENROLL_MAX_MISSES ? "failed" : "again", state };
+}
 //#endregion
