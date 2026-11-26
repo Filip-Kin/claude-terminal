@@ -16,6 +16,7 @@ import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
 import { classifyUserRow, noticeText, type RowState } from "./user-rows.ts";
 import { sessionHolders, heldMessage } from "./session-lock.ts";
+import { readPlan, setPlan, type Plan } from "./plan.ts";
 import { mergeStatus, spawnQueryOpts, type LiveStatus } from "./app-sessions.ts";
 
 // Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
@@ -44,7 +45,7 @@ function compactMeta(o: any): { trigger: "manual" | "auto"; preTokens?: number; 
 
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
-  | { t: "init"; sessionId: string; model: string; cwd: string }
+  | { t: "init"; sessionId: string; model: string; cwd: string; plan?: Plan }
   | { t: "text"; text: string; bid?: string }
   | { t: "text_delta"; text: string; bid?: string } // streamed token (includePartialMessages)
   | { t: "thinking"; text: string; bid?: string }
@@ -90,7 +91,8 @@ export type AppEvent =
   // Context window occupancy, from the usage the API reports on every assistant message. One source.
   | { t: "context"; used: number; max?: number }
   // The model this conversation runs on: at init, and whenever it is switched.
-  | { t: "model"; model: string }
+  | { t: "model"; model: string }  // a turn started on this model
+  | { t: "plan"; plan: Plan }      // a turn started on this plan
   // A background subagent finished. Its Task tool_result was only a launch ack, so without this the
   // card said "Running" forever after the work was done.
   | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string };
@@ -477,6 +479,7 @@ const SESSION_LIMIT_RE = /hit your (?:session|usage) limit/i;
 // "API Error: Connection lost mid-response"). Also delivered as a synthetic assistant message, so
 // without this it read as something Claude chose to say.
 const API_ERROR_RE = /^API Error:/i;
+const OWN_AUTH_RE = /Invalid API key|authentication_error|Please run \/login|OAuth token has expired|Invalid bearer token|API Error: 401/i;
 // One line for a retried API failure. The SDK reports every attempt as a system/api_error message
 // with a `formatted` summary; `attempt` lets a long outage say so without repeating itself.
 function apiErrorNotice(err: any, attempt: number): string {
@@ -642,6 +645,9 @@ export class Conversation {
   private forkNext = false;     // one-shot: the next run() should fork the session (edit-and-rerun)
   private runGen = 0;           // bumped per run() so a superseded run's finally stays quiet
   private inited = false;       // an init event has been seen (the SDK session is live)
+  plan: Plan = readPlan();        // the plan the live process runs on (its token is fixed at spawn)
+  private runModel?: string;      // the model the live query runs on; a pick waits in pendingModel
+  turnModel?: string;             // the model the last turn started on
   private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
   private titleScan = false;   // true during a new chat's first turn: withhold a leading <title> from the stream
   private running = false;     // the run() query loop is alive; a send while false means the subprocess died and must be re-run
@@ -822,6 +828,25 @@ export class Conversation {
       if (!this.resume && this.inited) this.resume = this.id;
       tlog("reopen", { conv: this.id });
     }
+    // A plan change applies from this message: an idle live process started under the other plan
+    // is replaced by a fresh one resuming this session, so the turn runs on the new token.
+    const turnStart = !this.busy;
+    let restarted = false;
+    if (this.running && turnStart && this.plan !== readPlan()) {
+      tlog("plan-restart", { conv: this.id, from: this.plan });
+      if (!this.resume && this.inited) this.resume = this.id;
+      this.runGen++; // supersede the old run so its finally stays quiet
+      try { this.q?.close(); } catch { /* */ }
+      this.q = null; this.running = false; this.waiter = undefined;
+      this.pendingModel = undefined; // the fresh query starts on this.model
+      this.plan = readPlan(); this.runModel = this.model;
+      restarted = true;
+    }
+    if (turnStart) {
+      this.turnModel = (restarted ? this.model : this.runModel ?? this.model) || "default";
+      this.emit({ t: "model", model: this.turnModel });
+      this.emit({ t: "plan", plan: this.plan });
+    }
     this.lastActivity = Date.now();
     this.currentTurnText = text; // remember it so a subscription-limit rejection can re-run this turn
     this.currentTurnHuman = human;
@@ -894,10 +919,10 @@ export class Conversation {
   // it while a turn streams both threw AND wedged the query, so the turn never answered. So never push
   // it live during a turn. Record it, reflect it in the UI immediately, and apply it at the next idle
   // boundary (applyPendingModel, called from the result handler). Applied now only if already idle.
+  // The model event goes out with the next turn start (send), not here.
   async setModel(model: string) {
     this.model = model;
     this.pendingModel = model;
-    this.emit({ t: "model", model }); // every device watching this chat shows the switch right away
     if (!this.id.startsWith("new-")) modelChoiceHook?.(this.id, model); // a new chat persists at init
     if (!this.busy) await this.applyPendingModel();
   }
@@ -907,8 +932,16 @@ export class Conversation {
   private async applyPendingModel() {
     if (!this.pendingModel || !this.q || !this.inited || this.closed || this.busy) return;
     const m = this.pendingModel;
-    try { await this.q.setModel(m); this.pendingModel = undefined; }
+    try { await this.q.setModel(m); this.pendingModel = undefined; this.runModel = m; }
     catch (e: any) { tlog("setmodel-defer", { conv: this.id, msg: String(e?.message || e).slice(0, 80) }); }
+  }
+
+  // The own token stopped working: go back to the shared plan and say so. The next message restarts
+  // this conversation under the shared token.
+  private ownPlanExpired() {
+    setPlan("shared");
+    this.emit({ t: "error", message: "Own plan sign-in expired. Switched to Shared" });
+    this.setPhase("idle");
   }
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
@@ -1125,6 +1158,7 @@ export class Conversation {
     let stored: Record<string, McpServerConfig> = {};
     if (this.mcpFile) { try { stored = await mcpServersForQuery(this.mcpFile); } catch {} }
     const spawn = spawnQueryOpts(this.spawnName, !!this.resume);
+    this.plan = readPlan(); this.runModel = this.model; // process.env carries this plan's token (plan.ts applyPlanEnv)
     this.q = query({
       prompt: this.inputGen(first, cid, human),
       options: {
@@ -1239,10 +1273,12 @@ export class Conversation {
           // today. Overwriting the choice with it pinned every chat to the concrete model of the moment,
           // so when "default" moved from Opus 4.8 to 5.5 old chats stayed on 4.8 and the selector
           // showed 4.8. A resume that passed no model runs the CLI default, i.e. "default".
-          const chosen = this.model || "default";
-          this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: chosen, cwd: anyM.cwd });
+          const chosen = this.runModel || "default";
+          this.turnModel = chosen;
+          this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: chosen, cwd: anyM.cwd, plan: this.plan });
           appSessionHook?.(String(anyM.session_id || this.id));
           this.emit({ t: "model", model: chosen });
+          this.emit({ t: "plan", plan: this.plan });
           if (this.model && anyM.session_id) modelChoiceHook?.(anyM.session_id, this.model);
           if (this.phase === "starting") this.setPhase("waiting");
           // An MCP server that failed to connect is the classic silent pre-model stall. Say so.
@@ -1353,6 +1389,10 @@ export class Conversation {
         // sentence instead of the notice. Arm from the message's own clock time.
         if (anyM.message?.model === "<synthetic>") {
           const t = textOfContent(anyM.message?.content);
+          if (this.plan === "own" && (anyM.error === "authentication_failed" || OWN_AUTH_RE.test(t))) {
+            this.ownPlanExpired();
+            break;
+          }
           if (SESSION_LIMIT_RE.test(t)) {
             if (!this.pendingRateLimit) {
               const at = sessionLimitResetAt(t) ?? this.resetAtFrom({});

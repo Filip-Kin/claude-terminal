@@ -7,8 +7,7 @@
 // transcripts itself. HOME-relative for the per-instance terminal bits (tab-registry, settings,
 // tmux), so the same binary runs for the host owner and inside each guest container.
 import { isWorkUser, WORK_SUFFIX } from "./transcripts.ts";
-import { hostPlan, applyPlanEnv, IN_GUEST } from "./plan.ts";
-if (IN_GUEST) applyPlanEnv(); // own-plan guests: new Claude children inherit their own token
+import { hostPlan, setHostUser } from "./plan.ts";
 import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -29,6 +28,7 @@ import { initBstats, recordSample, countEvent, buildReport } from "./battery-sta
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
 const OWNER: string = cfg.owner;
+setHostUser(OWNER); // the host owner's plan mirror lives under HOST_PLAN_DIR/<owner>
 const DB_PATH: string = cfg.db;
 const PORT = Number(process.env.PORT || cfg.port || 7682);
 // 127.0.0.1 on the host (nginx is local); guests set "0.0.0.0" so docker port
@@ -298,6 +298,7 @@ function buildLeaderboard() {
   const hide = new Set<string>(cfg.leaderboardHide || []);
   for (const user of bases) {
     const hours = new Map<string, any>();
+    const ownHours = new Map<string, any>(); // the unbilled own-plan row's hours alone
     let outTotal = 0, tokTotal = 0, sessions = 0, last: string | null = null, monthOutput = 0, monthWeighted = 0;
     const models = new Set<string>();
     for (const row of [user, user + WORK_SUFFIX]) {
@@ -308,6 +309,7 @@ function buildLeaderboard() {
         const h = hours.get(r.hour_utc) || { total: 0, output: 0 };
         h.total += r.total; h.output += r.output;
         hours.set(r.hour_utc, h);
+        if (!billed) { const o = ownHours.get(r.hour_utc) || { total: 0, output: 0 }; o.total += r.total; o.output += r.output; ownHours.set(r.hour_utc, o); }
         const mk = r.hour_utc.slice(0, 7);
         if (billed) (byMonth[mk] ??= {})[user] = (byMonth[mk][user] || 0) + r.output;
         if (mk === monthPrefix) rowMonth += r.output;
@@ -338,6 +340,7 @@ function buildLeaderboard() {
       last_used: last,
       active,
       spark: sparkSeries(hours, now, SPARK_HOURS),
+      spark_own: sparkSeries(ownHours, now, SPARK_HOURS),
       hourly: sparkSeries(hours, now, HOURLY_HOURS),
       month_output: monthOutput,
       month_weighted: Math.round(monthWeighted),

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { accountRouter } from "./transcripts.ts";
 import { loadSamples, sharedModelOutput } from "./ration.ts";
-import { skipOwnPlan, hostPlan, setPlan, readPlan, writeToken, planEnv } from "./plan.ts";
+import { ownPlanOfEnviron, setHostUser, mirrorDirOf, setPlan, readPlan, writeToken, planEnv, extractUrl, extractToken, removeToken } from "./plan.ts";
 
 const T0 = Date.parse("2026-11-26T12:00:00Z");
 function planDir(user: string, periods: { since: number; plan: string }[]) {
@@ -33,14 +33,44 @@ test("own-plan output is excluded from the ration sample weights", () => {
   expect(w[0].w).toBe(1200);
 });
 
-test("kill list skips an own-plan container's pids (dry run)", () => {
+test("ownPlanPid: CT_PLAN=own, or a guest container whose mirror says own", () => {
   const dir = planDir("michel", [{ since: 1, plan: "own" }]);
   mkdirSync(join(dir, "ian")); writeFileSync(join(dir, "ian", "plan.json"), JSON.stringify({ plan: "shared", periods: [{ since: 1, plan: "shared" }] }));
-  const owner: Record<number, string | null> = { 10: "michel", 11: "michel", 12: "ian", 13: null };
-  const targets = [10, 11, 12, 13].map((pid) => ({ pid, args: "" }));
-  const { keep, skipped } = skipOwnPlan(targets, (p) => owner[p], (u) => hostPlan(u, dir));
-  expect(keep.map((t) => t.pid)).toEqual([12, 13]);
-  expect(skipped.map((s) => s.t.pid)).toEqual([10, 11]);
+  expect(ownPlanOfEnviron(["PATH=/bin", "CT_PLAN=own"], dir)).toBe(true);
+  expect(ownPlanOfEnviron(["GUEST_USER=michel"], dir)).toBe(true);
+  expect(ownPlanOfEnviron(["GUEST_USER=ian"], dir)).toBe(false);
+  expect(ownPlanOfEnviron(["PATH=/bin"], dir)).toBe(false);
+  expect(ownPlanOfEnviron([], dir)).toBe(false);
+});
+
+test("host plan: no host user means no mirror; the mirror path is HOST_PLAN_DIR/<user>", () => {
+  expect(mirrorDirOf()).toBeNull();
+  const home = mkdtempSync(join(tmpdir(), "home-"));
+  writeToken("sk-ant-oat01-test", home);
+  expect(setPlan("own", home)).toBe("Plan sync unavailable");
+  setHostUser("filip");
+  expect(mirrorDirOf()).toBe("/var/lib/claude-terminal/guest-plan/filip");
+  setHostUser("bad/../name");
+  expect(mirrorDirOf()).toBeNull();
+});
+
+test("host mirror is written directly into a missing directory", () => {
+  const home = mkdtempSync(join(tmpdir(), "home-")), mirror = join(mkdtempSync(join(tmpdir(), "mirror-")), "filip");
+  writeToken("sk-ant-oat01-test", home);
+  expect(setPlan("own", home, mirror, 7)).toBeNull();
+  expect(JSON.parse(require("node:fs").readFileSync(join(mirror, "plan.json"), "utf8")).periods).toEqual([{ since: 7, plan: "own" }]);
+  expect(setPlan("shared", home, mirror, 8)).toBeNull();
+  removeToken(home);
+  expect(readPlan(home)).toBe("shared");
+  expect(planEnv(home)).toEqual({});
+});
+
+test("sign-in output: link from the OSC 8 target, token from stripped text", () => {
+  const raw = "\x1b[2Jopen\r\n\x1b]8;id=a;https://claude.ai/oauth/authorize?abc_DEF-1\x07https://claude.ai/oauth/authorize?abc_DEF-1\x1b]8;;\x07\r\n";
+  expect(extractUrl(raw)).toBe("https://claude.ai/oauth/authorize?abc_DEF-1");
+  expect(extractUrl("\x1b[1mhttps://claude.ai/oauth/authorize?zz\x1b[0m")).toBe("https://claude.ai/oauth/authorize?zz");
+  expect(extractToken("Your token:\r\n\x1b[32msk-ant-oat01-AbCdEfGhIjKlMnOpQrStUv\x1b[0m\r\n")).toBe("sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUv");
+  expect(extractToken("no token here")).toBeNull();
 });
 
 test("guest plan: own needs a token, switch applies to the env, mirror keeps periods", () => {
@@ -49,7 +79,7 @@ test("guest plan: own needs a token, switch applies to the env, mirror keeps per
   writeToken("sk-ant-oat01-test", home);
   expect(setPlan("own", home, mirror, 5)).toBeNull();
   expect(readPlan(home)).toBe("own");
-  expect(planEnv(home)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-test" });
+  expect(planEnv(home)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-test", CT_PLAN: "own" });
   expect(setPlan("shared", home, mirror, 9)).toBeNull();
   expect(planEnv(home)).toEqual({});
   expect(JSON.parse(require("node:fs").readFileSync(join(mirror, "plan.json"), "utf8")).periods).toEqual([{ since: 5, plan: "own" }, { since: 9, plan: "shared" }]);

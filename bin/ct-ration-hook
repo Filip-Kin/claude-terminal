@@ -1,13 +1,26 @@
 #!/bin/bash
-# UserPromptSubmit hook: block prompts while the weekly ration is spent. Reads the state file
-# written by ration-tick.ts. Fails open on a missing or stale (> 10 min) file.
-# A guest on its own plan does not draw on the shared limit.
+# UserPromptSubmit hook: block prompts while the shared ration is spent. Reads the state file
+# written by ration-tick.ts: the weekly track blocks every model, the Fable track only a Fable
+# session. Fails open on a missing or stale (> 10 min) file and on an unknown model.
+# A person on their own plan does not draw on the shared limit.
 [ "$(cat "${CT_PLAN_FILE:-$HOME/plan}" 2>/dev/null)" = own ] && [ -s "$HOME/own-token" ] && exit 0
 f=${RATION_FILE:-/var/lib/claude-terminal/ration/ration.json}
 [ -r "$f" ] || f=/var/lib/claude-terminal/ration.json
 [ -r "$f" ] || exit 0
-read -r spent active label at < <(jq -r '[.spent,.active,.nextAtLabel,.computedAt]|@tsv' "$f" 2>/dev/null | tr '\t' ' ')
-[ "$spent" = true ] && [ "$active" = true ] || exit 0
+read -r at wspent wactive wlabel fspent factive flabel < <(jq -r '[.computedAt, .tracks.weekly.spent, .tracks.weekly.active, (.tracks.weekly.nextAtLabel // "-"), .tracks.fable.spent, .tracks.fable.active, (.tracks.fable.nextAtLabel // "-")] | map(tostring) | join(" ")' "$f" 2>/dev/null)
 age=$(( $(date +%s) - $(date -d "$at" +%s 2>/dev/null || echo 0) ))
 [ "$age" -le 600 ] || exit 0
-jq -n --arg r "Ration spent · +0.5% at $label" '{decision:"block",reason:$r}'
+# "-" stands for no next period.
+[ "$wlabel" = - ] && wlabel=
+[ "$flabel" = - ] && flabel=
+if [ "$wspent" = true ] && [ "$wactive" = true ]; then
+  jq -n --arg r "Ration spent${wlabel:+ · next at $wlabel}" '{decision:"block",reason:$r}'
+  exit 0
+fi
+[ "$fspent" = true ] && [ "$factive" = true ] || exit 0
+# The model of the session's last assistant record (hook input carries transcript_path).
+tp=$(jq -r '.transcript_path // empty' 2>/dev/null)
+[ -r "$tp" ] || exit 0
+model=$(tail -n 200 "$tp" | jq -r 'select(.type=="assistant") | .message.model // empty' 2>/dev/null | grep -v '^<synthetic>$' | tail -n 1)
+case "$model" in *[Ff]able*) jq -n --arg r "Fable ration spent${flabel:+ · next at $flabel}" '{decision:"block",reason:$r}';; esac
+exit 0

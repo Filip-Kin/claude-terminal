@@ -14,6 +14,9 @@
   --accent-2: #e08a6d;
   --user-bg: #2c2925;
   --danger: #e0685f;
+  --pending: #f59e0b;
+  --pending-bg: rgba(245, 158, 11, .22);
+  --pending-text: #fcd34d;
   --radius: 14px;
   --sidebar-w: 268px;
   --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -36,6 +39,9 @@ body.theme-light {
   --accent-2: #d97757;
   --user-bg: #ece5dd;
   --danger: #c0392b;
+  --pending: #d97706;
+  --pending-bg: rgba(245, 158, 11, .2);
+  --pending-text: #92400e;
   color-scheme: light;
 }
 * { box-sizing: border-box; }
@@ -96,7 +102,7 @@ a { color: var(--accent-2); }
 /* A server waiting on a sign-in: red dot on the Connections buttons. */
 .has-dot { position: relative; }
 .has-dot::after { content: ""; position: absolute; top: 2px; right: 2px; width: 8px; height: 8px; border-radius: 50%; background: #EF4444; box-shadow: 0 0 0 2px var(--bg); pointer-events: none; }
-.settings-body { padding: 6px 4px 4px; }
+.settings-body { padding: 6px 4px 4px; overflow-y: auto; min-height: 0; }
 .settings-section { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; padding: 8px 8px 6px; }
 .settings-row { display: flex; align-items: center; gap: 14px; padding: 10px 8px; }
 .settings-row-main { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
@@ -655,5 +661,15 @@ body.theme-light .sc-deal-high { background: rgba(192, 57, 43, .12); color: var(
 .msg-img-zoom { cursor: zoom-in; }
 .bubble-user .ct-file-card { margin: 4px 0; }
 
-.ration-bar { background: #b45309; color: #fff; font-weight: 600; font-size: 14px; text-align: center; padding: 6px 12px; flex: none; }
-.ration-bar.spent { background: #dc2626; }
+.ration-bars { flex: none; display: flex; flex-direction: column; }
+.ration-bar { position: relative; flex: none; background: var(--bg-3); color: var(--text); font-weight: 600; font-size: 13px; text-align: center; padding: 6px 12px; overflow: hidden; border-bottom: 1px solid var(--line); }
+.ration-bar > .ration-fill { position: absolute; inset: 0 auto 0 0; background: var(--pending-bg); border-right: 1px solid var(--pending); transition: width .4s; }
+.ration-bar > .ration-label { position: relative; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+.ration-bar.spent > .ration-fill { background: var(--danger); opacity: .35; border-right: 0; }
+.ration-bar.own > .ration-fill { display: none; }
+
+/* Pending select box: the choice applies from the next message. */
+.model-btn.pending { background: var(--pending-bg); border-color: var(--pending); color: var(--pending-text); }
+.model-btn.pending:hover { border-color: var(--pending); }
+.settings-signin { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; min-width: 0; }
+.settings-signin a { overflow-wrap: anywhere; font-size: 13px; }

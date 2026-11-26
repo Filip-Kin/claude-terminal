@@ -13,6 +13,8 @@ export function makeModelWeight(overrides: Record<string, number> = {}) {
   "claude-sonnet-5": 1.0, "claude-sonnet-4-6": 1.5, "claude-sonnet-4-5": 1.5,
   "claude-haiku-4-5": 0.5, "claude-haiku-4-5-20251001": 0.5,
   "claude-fable-5-1": 4.5, "claude-fable-5": 4.5,
+  // Unmeasured: the family weight.
+  "claude-fable-5-2": 4.5, "claude-opus-5-5": 1.6, "claude-sonnet-5-5": 1.0, "claude-haiku-5-5": 0.5,
 }, overrides);
 // A model the map does not know is weighted 1.0 (treated as a Sonnet-class token) rather than
 // dropped, so a new model still counts toward the bill until its weight is added.

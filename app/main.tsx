@@ -91,7 +91,7 @@ function pressedExtras(target: Element | null): { link?: string; code?: string }
 type Model = { id: string; label: string; description?: string };
 type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean; queuedText?: string };
 type AppEvent =
-  | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
+  | { t: "init"; sessionId: string; model: string; plan?: string; cwd: string; _seq?: number }
   | { t: "text"; text: string; bid?: string; _seq?: number }
   | { t: "text_delta"; text: string; bid?: string; _seq?: number }
   | { t: "thinking"; text: string; bid?: string; _seq?: number }
@@ -116,6 +116,7 @@ type AppEvent =
   | { t: "block_end"; bid: string; _seq?: number }                     // a streamed block finished (exact end of a thinking timer)
   | { t: "context"; used: number; max?: number; _seq?: number }        // context occupancy, from the usage on each assistant message
   | { t: "model"; model: string; _seq?: number }                       // the model this conversation runs on
+  | { t: "plan"; plan: string; _seq?: number }                         // the plan the live process runs on
   | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string; _seq?: number }; // a background subagent finished
 type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
@@ -285,6 +286,10 @@ const api = {
   compact: (id: string) => fetch("/app/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
   usage: () => withTimeout(fetch("/app/api/usage").then(J)),
   ration: () => withTimeout(fetch("/app/api/ration").then(J)),
+  plan: () => withTimeout(fetch("/app/api/plan").then(J)),
+  planPost: (path: string, body?: object) =>
+    fetch("/app/api/plan" + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) }).then(J),
+  planDisconnect: () => fetch("/app/api/plan/own", { method: "DELETE" }).then(J),
   statuses: () => withTimeout(fetch("/app/api/statuses").then(J)),
   search: (q: string) => withTimeout(fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J)),
   answerAsk: (id: string, askId: string, answer: string) =>
@@ -504,6 +509,8 @@ class ConvStore {
   phaseSince = 0;
   phaseDetail: string | undefined = undefined;
   model: string | null = null;  // what THIS conversation runs on (init / model events / replay), not the picker default
+  runModel: string | null = null; // the model the live process runs on: only init / model events set it, a pick does not
+  runPlan: string | null = null;  // the plan the live process runs on: init / plan events only
   ctx: { used: number; max?: number } | null = null; // context occupancy from the stream; the ring reads this
   busy = false;
   cwd: string | null = null;
@@ -592,7 +599,8 @@ class ConvStore {
     switch (e.t) {
       case "init":
         if (e.sessionId && e.sessionId !== this.id) this.mgr.rebind(this, e.sessionId);
-        if (e.model) this.model = e.model;
+        if (e.model) { this.model = e.model; this.runModel = e.model; }
+        if (e.plan) this.runPlan = e.plan;
         this.mgr.hooks?.onInit(this, e.sessionId);
         return;
       case "status": {
@@ -610,7 +618,8 @@ class ConvStore {
         return;
       }
       case "context": this.ctx = { used: e.used, max: e.max ?? this.ctx?.max }; this.signal(); this.mgr.hooks?.onContext(this); return;
-      case "model": this.model = e.model; this.signal(); return;
+      case "model": this.model = e.model; this.runModel = e.model; this.signal(); return;
+      case "plan": this.runPlan = e.plan; this.signal(); return;
       case "busy": if (this.busy !== e.busy) { this.busy = e.busy; if (!e.busy) { this.items = freezeOpen(this.items); this.touch(); } else this.signal(); } return;
       case "compacting":
         this.compacting = e.active; this.compactStart = e.active ? (this.compactStart || Date.now()) : 0; this.signal(); return;
@@ -987,60 +996,107 @@ function fmtResetIn(iso?: string | null): string {
 
 // Subscription session-limit chip: how much of the claude.ai 5-hour rate-limit window is used, plus
 // when it resets. Colour is status-only feedback (amber ≥80%, red ≥95%). Weekly window in the tooltip.
-// #region plan (guest container only: Shared / Own plan, state from /app/api/plan)
-function PlanSettings() {
-  const [st, setSt] = useState<{ guest: boolean; plan: "shared" | "own"; hasToken: boolean } | null>(null);
+const PENDING_TIP = "Applies from your next message";
+
+// #region plan (the person's plans and the connect-your-plan sign-in, state from /app/api/plan)
+type PlanInfo = { plans: { id: string; label: string }[]; plan: string; signin?: "flow" | "token" };
+const SIGNIN_FAILED = "Sign-in failed";
+
+/** The plan setting: connect an own plan (link and code, or a pasted token) and disconnect it again. */
+function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: PlanInfo) => void }) {
   const [tok, setTok] = useState("");
+  const [code, setCode] = useState("");
+  const [link, setLink] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  useEffect(() => { fetch("/app/api/plan").then(J).then(setSt).catch(() => {}); }, []);
-  if (!st || !st.guest) return null;
-  const post = async (path: string, body: object) => {
+  if (!info || !info.signin) return null;
+  const connected = info.plans.some((p) => p.id === "own");
+  /** Runs one plan request; a body with `error` or a network failure leaves the plan unchanged and shows the message. */
+  const run = async (req: () => Promise<any>, ok: (d: any) => void) => {
     setBusy(true); setErr(null);
     try {
-      const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      const d = await r.json();
-      if (!r.ok) setErr(d.error || "Request failed"); else { setSt((p) => (p ? { ...p, ...d } : p)); setTok(""); }
-    } catch { setErr("Request failed"); }
+      const d = await req();
+      if (d?.error) setErr(d.error); else ok(d);
+    } catch { setErr(SIGNIN_FAILED); }
     setBusy(false);
   };
+  const adopt = (d: PlanInfo) => { setInfo(d); setTok(""); setCode(""); setLink(null); };
+  const title = "Connect your plan";
+  let control: React.ReactNode;
+  if (connected) {
+    control = <button className="settings-select" disabled={busy} onClick={() => void run(() => api.planDisconnect(), adopt)}>Disconnect</button>;
+  } else if (info.signin === "token") {
+    control = (
+      <>
+        <input className="settings-select" type="password" autoComplete="off" spellCheck={false} value={tok} disabled={busy} onChange={(e) => setTok(e.target.value)} placeholder="sk-ant-oat01-…" />
+        <button className="settings-select" disabled={busy || !tok.trim()} onClick={() => void run(() => api.planPost("/token", { token: tok }), adopt)}>Save</button>
+      </>
+    );
+  } else if (link) {
+    control = (
+      <div className="settings-signin">
+        <a href={link} target="_blank" rel="noreferrer">Open sign-in link</a>
+        <input className="settings-select" value={code} autoComplete="off" spellCheck={false} disabled={busy} onChange={(e) => setCode(e.target.value)} placeholder="Code" />
+        <span>
+          <button className="settings-select" disabled={busy || !code.trim()} onClick={() => void run(() => api.planPost("/signin/code", { code: code.trim() }), adopt)}>Submit</button>{" "}
+          <button className="settings-select" disabled={busy} onClick={() => { setLink(null); setCode(""); setErr(null); }}>Cancel</button>
+        </span>
+      </div>
+    );
+  } else {
+    control = <button className="settings-select" disabled={busy} onClick={() => void run(() => api.planPost("/signin"), (d) => setLink(d.url))}>Connect</button>;
+  }
   return (
     <>
       <div className="settings-section">Plan</div>
-      <label className="settings-row">
-        <span className="settings-row-main"><span className="settings-row-title">Plan</span></span>
-        <select className="settings-select" value={st.plan} disabled={busy} onChange={(e) => void post("/app/api/plan", { plan: e.target.value })}>
-          <option value="shared">Shared</option>
-          <option value="own">Own</option>
-        </select>
-      </label>
-      <label className="settings-row">
+      <div className="settings-row">
         <span className="settings-row-main">
-          <span className="settings-row-title">Own plan token</span>
-          {st.hasToken && <span className="settings-row-desc">Token set</span>}
+          <span className="settings-row-title">{info.signin === "token" && !connected ? "Own plan token" : title}</span>
+          {connected && <span className="settings-row-desc">Connected</span>}
           {err && <span className="settings-row-desc settings-row-err">{err}</span>}
         </span>
-        <input className="settings-select" type="password" autoComplete="off" spellCheck={false} value={tok} disabled={busy} onChange={(e) => setTok(e.target.value)} placeholder="sk-ant-oat01-…" />
-        <button className="settings-select" disabled={busy || !tok.trim()} onClick={() => void post("/app/api/plan/token", { token: tok })}>Save</button>
-      </label>
+        {control}
+      </div>
     </>
   );
 }
 // #endregion
 
-// #region ration bar (shared weekly-limit ration, state from /app/api/ration)
-function RationBar() {
-  const [s, setS] = useState<{ active: boolean; spent?: boolean; remaining?: number; nextAtLabel?: string } | null>(null);
+// #region ration bar (weekly-limit ration, state from /app/api/ration)
+type RationTrack = { active: boolean; spent: boolean; used: number; allowance: number; remaining: number; nextAtLabel: string | null };
+type RationState = { tracks?: { weekly: RationTrack | null; fable: RationTrack | null } };
+
+/** One ration progress bar: filled part is used / allowance; an own plan shows its label with no fill. */
+function RationTrackBar({ track, name, own }: { track: RationTrack; name: string; own: boolean }) {
+  const spent = !own && track.spent;
+  const frac = own || !track.allowance ? 0 : Math.min(1, Math.max(0, track.used / track.allowance));
+  const label = own ? "Own plan" : (spent ? `${name} spent` : `${name} ${track.remaining.toFixed(2)}% left`) + (track.nextAtLabel ? ` · next at ${track.nextAtLabel}` : "");
+  return (
+    <div className={"ration-bar" + (spent ? " spent" : "") + (own ? " own" : "")} role="progressbar" aria-label={name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(frac * 100)}>
+      <div className="ration-fill" style={{ width: `${spent ? 100 : frac * 100}%` }} />
+      <span className="ration-label">{label}</span>
+    </div>
+  );
+}
+
+/** The weekly bar, plus the Fable bar while a Fable model is selected and the Fable ration is the tighter one. */
+function RationBar({ fableSelected, own }: { fableSelected: boolean; own: boolean }) {
+  const [s, setS] = useState<RationState | null>(null);
   useEffect(() => {
-    const pull = () => api.ration().then((d) => setS(d)).catch(() => {});
+    // A failed poll keeps the last good state; only an explicit empty answer clears it.
+    const pull = () => api.ration().then((d) => { if (d?.tracks) setS(d); else if (d?.active === false) setS(null); }).catch(() => {});
     pull();
     const t = setInterval(pull, 30000);
     return () => clearInterval(t);
   }, []);
-  if (!s?.active) return null;
+  const weekly = s?.tracks?.weekly?.active ? s.tracks.weekly : null;
+  const fable = s?.tracks?.fable?.active ? s.tracks.fable : null;
+  const showFable = !own && fableSelected && !!fable && (!weekly || weekly.remaining > fable.remaining);
+  if (!weekly && !showFable) return null;
   return (
-    <div className={"ration-bar" + (s.spent ? " spent" : "")}>
-      {(s.spent ? "Ration spent" : `Ration ${(s.remaining ?? 0).toFixed(2)}% left`) + ` · +0.5% at ${s.nextAtLabel}`}
+    <div className="ration-bars">
+      {weekly && <RationTrackBar track={weekly} name="Ration" own={own} />}
+      {showFable && <RationTrackBar track={fable!} name="Fable ration" own={false} />}
     </div>
   );
 }
@@ -1502,11 +1558,26 @@ function App() {
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
   const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
+  // Pending: the selection differs from what the live process runs on, until a turn starts on it. A
+  // conversation with no process yet (new chat, nothing run) has no run value and is never pending.
+  const modelPending = isRealConv && !!activeStore!.runModel && canonicalModelId(activeStore!.runModel!, [...models, ...moreModels]) !== model;
+  const planPending = isRealConv && !!activeStore!.runPlan && !!planInfo && activeStore!.runPlan !== planInfo.plan;
+  const fableSelected = /fable/i.test(rawModel) || /fable/i.test(model);
+  const ownPlanNow = ((isRealConv && activeStore!.runPlan) || planInfo?.plan) === "own";
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const editChipsRef = useRef(false); // the composer chips came from an edited turn (cleared on chat switch)
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [planMenuOpen, setPlanMenuOpen] = useState(false);
+  // The person's plans and selection (one for every open conversation). A failed poll keeps the last good value.
+  const [planInfo, setPlanInfo] = useState<PlanInfo | null>(null);
+  useEffect(() => {
+    const pull = () => api.plan().then((d) => { if (d?.plans) setPlanInfo(d); }).catch(() => {});
+    pull();
+    const t = setInterval(pull, 30000);
+    return () => clearInterval(t);
+  }, []);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
@@ -2739,6 +2810,13 @@ function App() {
     setDefaultModel(m); localStorage.setItem("ct-app-model", m); // new-chat page: the default for future chats
   };
 
+  /** Selects a plan for the person; the response is the whole plan state, an error leaves the selection as it was. */
+  const onPickPlan = async (id: string) => {
+    setPlanMenuOpen(false);
+    if (id === planInfo?.plan) return;
+    try { const d = await api.planPost("", { plan: id }); if (d?.plans) setPlanInfo(d); } catch { /* the next poll shows the real selection */ }
+  };
+
   const startRename = () => { if (!activeId) return; setTitleDraft(convs.find((c) => c.sessionId === activeId)?.title || ""); setEditingTitle(true); };
   const saveTitle = async () => {
     const t = titleDraft.trim();
@@ -2965,7 +3043,7 @@ function App() {
                   <option value="system">System</option>
                 </select>
               </label>
-              <PlanSettings />
+              <PlanSettings info={planInfo} setInfo={setPlanInfo} />
               <div className="settings-section">Notifications</div>
               <label className="settings-row">
                 <span className="settings-row-main">
@@ -3094,7 +3172,7 @@ function App() {
       </aside>
 
       <main className="main">
-        <RationBar />
+        <RationBar fableSelected={fableSelected} own={ownPlanNow} />
         <div className="topbar">
           <button className="icon-btn" onClick={() => setDrawer((d) => !d)} aria-label="Menu">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
@@ -3213,7 +3291,7 @@ function App() {
           </div>
           <div className="composer-foot">
             <div className="model-picker up">
-              <button className="model-btn" onClick={() => { if (!models.length) loadModelsRef.current(); setMenuOpen((o) => !o); }}>
+              <button className={"model-btn" + (modelPending ? " pending" : "")} title={modelPending ? PENDING_TIP : undefined} onClick={() => { if (!models.length) loadModelsRef.current(); setPlanMenuOpen(false); setMenuOpen((o) => !o); }}>
                 <span>{modelBtnLabel}</span>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
               </button>
@@ -3229,6 +3307,23 @@ function App() {
                 </div>
               )}
             </div>
+            {planInfo && planInfo.plans.length > 1 && (
+              <div className="model-picker up">
+                <button className={"model-btn" + (planPending ? " pending" : "")} title={planPending ? PENDING_TIP : undefined} onClick={() => { setMenuOpen(false); setPlanMenuOpen((o) => !o); }}>
+                  <span>{planInfo.plans.find((p) => p.id === planInfo.plan)?.label || planInfo.plan}</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                </button>
+                {planMenuOpen && (
+                  <div className="model-menu" onMouseLeave={() => setPlanMenuOpen(false)}>
+                    {planInfo.plans.map((p) => (
+                      <button key={p.id} className="model-row" onClick={() => onPickPlan(p.id)}>
+                        <span className="model-line">{p.label}{p.id === planInfo.plan && <span className="dot">●</span>}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="cf-spacer" />
             {activeId && context && <span className="cf-convtok" title="Total tokens in this conversation right now">{fmtTokens(context.total)}</span>}
             {usage5h && (

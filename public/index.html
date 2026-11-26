@@ -9,13 +9,13 @@
   :root {
     --bg:#f4f5f7; --card:#ffffff; --ink:#14161b; --muted:#697086;
     --line:#e7e9ee; --track:#edeef2; --shadow:0 1px 3px rgba(20,22,27,.06),0 8px 24px rgba(20,22,27,.05);
-    --grad-a:#6366f1; --grad-b:#8b5cf6;
+    --grad-a:#6366f1; --grad-b:#8b5cf6; --own-spark:#0d9488;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg:#0c0e13; --card:#151821; --ink:#eceef3; --muted:#8b93a7;
       --line:#232734; --track:#1e222c; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
-      --grad-a:#818cf8; --grad-b:#a78bfa;
+      --grad-a:#818cf8; --grad-b:#a78bfa; --own-spark:#2dd4bf;
     }
   }
   * { box-sizing:border-box; }
@@ -228,7 +228,10 @@ function countUp(el, to){
 }
 
 // [timestamp, value] pairs for a user's 48h sparkline from the shared hour axis.
-const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); return u.spark.map((y,j)=>[ms[j], y]); };
+// Two stacked series: shared (total minus own plan) and own plan. A server without spark_own is all shared.
+const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); const own=u.spark_own||[];
+  const pair = f => u.spark.map((y,j)=>[ms[j], f(y, own[j]||0)]);
+  return [{ name:"Shared", data:pair((y,o)=>Math.max(0,y-o)) }, { name:"Own plan", data:pair((y,o)=>o) }]; };
 
 function sparkOpts(user, data){
   const c = colorFor(user);
@@ -236,16 +239,16 @@ function sparkOpts(user, data){
     // Animations OFF: on a 46px sparkline the entrance tween buys nothing, and with it enabled the
     // hover marker re-animates the series, which makes ApexCharts clear the tooltip the moment the
     // animation finishes (~700ms) — the tooltip flashed then vanished until the cursor moved again.
-    chart:{ type:"area", height:46, sparkline:{enabled:true}, animations:{enabled:false} },
+    chart:{ type:"area", height:46, stacked:true, sparkline:{enabled:true}, animations:{enabled:false} },
     stroke:{ curve:"smooth", width:2 },
     fill:{ type:"gradient", gradient:{ shadeIntensity:1, opacityFrom:.45, opacityTo:0, stops:[0,100] } },
-    colors:[c],
-    series:[{ name:"output", data }],
+    colors:[c, getComputedStyle(document.body).getPropertyValue("--own-spark").trim()],
+    series:data,
     xaxis:{ type:"datetime" },
     markers:{ size:0, hover:{size:4} },
-    tooltip:{ enabled:true, theme:isDark()?"dark":"light",
+    tooltip:{ enabled:true, shared:true, theme:isDark()?"dark":"light",
       x:{ format:"ddd MMM d, h:mm TT" },
-      y:{ formatter:v=>(v||0).toLocaleString()+" output tokens", title:{formatter:()=>""} } }
+      y:{ formatter:v=>(v||0).toLocaleString()+" output tokens" } }
   };
 }
 
@@ -441,7 +444,7 @@ function refresh(d){
   // entrance animation still runs in build().
   if(onChart){ pendingData = d; return; }   // don't redraw a chart the cursor is hovering — see note above
   d.users.forEach(u => {
-    if(sparks[u.user]) sparks[u.user].updateSeries([{name:"output", data:sparkData(d,u)}], false);
+    if(sparks[u.user]) sparks[u.user].updateSeries(sparkData(d,u), false);
     const vals = { mo:u.month_weighted ?? u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total }; // weighted, to match the card label + ranking
     for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
   });

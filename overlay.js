@@ -371,8 +371,10 @@
     "#claude-tabbar .ctab-btn{display:flex;align-items:center;justify-content:center;width:28px;flex:0 0 auto;margin:5px 0;border-radius:7px;background:#262626;border:1px solid #333;cursor:pointer;color:#cfcfcf}",
     "#claude-tabbar .ctab-btn:hover{background:#333;color:#fff}",
     "#claude-tabbar .ctab-new{font-size:18px;line-height:1}",
-    "#claude-tabbar .ctab-ration{flex:none;padding:3px 10px;margin:0 6px;border-radius:6px;background:#b45309;color:#fff;font:600 12px/1.4 system-ui,sans-serif;white-space:nowrap}",
-    "#claude-tabbar .ctab-ration.spent{background:#dc2626}",
+    "#claude-tabbar .ctab-ration{position:relative;flex:0 1 auto;min-width:0;overflow:hidden;padding:3px 10px;margin:0 6px;border-radius:6px;background:rgba(127,127,127,.28);color:inherit;font:600 12px/1.4 system-ui,sans-serif;white-space:nowrap}",
+    "#claude-tabbar .ctab-ration .fill{position:absolute;inset:0 auto 0 0;background:rgba(245,158,11,.4);border-right:1px solid #f59e0b}",
+    "#claude-tabbar .ctab-ration .lbl{position:relative;display:block;overflow:hidden;text-overflow:ellipsis}",
+    "#claude-tabbar .ctab-ration.spent .fill{background:rgba(220,38,38,.5);border-right:0}",
     "#claude-tabbar .ctab-usage{width:auto;padding:0 9px;gap:5px}",
     "#claude-tabbar .ctab-usage .ctab-usage-fig{font-size:11px;font-variant-numeric:tabular-nums}",
     // notification bell (green glow when on)
@@ -567,9 +569,18 @@
       const r = await api("ration");
       if (!r.ok) return;
       const s = await r.json();
-      if (!s.active) { rationEl.style.display = "none"; return; }
-      rationEl.textContent = (s.spent ? "Ration spent" : "Ration " + s.remaining.toFixed(2) + "% left") + " \u00b7 +0.5% at " + s.nextAtLabel;
-      rationEl.className = "ctab-ration" + (s.spent ? " spent" : "");
+      const w = s.tracks && s.tracks.weekly;
+      if (!w || !w.active) { rationEl.style.display = "none"; return; }
+      const frac = w.allowance ? Math.min(1, Math.max(0, w.used / w.allowance)) : 0;
+      rationEl.replaceChildren();
+      const fill = document.createElement("div");
+      fill.className = "fill";
+      fill.style.width = (w.spent ? 100 : frac * 100) + "%";
+      const lbl = document.createElement("span");
+      lbl.className = "lbl";
+      lbl.textContent = (w.spent ? "Ration spent" : "Ration " + w.remaining.toFixed(2) + "% left") + (w.nextAtLabel ? " \u00b7 next at " + w.nextAtLabel : "");
+      rationEl.append(fill, lbl);
+      rationEl.className = "ctab-ration" + (w.spent ? " spent" : "");
       rationEl.style.display = "";
     } catch (e) { /* ignore */ }
   }
