@@ -276,7 +276,13 @@ export async function finishSignin(code: string, home = homedir(), mirrorDir: st
   if (!s) return { error: "Sign-in expired. Log in again" };
   if (!/^[A-Za-z0-9_#.~-]{8,300}$/.test(code.trim())) return { error: "Code not accepted" };
   const from = s.out.length;
-  try { s.proc.terminal.write(code.trim() + "\r"); } catch { cancelSignin(); return { error: "Sign-in failed" }; }
+  // Enter goes in its own write, after the screen has echoed the code: a long code written together
+  // with Enter is taken as one paste and the Enter is not a submit.
+  try {
+    s.proc.terminal.write(code.trim());
+    await until(s, () => (s.out.length > from ? true : null), 5_000);
+    s.proc.terminal.write("\r");
+  } catch { cancelSignin(); return { error: "Sign-in failed" }; }
   const got = await until(s, () => extractToken(s.out.slice(from)) ?? (codeRefused(s.out.slice(from)) ? "refused" : null), 60_000);
   const screen = stripAnsi(s.out.slice(from)).replace(/sk-ant-[A-Za-z0-9_-]+/g, "sk-ant-<redacted>").replace(/\s+/g, " ").slice(-600);
   cancelSignin();
