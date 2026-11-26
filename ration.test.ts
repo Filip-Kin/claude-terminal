@@ -146,3 +146,8 @@ test("tokens since the last whole-percent tick are added on top of the percent f
   expect(lastTickMs([{ ts: 1, util: 5, w: 0 }, { ts: 2, util: 5, w: 1 }, { ts: 3, util: 6, w: 2 }, { ts: 4, util: 6, w: 3 }])).toBe(3);
   expect(lastTickMs([{ ts: 1, util: 5, w: 0 }])).toBeNull();
 });
+
+test("a limit already at 100% has no next period", () => {
+  const act = { start: "2026-11-26T15:00:00-05:00", startUtil: 100, resetAt: "2026-11-30T07:00:00Z" };
+  expect(computeTrack(act, { util: 100, resetAt: act.resetAt }, 0, null, Date.parse(act.start) + 3600_000)).toMatchObject({ spent: true, nextAt: null, nextAtLabel: null });
+});

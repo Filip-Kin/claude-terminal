@@ -203,7 +203,8 @@ export function computeTrack(act: Activation | undefined, r: Reading | null, tok
   // The whole-percent figure is exact at its last tick; tokens since that tick are added on top.
   const used = r2(tokensPerPct ? Math.max(tokensSinceStart / tokensPerPct, pct + tokensSinceTick / tokensPerPct) : pct);
   const remaining = r2(allowance - used);
-  const next = periods < nPeriods ? new Date(startMs + periods * PERIOD_MS) : null;
+  // No next period when the allowance cannot grow: the last period, or a limit already at 100%.
+  const next = periods < nPeriods && act.startUtil < 100 ? new Date(startMs + periods * PERIOD_MS) : null;
   return { ...base, active: true, spent: remaining <= 0, used, allowance, remaining, nextAt: next?.toISOString() ?? null, nextAtLabel: next ? hhmmDetroit(next) : null };
 }
 
