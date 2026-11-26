@@ -1616,10 +1616,10 @@ function App() {
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
   // The person's plans and selection (one for every open conversation). A failed poll keeps the last good value.
   const [planInfo, setPlanInfo] = useState<PlanInfo | null>(null);
-  // Pending: the selection differs from what the live process runs on, until a turn starts on it. A
-  // conversation with no process yet (new chat, nothing run) has no run value and is never pending.
-  const modelPending = isRealConv && !!activeStore!.runModel && canonicalModelId(activeStore!.runModel!, [...models, ...moreModels]) !== model;
-  const planPending = isRealConv && !!activeStore!.runPlan && !!planInfo && activeStore!.runPlan !== planInfo.plan;
+  // Pending: a prompt is running and the selection differs from what that prompt runs on. With no
+  // prompt running the selection is what the next message uses, so nothing is pending.
+  const modelPending = busy && isRealConv && !!activeStore!.runModel && canonicalModelId(activeStore!.runModel!, [...models, ...moreModels]) !== model;
+  const planPending = busy && isRealConv && !!activeStore!.runPlan && !!planInfo && activeStore!.runPlan !== planInfo.plan;
   const fableSelected = /fable/i.test(rawModel) || /fable/i.test(model);
   const activePlan = (isRealConv && activeStore!.runPlan) || planInfo?.plan || "shared";
   const ownPlanLabel = activePlan === "shared" ? null : planInfo?.plans.find((p) => p.id === activePlan)?.label ?? "Plan";
