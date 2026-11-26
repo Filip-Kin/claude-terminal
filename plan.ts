@@ -171,7 +171,7 @@ export async function validateToken(token: string, cwd = homedir()): Promise<boo
     });
     const kill = setTimeout(() => p.kill(), 90_000);
     const code = await p.exited; clearTimeout(kill);
-    if (code !== 0) return false;
+    if (code !== 0) { console.error("[plan] token check exited", code, (await new Response(p.stderr).text()).replace(/sk-ant-[A-Za-z0-9_-]+/g, "sk-ant-<redacted>").slice(0, 300)); return false; }
     const out = JSON.parse(await new Response(p.stdout).text());
     return out && out.is_error !== true;
   } catch (e) { console.error("[plan] token check failed:", (e as Error).message); return false; }
@@ -278,9 +278,11 @@ export async function finishSignin(code: string, home = homedir(), mirrorDir: st
   const from = s.out.length;
   try { s.proc.terminal.write(code.trim() + "\r"); } catch { cancelSignin(); return { error: "Sign-in failed" }; }
   const got = await until(s, () => extractToken(s.out.slice(from)) ?? (codeRefused(s.out.slice(from)) ? "refused" : null), 60_000);
+  const screen = stripAnsi(s.out.slice(from)).replace(/sk-ant-[A-Za-z0-9_-]+/g, "sk-ant-<redacted>").replace(/\s+/g, " ").slice(-600);
   cancelSignin();
   if (got === "refused") return { error: "Code not accepted. Log in again" };
-  if (!got || !(await validateToken(got))) return { error: "Sign-in failed" };
+  if (!got) { console.error("[plan] sign-in: no token on the sign-in screen within 60 s. Screen:", screen); return { error: "Sign-in failed" }; }
+  if (!(await validateToken(got))) { console.error("[plan] sign-in: the new token failed its check"); return { error: "Sign-in failed" }; }
   return addPlan(defaultName(home), got, home, mirrorDir);
 }
 // #endregion
