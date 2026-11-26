@@ -231,7 +231,9 @@ function countUp(el, to){
 // Two stacked series: shared (total minus own plan) and own plan. A server without spark_own is all shared.
 const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); const own=u.spark_own||[];
   const pair = f => u.spark.map((y,j)=>[ms[j], f(y, own[j]||0)]);
-  return [{ name:"Shared", data:pair((y,o)=>Math.max(0,y-o)) }, { name:"Own plan", data:pair((y,o)=>o) }]; };
+  const shared={ name:"Shared", data:pair((y,o)=>Math.max(0,y-o)) };
+  // A person with no own-plan output gets the shared series alone.
+  return own.some(o=>o>0) ? [shared, { name:"Own plan", data:pair((y,o)=>o) }] : [shared]; };
 
 function sparkOpts(user, data){
   const c = colorFor(user);

@@ -1558,6 +1558,8 @@ function App() {
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
   const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
+  // The person's plans and selection (one for every open conversation). A failed poll keeps the last good value.
+  const [planInfo, setPlanInfo] = useState<PlanInfo | null>(null);
   // Pending: the selection differs from what the live process runs on, until a turn starts on it. A
   // conversation with no process yet (new chat, nothing run) has no run value and is never pending.
   const modelPending = isRealConv && !!activeStore!.runModel && canonicalModelId(activeStore!.runModel!, [...models, ...moreModels]) !== model;
@@ -1570,8 +1572,6 @@ function App() {
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [planMenuOpen, setPlanMenuOpen] = useState(false);
-  // The person's plans and selection (one for every open conversation). A failed poll keeps the last good value.
-  const [planInfo, setPlanInfo] = useState<PlanInfo | null>(null);
   useEffect(() => {
     const pull = () => api.plan().then((d) => { if (d?.plans) setPlanInfo(d); }).catch(() => {});
     pull();
