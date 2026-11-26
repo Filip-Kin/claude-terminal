@@ -5,6 +5,7 @@
 import { Database } from "bun:sqlite";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { guestUserOfPid, hostPlan, skipOwnPlan } from "./plan.ts";
 import { computeRation, estimateFraction, loadSamples, writeRation, rationLine, type RationCfg } from "./ration.ts";
 
 const dry = process.argv.includes("--dry-run");
@@ -39,7 +40,10 @@ for (const l of ps) {
   if (comm !== "claude" || stat.startsWith("Z") || Number(pid) === process.pid) continue;
   targets.push({ pid: Number(pid), args: args.slice(0, 90) });
 }
-for (const t of targets) {
+// A container on its own plan does not draw on the shared limit: leave its processes alone.
+const { keep, skipped } = skipOwnPlan(targets, guestUserOfPid, hostPlan);
+for (const { t, user } of skipped) console.log(`SKIP ${t.pid} own plan (${user})`);
+for (const t of keep) {
   if (dry) { console.log(`WOULD KILL ${t.pid} claude ${t.args}`); continue; }
   try { process.kill(t.pid, "SIGKILL"); console.log(`killed ${t.pid}`); } catch (e) { console.log(`kill ${t.pid} failed: ${e}`); }
 }

@@ -59,6 +59,15 @@ export function estimateFraction(samples: Sample[], startMs: number): Est {
   return { outputPerPct, fraction, lastTickTs: base.ts };
 }
 
+// Per-model cumulative output on the SHARED limit: "<user>_work" rows (another plan: the box work
+// login, or a guest on its own plan, see transcripts.ts accountRouter) never draw on it.
+export function sharedModelOutput(db: { query: (q: string) => { all: (...a: unknown[]) => unknown[] } }): Record<string, { output: number; total: number }> {
+  const out: Record<string, { output: number; total: number }> = {};
+  for (const r of db.query("SELECT model, SUM(output) AS output, SUM(total) AS total FROM model_usage WHERE user NOT LIKE '%\\_work' ESCAPE '\\' GROUP BY model").all() as { model: string; output: number; total: number }[])
+    out[r.model] = { output: r.output, total: r.total };
+  return out;
+}
+
 // Cumulative weighted output per sample, using the same per-model weights server.ts uses.
 export function loadSamples(db: { query: (q: string) => { all: (...a: unknown[]) => unknown[] } }, sinceMs: number, modelWeights: Record<string, number> = {}): Sample[] {
   const { modelWeight } = makeModelWeight(modelWeights);

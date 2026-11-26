@@ -13,6 +13,7 @@ import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-m
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
 import { readRation, rationLine } from "./ration";
+import { IN_GUEST, applyPlanEnv, ownToken, readPlan, setPlan, validateToken, writeToken, type Plan } from "./plan";
 import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, onAppSession, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 import { sessionHolders, heldMessage } from "./session-lock";
 
@@ -493,6 +494,22 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   // --- API ---
+  // Guest plan: shared (the injected token) or own (the guest's setup-token). Host: guest=false.
+  if (req.method === "GET" && path === "/app/api/plan") return jsonRes({ guest: IN_GUEST, plan: readPlan(), hasToken: !!ownToken() }, ctx, req);
+  if (req.method === "POST" && path === "/app/api/plan" && IN_GUEST) {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    if (b.plan !== "shared" && b.plan !== "own") return jsonRes({ error: "Bad plan" }, ctx, req, 400);
+    const err = setPlan(b.plan as Plan);
+    if (err) return jsonRes({ error: err }, ctx, req, 400);
+    return jsonRes({ plan: readPlan(), hasToken: !!ownToken() }, ctx, req);
+  }
+  if (req.method === "POST" && path === "/app/api/plan/token" && IN_GUEST) {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const t = typeof b.token === "string" ? b.token.trim() : "";
+    if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(t) || !(await validateToken(t))) return jsonRes({ error: "Token rejected" }, ctx, req, 400);
+    writeToken(t); applyPlanEnv();
+    return jsonRes({ plan: readPlan(), hasToken: true }, ctx, req);
+  }
   if (req.method === "GET" && path === "/app/api/models") {
     // Quick-picks come from the CLI's live supported-models probe (falls back to config if it fails).
     // The "Other models" dialog ALWAYS carries the full config list, minus anything already a quick-

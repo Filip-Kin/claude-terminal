@@ -987,6 +987,47 @@ function fmtResetIn(iso?: string | null): string {
 
 // Subscription session-limit chip: how much of the claude.ai 5-hour rate-limit window is used, plus
 // when it resets. Colour is status-only feedback (amber ≥80%, red ≥95%). Weekly window in the tooltip.
+// #region plan (guest container only: Shared / Own plan, state from /app/api/plan)
+function PlanSettings() {
+  const [st, setSt] = useState<{ guest: boolean; plan: "shared" | "own"; hasToken: boolean } | null>(null);
+  const [tok, setTok] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => { fetch("/app/api/plan").then(J).then(setSt).catch(() => {}); }, []);
+  if (!st || !st.guest) return null;
+  const post = async (path: string, body: object) => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json();
+      if (!r.ok) setErr(d.error || "Request failed"); else { setSt((p) => (p ? { ...p, ...d } : p)); setTok(""); }
+    } catch { setErr("Request failed"); }
+    setBusy(false);
+  };
+  return (
+    <>
+      <div className="settings-section">Plan</div>
+      <label className="settings-row">
+        <span className="settings-row-main"><span className="settings-row-title">Plan</span></span>
+        <select className="settings-select" value={st.plan} disabled={busy} onChange={(e) => void post("/app/api/plan", { plan: e.target.value })}>
+          <option value="shared">Shared</option>
+          <option value="own">Own</option>
+        </select>
+      </label>
+      <label className="settings-row">
+        <span className="settings-row-main">
+          <span className="settings-row-title">Own plan token</span>
+          {st.hasToken && <span className="settings-row-desc">Token set</span>}
+          {err && <span className="settings-row-desc settings-row-err">{err}</span>}
+        </span>
+        <input className="settings-select" type="password" autoComplete="off" spellCheck={false} value={tok} disabled={busy} onChange={(e) => setTok(e.target.value)} placeholder="sk-ant-oat01-…" />
+        <button className="settings-select" disabled={busy || !tok.trim()} onClick={() => void post("/app/api/plan/token", { token: tok })}>Save</button>
+      </label>
+    </>
+  );
+}
+// #endregion
+
 // #region ration bar (shared weekly-limit ration, state from /app/api/ration)
 function RationBar() {
   const [s, setS] = useState<{ active: boolean; spent?: boolean; remaining?: number; nextAtLabel?: string } | null>(null);
@@ -2924,6 +2965,7 @@ function App() {
                   <option value="system">System</option>
                 </select>
               </label>
+              <PlanSettings />
               <div className="settings-section">Notifications</div>
               <label className="settings-row">
                 <span className="settings-row-main">

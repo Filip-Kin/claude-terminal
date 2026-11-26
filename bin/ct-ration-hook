@@ -1,6 +1,8 @@
 #!/bin/bash
 # UserPromptSubmit hook: block prompts while the weekly ration is spent. Reads the state file
 # written by ration-tick.ts. Fails open on a missing or stale (> 10 min) file.
+# A guest on its own plan does not draw on the shared limit.
+[ "$(cat "${CT_PLAN_FILE:-$HOME/plan}" 2>/dev/null)" = own ] && [ -s "$HOME/own-token" ] && exit 0
 f=${RATION_FILE:-/var/lib/claude-terminal/ration/ration.json}
 [ -r "$f" ] || f=/var/lib/claude-terminal/ration.json
 [ -r "$f" ] || exit 0

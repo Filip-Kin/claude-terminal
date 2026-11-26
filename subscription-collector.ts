@@ -14,6 +14,7 @@
 // Non-fatal by contract: a stopped service / missing subscription data must never disturb token
 // collection. No-ops quietly when the snapshot is unavailable.
 import { isWorkUser } from "./transcripts.ts";
+import { sharedModelOutput } from "./ration.ts";
 import { openDb } from "./db.ts";
 
 // Kept in a sibling table inside usage.db. IF NOT EXISTS so the collector creates it on its
@@ -166,11 +167,9 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
     const perModelOutput: Record<string, number> = {};
     const perModelTotal: Record<string, number> = {};
     try {
-      for (const r of db
-        .query("SELECT model, SUM(output) AS output, SUM(total) AS total FROM model_usage WHERE user NOT LIKE '%\\_work' ESCAPE '\\' GROUP BY model")
-        .all() as any[]) {
-        perModelOutput[r.model] = r.output;
-        perModelTotal[r.model] = r.total;
+      for (const [m, v] of Object.entries(sharedModelOutput(db as any))) {
+        perModelOutput[m] = v.output;
+        perModelTotal[m] = v.total;
       }
     } catch {
       /* model_usage not created yet on the very first tick after deploy */

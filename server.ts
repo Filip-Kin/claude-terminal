@@ -7,6 +7,8 @@
 // transcripts itself. HOME-relative for the per-instance terminal bits (tab-registry, settings,
 // tmux), so the same binary runs for the host owner and inside each guest container.
 import { isWorkUser, WORK_SUFFIX } from "./transcripts.ts";
+import { hostPlan, applyPlanEnv, IN_GUEST } from "./plan.ts";
+if (IN_GUEST) applyPlanEnv(); // own-plan guests: new Claude children inherit their own token
 import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -326,6 +328,8 @@ function buildLeaderboard() {
       name: cfg.names?.[user] || titleCase(user),
       host: (cfg.hosts || []).includes(user),
       billed: present.has(user),
+      plan: hostPlan(user),
+      tag: hostPlan(user) === "own" ? "Own plan" : null,
       output_5h: rolling(hours, "output", now),
       output_total: outTotal,
       tokens_total: tokTotal,
