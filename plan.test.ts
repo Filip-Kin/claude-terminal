@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { accountRouter } from "./transcripts.ts";
 import { loadSamples, sharedModelOutput } from "./ration.ts";
-import { ownPlanOfEnviron, setHostUser, mirrorDirOf, setPlan, readPlan, readPlans, addPlan, renamePlan, removePlan, checkName, planAt, planEnv, extractUrl, extractToken, readMirror } from "./plan.ts";
+import { codeRefused, defaultName, ownPlanOfEnviron, setHostUser, mirrorDirOf, setPlan, readPlan, readPlans, addPlan, renamePlan, removePlan, checkName, planAt, planEnv, extractUrl, extractToken, readMirror } from "./plan.ts";
 
 const T0 = Date.parse("2026-11-26T12:00:00Z");
 function planDir(user: string, periods: { since: number; plan: string }[]) {
@@ -158,4 +158,17 @@ test("plan ids are never reused, including ids only the mirror history still hol
   const home = newHome(), mirror = mkdtempSync(join(tmpdir(), "mirror-"));
   const ids = new Set<string>();
   for (let i = 0; i < 30; i++) { const id = mustAdd("p" + i, home, mirror); expect(ids.has(id)).toBe(false); ids.add(id); }
+});
+
+test("sign-in screen parsing: a half-printed token does not match, a refused code is seen", () => {
+  expect(extractToken("sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUv")).toBeNull();
+  expect(extractToken("sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUv\r\n")).toBe("sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUv");
+  expect(codeRefused("\x1b[31m\u2718OAuth error: That code wasn't accepted.\x1b[0m\r\nPressEnter toretry")).toBe(true);
+  expect(codeRefused("Finishing sign-in")).toBe(false);
+});
+test("default plan names take the first free number", () => {
+  const home = mkdtempSync(join(tmpdir(), "plan-default-"));
+  expect(defaultName(home)).toBe("Plan");
+  writeFileSync(join(home, "plans.json"), JSON.stringify({ plans: [{ id: "aaaaaaaa", name: "plan" }, { id: "bbbbbbbb", name: "Plan 2" }] }));
+  expect(defaultName(home)).toBe("Plan 3");
 });

@@ -526,6 +526,11 @@ body.theme-light .md pre { background: #f3eee7; }
 
 /* Settings: an error under a toggle (e.g. notifications blocked in browser settings) */
 .settings-name { flex: 1; max-width: none; min-width: 0; }
+.settings-modal { max-width: 560px; }
+.settings-ctl { display: flex; align-items: center; gap: 8px; flex-shrink: 0; max-width: 62%; min-width: 0; }
+.settings-ctl input.settings-select { flex: 1; min-width: 0; max-width: none; width: 220px; }
+a.settings-select { text-decoration: none; }
+button.settings-select, a.settings-select { cursor: pointer; white-space: nowrap; }
 .settings-row-err { color: var(--err, #ef4444); }
 /* A toggle mid-request (subscribing can take a moment on a weak link) */
 .toggle.busy { opacity: .6; pointer-events: none; }
@@ -672,5 +677,3 @@ body.theme-light .sc-deal-high { background: rgba(192, 57, 43, .12); color: var(
 /* Pending select box: the choice applies from the next message. */
 .model-btn.pending { background: var(--pending-bg); border-color: var(--pending); color: var(--pending-text); }
 .model-btn.pending:hover { border-color: var(--pending); }
-.settings-signin { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; min-width: 0; }
-.settings-signin a { overflow-wrap: anywhere; font-size: 13px; }

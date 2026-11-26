@@ -219,9 +219,17 @@ export function extractUrl(raw: string): string | null {
   if (osc) return osc[1];
   return /https:\/\/claude\.ai\/oauth\/authorize\S+/.exec(stripAnsi(raw))?.[0] ?? null;
 }
-export const extractToken = (raw: string): string | null => /sk-ant-[A-Za-z0-9_-]{20,}/.exec(stripAnsi(raw))?.[0] ?? null;
+// A token counts only once the character after it has been printed, so a half-printed one never matches.
+export const extractToken = (raw: string): string | null => /sk-ant-[A-Za-z0-9_-]{20,}(?=[^A-Za-z0-9_-])/.exec(stripAnsi(raw))?.[0] ?? null;
+// The sign-in screen's refusal of a pasted code.
+export const codeRefused = (raw: string): boolean => /OAuth\s*error|Press\s*Enter\s*to\s*retry/i.test(stripAnsi(raw));
+// The first free default name for a newly connected plan: "Plan", "Plan 2", ...
+export function defaultName(home = homedir()): string {
+  const taken = new Set(readPlans(home).map((p) => p.name.toLowerCase()));
+  for (let i = 1; ; i++) { const n = i === 1 ? "Plan" : `Plan ${i}`; if (!taken.has(n.toLowerCase())) return n; }
+}
 
-type Signin = { proc: any; name: string; out: string; wake: (() => void) | null; timer: ReturnType<typeof setTimeout> };
+type Signin = { proc: any; out: string; wake: (() => void) | null; timer: ReturnType<typeof setTimeout> };
 let signin: Signin | null = null;
 
 // Kill the running sign-in child and forget it. Safe to call with none running.
@@ -242,9 +250,8 @@ async function until<T>(s: Signin, check: () => T | null, ms: number): Promise<T
     await new Promise<void>((r) => { s.wake = r; setTimeout(r, 250); });
   }
 }
-// Starts a sign-in for a plan of the given (already checked) name, replacing any running one, and
-// returns the link to open, or null.
-export async function startSignin(name: string, cmd: string[] = ["claude", "setup-token"], cwd = homedir()): Promise<string | null> {
+// Starts a sign-in, replacing any running one, and returns the link to open, or null.
+export async function startSignin(cmd: string[] = ["claude", "setup-token"], cwd = homedir()): Promise<string | null> {
   cancelSignin();
   const env = { ...(process.env as Record<string, string>), TERM: "xterm-256color" };
   delete env.CLAUDE_CODE_OAUTH_TOKEN; delete env.CT_PLAN;
@@ -254,7 +261,7 @@ export async function startSignin(name: string, cmd: string[] = ["claude", "setu
       cwd, env,
       terminal: { cols: 500, rows: 50, data(_t: unknown, d: Uint8Array) { if (signin === s) { s.out = (s.out + new TextDecoder().decode(d)).slice(-64_000); s.wake?.(); } } },
     } as any);
-    s = { proc, name, out: "", wake: null, timer: setTimeout(cancelSignin, SIGNIN_MS) };
+    s = { proc, out: "", wake: null, timer: setTimeout(cancelSignin, SIGNIN_MS) };
   } catch (e) { console.error("[plan] sign-in start failed:", (e as Error).message); return null; }
   signin = s;
   void s.proc.exited.then(() => { if (signin === s) { s.wake?.(); } });
@@ -262,18 +269,18 @@ export async function startSignin(name: string, cmd: string[] = ["claude", "setu
   if (!url) cancelSignin();
   return url;
 }
-// Feeds the pasted code to the running sign-in, waits for the token, checks it and stores it as a
-// new plan under the sign-in's name. Returns the new plan's id, or null.
-export async function finishSignin(code: string, home = homedir(), mirrorDir: string | null = mirrorDirOf()): Promise<string | null> {
+// Feeds the pasted code to the running sign-in, waits for the token or a refusal, checks the token
+// and stores it as a new plan under a default name. Returns the new plan's id, or an error line.
+export async function finishSignin(code: string, home = homedir(), mirrorDir: string | null = mirrorDirOf()): Promise<{ id: string } | { error: string }> {
   const s = signin;
-  if (!s || !/^[A-Za-z0-9_#.~-]{8,300}$/.test(code.trim())) return null;
-  try { s.proc.terminal.write(code.trim() + "\r"); } catch { cancelSignin(); return null; }
-  const first = await until(s, () => extractToken(s.out), 60_000);
-  if (first) await new Promise((r) => setTimeout(r, 500)); // let a token still being printed finish
-  const token = first ? extractToken(s.out) : null;
+  if (!s) return { error: "Sign-in expired. Get a new link" };
+  if (!/^[A-Za-z0-9_#.~-]{8,300}$/.test(code.trim())) return { error: "Code not accepted" };
+  const from = s.out.length;
+  try { s.proc.terminal.write(code.trim() + "\r"); } catch { cancelSignin(); return { error: "Sign-in failed" }; }
+  const got = await until(s, () => extractToken(s.out.slice(from)) ?? (codeRefused(s.out.slice(from)) ? "refused" : null), 60_000);
   cancelSignin();
-  if (!token || !(await validateToken(token))) return null;
-  const r = addPlan(s.name, token, home, mirrorDir);
-  return "id" in r ? r.id : null;
+  if (got === "refused") return { error: "Code not accepted. Get a new link" };
+  if (!got || !(await validateToken(got))) return { error: "Sign-in failed" };
+  return addPlan(defaultName(home), got, home, mirrorDir);
 }
 // #endregion

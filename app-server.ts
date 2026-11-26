@@ -13,7 +13,7 @@ import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-m
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
 import { readRation, rationLine } from "./ration";
-import { addPlan, applyPlanEnv, cancelSignin, checkName, finishSignin, readPlan, readPlans, removePlan, renamePlan, setPlan, signinMode, startSignin, validateToken } from "./plan";
+import { addPlan, applyPlanEnv, cancelSignin, defaultName, finishSignin, readPlan, readPlans, removePlan, renamePlan, setPlan, signinMode, startSignin, validateToken } from "./plan";
 
 applyPlanEnv(); // new Claude children inherit the active plan's token
 import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, onAppSession, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
@@ -510,25 +510,20 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     return err ? planErr(err) : jsonRes(planBody(), ctx, req);
   }
   if (req.method === "POST" && path === "/app/api/plan/signin" && signinMode() === "flow") {
-    let b: any = {}; try { b = await req.json(); } catch {}
-    const n = checkName(b.name);
-    if ("error" in n) return planErr(n.error);
-    const url = await startSignin(n.name);
+    const url = await startSignin();
     return url ? jsonRes({ url }, ctx, req) : planErr("Sign-in failed");
   }
   if (req.method === "POST" && path === "/app/api/plan/signin/code" && signinMode() === "flow") {
     let b: any = {}; try { b = await req.json(); } catch {}
-    const id = typeof b.code === "string" ? await finishSignin(b.code) : null;
-    return id ? jsonRes(planBody(), ctx, req) : planErr("Sign-in failed");
+    const r = typeof b.code === "string" ? await finishSignin(b.code) : { error: "Code not accepted" };
+    return "error" in r ? planErr(r.error) : jsonRes({ ...planBody(), added: r.id }, ctx, req);
   }
   if (req.method === "POST" && path === "/app/api/plan/token") {
     let b: any = {}; try { b = await req.json(); } catch {}
-    const n = checkName(b.name);
-    if ("error" in n) return planErr(n.error);
     const t = typeof b.token === "string" ? b.token.trim() : "";
     if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(t) || !(await validateToken(t))) return planErr("Token rejected");
-    const r = addPlan(n.name, t);
-    return "error" in r ? planErr(r.error) : jsonRes(planBody(), ctx, req);
+    const r = addPlan(defaultName(), t);
+    return "error" in r ? planErr(r.error) : jsonRes({ ...planBody(), added: r.id }, ctx, req);
   }
   const planRoute = /^\/app\/api\/plan\/([a-z0-9]{8})$/.exec(path);
   if (planRoute && req.method === "PATCH") {

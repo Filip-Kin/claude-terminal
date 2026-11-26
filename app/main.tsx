@@ -1018,16 +1018,17 @@ function PlanRow({ plan, busy, onRename, onDisconnect }: { plan: { id: string; l
   );
 }
 
-/** The plans setting: each connected plan (rename, disconnect), and connecting another by sign-in link and code or a pasted token. */
+/** The plans setting: each connected plan (rename, disconnect), and connecting another: sign-in link, then code, then a name. */
 function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: PlanInfo) => void }) {
-  const [name, setName] = useState("");
   const [tok, setTok] = useState("");
   const [code, setCode] = useState("");
   const [link, setLink] = useState<string | null>(null);
+  const [added, setAdded] = useState<string | null>(null); // id of the plan just connected, while it is being named
+  const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   if (!info || !info.signin) return null;
-  const connected = info.plans.filter((p) => p.id !== "shared");
+  const connected = info.plans.filter((p) => p.id !== "shared" && p.id !== added);
   /** Runs one plan request; a body with `error` or a network failure leaves the plans unchanged and shows the message. */
   const run = async (req: () => Promise<any>, ok: (d: any) => void) => {
     setBusy(true); setErr(null);
@@ -1037,29 +1038,69 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
     } catch { setErr(SIGNIN_FAILED); }
     setBusy(false);
   };
-  const adopt = (d: PlanInfo) => { setInfo(d); setName(""); setTok(""); setCode(""); setLink(null); };
-  const nameInput = <input className="settings-select settings-name" value={name} maxLength={40} autoComplete="off" spellCheck={false} disabled={busy || !!link} onChange={(e) => setName(e.target.value)} placeholder="Name" />;
-  let control: React.ReactNode;
-  if (info.signin === "token") {
-    control = (
-      <>
-        <input className="settings-select" type="password" autoComplete="off" spellCheck={false} value={tok} disabled={busy} onChange={(e) => setTok(e.target.value)} placeholder="sk-ant-oat01-…" />
-        <button className="settings-select" disabled={busy || !name.trim() || !tok.trim()} onClick={() => void run(() => api.planPost("/token", { name, token: tok }), adopt)}>Save</button>
-      </>
-    );
-  } else if (link) {
-    control = (
-      <div className="settings-signin">
-        <a href={link} target="_blank" rel="noreferrer">Open sign-in link</a>
-        <input className="settings-select" value={code} autoComplete="off" spellCheck={false} disabled={busy} onChange={(e) => setCode(e.target.value)} placeholder="Code" />
-        <span>
-          <button className="settings-select" disabled={busy || !code.trim()} onClick={() => void run(() => api.planPost("/signin/code", { code: code.trim() }), adopt)}>Submit</button>{" "}
-          <button className="settings-select" disabled={busy} onClick={() => { setLink(null); setCode(""); setErr(null); }}>Cancel</button>
+  const reset = () => { setTok(""); setCode(""); setLink(null); setAdded(null); setName(""); setErr(null); };
+  /** A plan was connected under a default name: show the name step for it. */
+  const connectedNow = (d: PlanInfo & { added: string }) => {
+    setInfo({ plans: d.plans, plan: d.plan, signin: d.signin });
+    setTok(""); setCode(""); setLink(null); setAdded(d.added); setName(d.plans.find((x) => x.id === d.added)?.label || "");
+  };
+  const addedLabel = info.plans.find((x) => x.id === added)?.label;
+  const saveName = () => {
+    const n = name.trim();
+    if (!added || !n || n === addedLabel) { reset(); return; }
+    void run(() => api.planRename(added, n), (d) => { setInfo(d); reset(); });
+  };
+  /** Sends the pasted code. A refusal ends that sign-in on the server, so the steps go back to the start. */
+  const submitCode = () => void run(() => api.planPost("/signin/code", { code: code.trim() }).then((d) => { if (d?.error) { setLink(null); setCode(""); } return d; }), connectedNow);
+  let steps: React.ReactNode;
+  if (added) {
+    steps = (
+      <div className="settings-row">
+        <span className="settings-row-main"><span className="settings-row-title">Name</span><span className="settings-row-desc">Connected</span></span>
+        <span className="settings-ctl">
+          <input className="settings-select" value={name} maxLength={40} autoComplete="off" spellCheck={false} autoFocus disabled={busy} aria-label="Plan name"
+            onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") saveName(); }} />
+          <button className="settings-select" disabled={busy} onClick={saveName}>Save</button>
         </span>
       </div>
     );
+  } else if (info.signin === "token") {
+    steps = (
+      <div className="settings-row">
+        <span className="settings-row-main"><span className="settings-row-title">Token</span></span>
+        <span className="settings-ctl">
+          <input className="settings-select" type="password" autoComplete="off" spellCheck={false} value={tok} disabled={busy} onChange={(e) => setTok(e.target.value)} placeholder="sk-ant-oat01-…" aria-label="Token" />
+          <button className="settings-select" disabled={busy || !tok.trim()} onClick={() => void run(() => api.planPost("/token", { token: tok }), connectedNow)}>{busy ? "Checking" : "Save"}</button>
+        </span>
+      </div>
+    );
+  } else if (!link) {
+    steps = (
+      <div className="settings-row">
+        <span className="settings-row-main"><span className="settings-row-title">Sign in</span><span className="settings-row-desc">Claude subscription</span></span>
+        <button className="settings-select" disabled={busy} onClick={() => void run(() => api.planPost("/signin"), (d) => setLink(d.url))}>{busy ? "Starting" : "Get link"}</button>
+      </div>
+    );
   } else {
-    control = <button className="settings-select" disabled={busy || !name.trim()} onClick={() => void run(() => api.planPost("/signin", { name }), (d) => setLink(d.url))}>Connect</button>;
+    steps = (
+      <>
+        <div className="settings-row">
+          <span className="settings-row-main"><span className="settings-row-title">Sign in</span><span className="settings-row-desc">Opens in a new tab</span></span>
+          <span className="settings-ctl">
+            <a className="settings-select" href={link} target="_blank" rel="noreferrer">Open link</a>
+            <button className="settings-select" disabled={busy} onClick={reset}>Cancel</button>
+          </span>
+        </div>
+        <div className="settings-row">
+          <span className="settings-row-main"><span className="settings-row-title">Code</span></span>
+          <span className="settings-ctl">
+            <input className="settings-select" value={code} autoComplete="off" spellCheck={false} disabled={busy} onChange={(e) => setCode(e.target.value)} aria-label="Code"
+              onKeyDown={(e) => { if (e.key === "Enter" && code.trim()) submitCode(); }} />
+            <button className="settings-select" disabled={busy || !code.trim()} onClick={() => submitCode()}>{busy ? "Checking" : "Submit"}</button>
+          </span>
+        </div>
+      </>
+    );
   }
   return (
     <>
@@ -1070,10 +1111,7 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
           onDisconnect={(id) => void run(() => api.planDisconnect(id), (d) => setInfo(d))} />
       ))}
       <div className="settings-section">Connect a plan</div>
-      <div className="settings-row">
-        {nameInput}
-        {control}
-      </div>
+      {steps}
       {err && <div className="settings-row"><span className="settings-row-desc settings-row-err">{err}</span></div>}
     </>
   );
@@ -3047,7 +3085,7 @@ function App() {
       )}
       {settingsOpen && (
         <div className="modal-scrim" onClick={() => setSettingsOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">Settings<button className="modal-x" onClick={() => setSettingsOpen(false)} aria-label="Close">×</button></div>
             <div className="settings-body">
               <div className="settings-section">Appearance</div>
