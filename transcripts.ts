@@ -123,7 +123,7 @@ export function userTranscripts(cfg: CollectorConfig, user: string): string[] {
 // on the personal subscription the split divides. Guests and the coach container use their own
 // token and are never routed. A transcript does not record its account, so the collector notes the
 // signed-in account each tick (login_periods) and every record is judged by its own timestamp.
-import { HOST_PLAN_DIR, hostPeriods, isOwnAt, type Period } from "./plan.ts";
+import { HOST_PLAN_DIR, hostPeriods, planAt, type Period } from "./plan.ts";
 export const WORK_SUFFIX = "_work";
 export const isWorkUser = (u: string) => u.endsWith(WORK_SUFFIX);
 
@@ -143,7 +143,7 @@ export function recordLogin(cfg: CollectorConfig, db: Db, now = Date.now()): voi
 // user -> the row a record belongs to. Before the first recorded period everything is billed.
 export function accountRouter(cfg: CollectorConfig, db: Db, planDir = HOST_PLAN_DIR): (user: string, file: string, iso: string) => string {
   const base = boxRouter(cfg, db);
-  // A guest on its own plan (plan.ts mirror on the host): from that moment its records are another
+  // A guest on a connected plan (plan.ts mirror on the host): from that moment its records are another
   // plan's tokens, so they land on the unbilled "<user>_work" row and leave the shared sums.
   const cache = new Map<string, Period[]>();
   return (user, file, iso) => {
@@ -154,7 +154,7 @@ export function accountRouter(cfg: CollectorConfig, db: Db, planDir = HOST_PLAN_
     if (!ps.length) return r;
     let t = Date.parse(iso);
     if (!isFinite(t)) t = Date.now();
-    return isOwnAt(ps, t) ? r + WORK_SUFFIX : r;
+    return planAt(ps, t) !== "shared" ? r + WORK_SUFFIX : r;
   };
 }
 

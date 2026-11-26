@@ -525,6 +525,7 @@ body.theme-light .md pre { background: #f3eee7; }
 }
 
 /* Settings: an error under a toggle (e.g. notifications blocked in browser settings) */
+.settings-name { flex: 1; max-width: none; min-width: 0; }
 .settings-row-err { color: var(--err, #ef4444); }
 /* A toggle mid-request (subscribing can take a moment on a weak link) */
 .toggle.busy { opacity: .6; pointer-events: none; }

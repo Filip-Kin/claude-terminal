@@ -7,7 +7,7 @@
 // transcripts itself. HOME-relative for the per-instance terminal bits (tab-registry, settings,
 // tmux), so the same binary runs for the host owner and inside each guest container.
 import { isWorkUser, WORK_SUFFIX } from "./transcripts.ts";
-import { hostPlan, setHostUser } from "./plan.ts";
+import { hostMirror, planAt, setHostUser, type Mirror } from "./plan.ts";
 import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -124,6 +124,21 @@ function sparkSeries(hours: Map<string, any>, now: Date, n: number): number[] {
     vals.push(b ? b.output || 0 : 0);
   }
   return vals;
+}
+// Each hour's unbilled output attributed to the plan the mirror's periods say was selected at that
+// hour's start: one series per plan with output in the window, in the order first used.
+function sparkPlans(ownHours: Map<string, any>, now: Date, n: number, mirror: Mirror): { id: string; name: string; data: number[] }[] {
+  const out = new Map<string, number[]>();
+  for (let i = 0; i < n; i++) {
+    const at = new Date(now.getTime() - (n - 1 - i) * 3600e3);
+    const output = ownHours.get(hourKeyOf(at))?.output || 0;
+    const plan = planAt(mirror.periods, Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate(), at.getUTCHours()));
+    if (!output || plan === "shared") continue;
+    let data = out.get(plan);
+    if (!data) out.set(plan, (data = new Array(n).fill(0)));
+    data[i] += output;
+  }
+  return [...out].map(([id, data]) => ({ id, name: mirror.plans.find((p) => p.id === id)?.name ?? "Removed plan", data }));
 }
 function splitCents(amounts: Record<string, number>, pot: number): Record<string, number> {
   const total = Object.values(amounts).reduce((a, b) => a + b, 0);
@@ -298,7 +313,7 @@ function buildLeaderboard() {
   const hide = new Set<string>(cfg.leaderboardHide || []);
   for (const user of bases) {
     const hours = new Map<string, any>();
-    const ownHours = new Map<string, any>(); // the unbilled own-plan row's hours alone
+    const ownHours = new Map<string, any>(); // the unbilled connected-plan row's hours alone
     let outTotal = 0, tokTotal = 0, sessions = 0, last: string | null = null, monthOutput = 0, monthWeighted = 0;
     const models = new Set<string>();
     for (const row of [user, user + WORK_SUFFIX]) {
@@ -325,13 +340,14 @@ function buildLeaderboard() {
     let active = false;
     if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
     if (hide.has(user)) continue;
+    const mirror = hostMirror(user), plan = planAt(mirror.periods, now.getTime());
     users.push({
       user,
       name: cfg.names?.[user] || titleCase(user),
       host: (cfg.hosts || []).includes(user),
       billed: present.has(user),
-      plan: hostPlan(user),
-      tag: hostPlan(user) === "own" ? "Own plan" : null,
+      plan,
+      tag: plan === "shared" ? null : mirror.plans.find((p) => p.id === plan)?.name ?? "Removed plan",
       output_5h: rolling(hours, "output", now),
       output_total: outTotal,
       tokens_total: tokTotal,
@@ -340,7 +356,7 @@ function buildLeaderboard() {
       last_used: last,
       active,
       spark: sparkSeries(hours, now, SPARK_HOURS),
-      spark_own: sparkSeries(ownHours, now, SPARK_HOURS),
+      spark_plans: sparkPlans(ownHours, now, SPARK_HOURS, mirror),
       hourly: sparkSeries(hours, now, HOURLY_HOURS),
       month_output: monthOutput,
       month_weighted: Math.round(monthWeighted),

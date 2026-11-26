@@ -289,7 +289,9 @@ const api = {
   plan: () => withTimeout(fetch("/app/api/plan").then(J)),
   planPost: (path: string, body?: object) =>
     fetch("/app/api/plan" + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) }).then(J),
-  planDisconnect: () => fetch("/app/api/plan/own", { method: "DELETE" }).then(J),
+  planRename: (id: string, name: string) =>
+    fetch("/app/api/plan/" + id, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) }).then(J),
+  planDisconnect: (id: string) => fetch("/app/api/plan/" + id, { method: "DELETE" }).then(J),
   statuses: () => withTimeout(fetch("/app/api/statuses").then(J)),
   search: (q: string) => withTimeout(fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J)),
   answerAsk: (id: string, askId: string, answer: string) =>
@@ -1002,16 +1004,31 @@ const PENDING_TIP = "Applies from your next message";
 type PlanInfo = { plans: { id: string; label: string }[]; plan: string; signin?: "flow" | "token" };
 const SIGNIN_FAILED = "Sign-in failed";
 
-/** The plan setting: connect an own plan (link and code, or a pasted token) and disconnect it again. */
+/** One connected plan: its name, editable in place (saved on Enter or leaving the field), and Disconnect. */
+function PlanRow({ plan, busy, onRename, onDisconnect }: { plan: { id: string; label: string }; busy: boolean; onRename: (id: string, name: string) => void; onDisconnect: (id: string) => void }) {
+  const [draft, setDraft] = useState(plan.label);
+  useEffect(() => setDraft(plan.label), [plan.label]);
+  const save = () => { const n = draft.trim(); if (n && n !== plan.label) onRename(plan.id, n); else setDraft(plan.label); };
+  return (
+    <div className="settings-row">
+      <input className="settings-select settings-name" value={draft} maxLength={40} autoComplete="off" spellCheck={false} disabled={busy} aria-label="Plan name"
+        onChange={(e) => setDraft(e.target.value)} onBlur={save} onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }} />
+      <button className="settings-select" disabled={busy} onClick={() => onDisconnect(plan.id)}>Disconnect</button>
+    </div>
+  );
+}
+
+/** The plans setting: each connected plan (rename, disconnect), and connecting another by sign-in link and code or a pasted token. */
 function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: PlanInfo) => void }) {
+  const [name, setName] = useState("");
   const [tok, setTok] = useState("");
   const [code, setCode] = useState("");
   const [link, setLink] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   if (!info || !info.signin) return null;
-  const connected = info.plans.some((p) => p.id === "own");
-  /** Runs one plan request; a body with `error` or a network failure leaves the plan unchanged and shows the message. */
+  const connected = info.plans.filter((p) => p.id !== "shared");
+  /** Runs one plan request; a body with `error` or a network failure leaves the plans unchanged and shows the message. */
   const run = async (req: () => Promise<any>, ok: (d: any) => void) => {
     setBusy(true); setErr(null);
     try {
@@ -1020,16 +1037,14 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
     } catch { setErr(SIGNIN_FAILED); }
     setBusy(false);
   };
-  const adopt = (d: PlanInfo) => { setInfo(d); setTok(""); setCode(""); setLink(null); };
-  const title = "Connect your plan";
+  const adopt = (d: PlanInfo) => { setInfo(d); setName(""); setTok(""); setCode(""); setLink(null); };
+  const nameInput = <input className="settings-select settings-name" value={name} maxLength={40} autoComplete="off" spellCheck={false} disabled={busy || !!link} onChange={(e) => setName(e.target.value)} placeholder="Name" />;
   let control: React.ReactNode;
-  if (connected) {
-    control = <button className="settings-select" disabled={busy} onClick={() => void run(() => api.planDisconnect(), adopt)}>Disconnect</button>;
-  } else if (info.signin === "token") {
+  if (info.signin === "token") {
     control = (
       <>
         <input className="settings-select" type="password" autoComplete="off" spellCheck={false} value={tok} disabled={busy} onChange={(e) => setTok(e.target.value)} placeholder="sk-ant-oat01-…" />
-        <button className="settings-select" disabled={busy || !tok.trim()} onClick={() => void run(() => api.planPost("/token", { token: tok }), adopt)}>Save</button>
+        <button className="settings-select" disabled={busy || !name.trim() || !tok.trim()} onClick={() => void run(() => api.planPost("/token", { name, token: tok }), adopt)}>Save</button>
       </>
     );
   } else if (link) {
@@ -1044,19 +1059,22 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
       </div>
     );
   } else {
-    control = <button className="settings-select" disabled={busy} onClick={() => void run(() => api.planPost("/signin"), (d) => setLink(d.url))}>Connect</button>;
+    control = <button className="settings-select" disabled={busy || !name.trim()} onClick={() => void run(() => api.planPost("/signin", { name }), (d) => setLink(d.url))}>Connect</button>;
   }
   return (
     <>
-      <div className="settings-section">Plan</div>
+      {connected.length > 0 && <div className="settings-section">Plans</div>}
+      {connected.map((p) => (
+        <PlanRow key={p.id} plan={p} busy={busy}
+          onRename={(id, n) => void run(() => api.planRename(id, n), (d) => setInfo(d))}
+          onDisconnect={(id) => void run(() => api.planDisconnect(id), (d) => setInfo(d))} />
+      ))}
+      <div className="settings-section">Connect a plan</div>
       <div className="settings-row">
-        <span className="settings-row-main">
-          <span className="settings-row-title">{info.signin === "token" && !connected ? "Own plan token" : title}</span>
-          {connected && <span className="settings-row-desc">Connected</span>}
-          {err && <span className="settings-row-desc settings-row-err">{err}</span>}
-        </span>
+        {nameInput}
         {control}
       </div>
+      {err && <div className="settings-row"><span className="settings-row-desc settings-row-err">{err}</span></div>}
     </>
   );
 }
@@ -1066,13 +1084,13 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
 type RationTrack = { active: boolean; spent: boolean; used: number; allowance: number; remaining: number; nextAtLabel: string | null };
 type RationState = { tracks?: { weekly: RationTrack | null; fable: RationTrack | null } };
 
-/** One ration progress bar: filled part is used / allowance; an own plan shows its label with no fill. */
-function RationTrackBar({ track, name, own }: { track: RationTrack; name: string; own: boolean }) {
+/** One ration progress bar: filled part is used / allowance; a connected plan shows its name with no fill. */
+function RationTrackBar({ track, name, own }: { track: RationTrack; name: string; own: string | null }) {
   const spent = !own && track.spent;
-  const frac = own || !track.allowance ? 0 : Math.min(1, Math.max(0, track.used / track.allowance));
-  const label = own ? "Own plan" : (spent ? `${name} spent` : `${name} ${track.remaining.toFixed(2)}% left`) + (track.nextAtLabel ? ` · next at ${track.nextAtLabel}` : "");
+  const frac = own !== null || !track.allowance ? 0 : Math.min(1, Math.max(0, track.used / track.allowance));
+  const label = own !== null ? own : (spent ? `${name} spent` : `${name} ${track.remaining.toFixed(2)}% left`) + (track.nextAtLabel ? ` · next at ${track.nextAtLabel}` : "");
   return (
-    <div className={"ration-bar" + (spent ? " spent" : "") + (own ? " own" : "")} role="progressbar" aria-label={name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(frac * 100)}>
+    <div className={"ration-bar" + (spent ? " spent" : "") + (own !== null ? " own" : "")} role="progressbar" aria-label={name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(frac * 100)}>
       <div className="ration-fill" style={{ width: `${spent ? 100 : frac * 100}%` }} />
       <span className="ration-label">{label}</span>
     </div>
@@ -1080,7 +1098,7 @@ function RationTrackBar({ track, name, own }: { track: RationTrack; name: string
 }
 
 /** The weekly bar, plus the Fable bar while a Fable model is selected and the Fable ration is the tighter one. */
-function RationBar({ fableSelected, own }: { fableSelected: boolean; own: boolean }) {
+function RationBar({ fableSelected, own }: { fableSelected: boolean; own: string | null }) {
   const [s, setS] = useState<RationState | null>(null);
   useEffect(() => {
     // A failed poll keeps the last good state; only an explicit empty answer clears it.
@@ -1091,12 +1109,12 @@ function RationBar({ fableSelected, own }: { fableSelected: boolean; own: boolea
   }, []);
   const weekly = s?.tracks?.weekly?.active ? s.tracks.weekly : null;
   const fable = s?.tracks?.fable?.active ? s.tracks.fable : null;
-  const showFable = !own && fableSelected && !!fable && (!weekly || weekly.remaining > fable.remaining);
+  const showFable = own === null && fableSelected && !!fable && (!weekly || weekly.remaining > fable.remaining);
   if (!weekly && !showFable) return null;
   return (
     <div className="ration-bars">
       {weekly && <RationTrackBar track={weekly} name="Ration" own={own} />}
-      {showFable && <RationTrackBar track={fable!} name="Fable ration" own={false} />}
+      {showFable && <RationTrackBar track={fable!} name="Fable ration" own={null} />}
     </div>
   );
 }
@@ -1565,7 +1583,8 @@ function App() {
   const modelPending = isRealConv && !!activeStore!.runModel && canonicalModelId(activeStore!.runModel!, [...models, ...moreModels]) !== model;
   const planPending = isRealConv && !!activeStore!.runPlan && !!planInfo && activeStore!.runPlan !== planInfo.plan;
   const fableSelected = /fable/i.test(rawModel) || /fable/i.test(model);
-  const ownPlanNow = ((isRealConv && activeStore!.runPlan) || planInfo?.plan) === "own";
+  const activePlan = (isRealConv && activeStore!.runPlan) || planInfo?.plan || "shared";
+  const ownPlanLabel = activePlan === "shared" ? null : planInfo?.plans.find((p) => p.id === activePlan)?.label ?? "Plan";
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const editChipsRef = useRef(false); // the composer chips came from an edited turn (cleared on chat switch)
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
@@ -3172,7 +3191,7 @@ function App() {
       </aside>
 
       <main className="main">
-        <RationBar fableSelected={fableSelected} own={ownPlanNow} />
+        <RationBar fableSelected={fableSelected} own={ownPlanLabel} />
         <div className="topbar">
           <button className="icon-btn" onClick={() => setDrawer((d) => !d)} aria-label="Menu">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>

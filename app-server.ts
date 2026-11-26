@@ -13,7 +13,7 @@ import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-m
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
 import { readRation, rationLine } from "./ration";
-import { applyPlanEnv, cancelSignin, finishSignin, ownToken, readPlan, removeToken, setPlan, signinMode, startSignin, validateToken, writeToken, type Plan } from "./plan";
+import { addPlan, applyPlanEnv, cancelSignin, checkName, finishSignin, readPlan, readPlans, removePlan, renamePlan, setPlan, signinMode, startSignin, validateToken } from "./plan";
 
 applyPlanEnv(); // new Claude children inherit the active plan's token
 import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, onAppSession, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
@@ -464,7 +464,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   if (path !== "/app" && !path.startsWith("/app/")) return null;
 
   // CORS preflight
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...ctx.cors(req), "Access-Control-Allow-Methods": "GET,POST,OPTIONS", "Access-Control-Allow-Headers": "Content-Type" } });
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...ctx.cors(req), "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type" } });
 
   // Everything below requires the owner.
   if (!ctx.allowed(req)) return new Response("Forbidden", { status: 403, headers: ctx.cors(req) });
@@ -496,43 +496,50 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   // --- API ---
-  // Plan: shared (the injected or logged-in token) or own (the person's own token). One per person.
+  // Plans: Shared (the injected or logged-in token) plus any number of connected plans, one selected per person.
   const planBody = () => ({
-    plans: [{ id: "shared", label: "Shared" }, ...(ownToken() ? [{ id: "own", label: "Own" }] : [])],
+    plans: [{ id: "shared", label: "Shared" }, ...readPlans().map((p) => ({ id: p.id, label: p.name }))],
     plan: readPlan(), signin: signinMode(),
   });
+  const planErr = (error: string) => jsonRes({ error }, ctx, req, 400);
   if (req.method === "GET" && path === "/app/api/plan") return jsonRes(planBody(), ctx, req);
   if (req.method === "POST" && path === "/app/api/plan") {
     let b: any = {}; try { b = await req.json(); } catch {}
-    if (b.plan !== "shared" && b.plan !== "own") return jsonRes({ error: "Bad plan" }, ctx, req, 400);
-    const err = setPlan(b.plan as Plan);
-    if (err) return jsonRes({ error: err }, ctx, req, 400);
-    return jsonRes(planBody(), ctx, req);
+    if (typeof b.plan !== "string") return planErr("Bad plan");
+    const err = setPlan(b.plan);
+    return err ? planErr(err) : jsonRes(planBody(), ctx, req);
   }
   if (req.method === "POST" && path === "/app/api/plan/signin" && signinMode() === "flow") {
-    const url = await startSignin();
-    return url ? jsonRes({ url }, ctx, req) : jsonRes({ error: "Sign-in failed" }, ctx, req, 400);
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const n = checkName(b.name);
+    if ("error" in n) return planErr(n.error);
+    const url = await startSignin(n.name);
+    return url ? jsonRes({ url }, ctx, req) : planErr("Sign-in failed");
   }
   if (req.method === "POST" && path === "/app/api/plan/signin/code" && signinMode() === "flow") {
     let b: any = {}; try { b = await req.json(); } catch {}
-    const ok = typeof b.code === "string" && (await finishSignin(b.code));
-    if (!ok) return jsonRes({ error: "Sign-in failed" }, ctx, req, 400);
-    applyPlanEnv();
-    return jsonRes(planBody(), ctx, req);
+    const id = typeof b.code === "string" ? await finishSignin(b.code) : null;
+    return id ? jsonRes(planBody(), ctx, req) : planErr("Sign-in failed");
   }
   if (req.method === "POST" && path === "/app/api/plan/token") {
     let b: any = {}; try { b = await req.json(); } catch {}
+    const n = checkName(b.name);
+    if ("error" in n) return planErr(n.error);
     const t = typeof b.token === "string" ? b.token.trim() : "";
-    if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(t) || !(await validateToken(t))) return jsonRes({ error: "Token rejected" }, ctx, req, 400);
-    writeToken(t); applyPlanEnv();
-    return jsonRes(planBody(), ctx, req);
+    if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(t) || !(await validateToken(t))) return planErr("Token rejected");
+    const r = addPlan(n.name, t);
+    return "error" in r ? planErr(r.error) : jsonRes(planBody(), ctx, req);
   }
-  if (req.method === "DELETE" && path === "/app/api/plan/own") {
+  const planRoute = /^\/app\/api\/plan\/([a-z0-9]{8})$/.exec(path);
+  if (planRoute && req.method === "PATCH") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const err = renamePlan(planRoute[1], b.name);
+    return err ? planErr(err) : jsonRes(planBody(), ctx, req);
+  }
+  if (planRoute && req.method === "DELETE") {
     cancelSignin();
-    const err = setPlan("shared");
-    if (err) return jsonRes({ error: err }, ctx, req, 400);
-    removeToken();
-    return jsonRes(planBody(), ctx, req);
+    const err = removePlan(planRoute[1]);
+    return err ? planErr(err) : jsonRes(planBody(), ctx, req);
   }
   if (req.method === "GET" && path === "/app/api/models") {
     // Quick-picks come from the CLI's live supported-models probe (falls back to config if it fails).
@@ -1072,8 +1079,8 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!conv) return jsonRes({ error: "no live conversation for id (start or resume it first)" }, ctx, req, 409);
     const rawText = String(b.text ?? "").trim();
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
-    // Own plan never draws on the shared ration. Shared: the weekly track, and the Fable track for a Fable model.
-    const tracks = readPlan() === "own" ? null : readRation()?.tracks;
+    // A connected plan never draws on the shared ration. Shared: the weekly track, and the Fable track for a Fable model.
+    const tracks = readPlan() !== "shared" ? null : readRation()?.tracks;
     if (tracks?.weekly?.active && tracks.weekly.spent) return jsonRes({ error: rationLine(tracks.weekly) }, ctx, req, 429);
     if (/fable/i.test(conv.model ?? "") && tracks?.fable?.active && tracks.fable.spent) return jsonRes({ error: rationLine(tracks.fable, "Fable ration") }, ctx, req, 429);
     if (dedupSeen(b.cid)) { tlog("dedup", { route: "send", conv: conv.id, cid: shortCid(b.cid) }); return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); } // redelivery -> ack, don't re-send

@@ -16,7 +16,7 @@ import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
 import { classifyUserRow, noticeText, type RowState } from "./user-rows.ts";
 import { sessionHolders, heldMessage } from "./session-lock.ts";
-import { readPlan, setPlan, type Plan } from "./plan.ts";
+import { planName, readPlan, setPlan, type PlanId } from "./plan.ts";
 import { mergeStatus, spawnQueryOpts, type LiveStatus } from "./app-sessions.ts";
 
 // Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
@@ -45,7 +45,7 @@ function compactMeta(o: any): { trigger: "manual" | "auto"; preTokens?: number; 
 
 // #region normalized events (one shape for live SDK output AND replayed .jsonl history)
 export type AppEvent =
-  | { t: "init"; sessionId: string; model: string; cwd: string; plan?: Plan }
+  | { t: "init"; sessionId: string; model: string; cwd: string; plan?: PlanId }
   | { t: "text"; text: string; bid?: string }
   | { t: "text_delta"; text: string; bid?: string } // streamed token (includePartialMessages)
   | { t: "thinking"; text: string; bid?: string }
@@ -92,7 +92,7 @@ export type AppEvent =
   | { t: "context"; used: number; max?: number }
   // The model this conversation runs on: at init, and whenever it is switched.
   | { t: "model"; model: string }  // a turn started on this model
-  | { t: "plan"; plan: Plan }      // a turn started on this plan
+  | { t: "plan"; plan: PlanId }      // a turn started on this plan
   // A background subagent finished. Its Task tool_result was only a launch ack, so without this the
   // card said "Running" forever after the work was done.
   | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string };
@@ -645,7 +645,7 @@ export class Conversation {
   private forkNext = false;     // one-shot: the next run() should fork the session (edit-and-rerun)
   private runGen = 0;           // bumped per run() so a superseded run's finally stays quiet
   private inited = false;       // an init event has been seen (the SDK session is live)
-  plan: Plan = readPlan();        // the plan the live process runs on (its token is fixed at spawn)
+  plan: PlanId = readPlan();        // the plan the live process runs on (its token is fixed at spawn)
   private runModel?: string;      // the model the live query runs on; a pick waits in pendingModel
   turnModel?: string;             // the model the last turn started on
   private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
@@ -936,11 +936,12 @@ export class Conversation {
     catch (e: any) { tlog("setmodel-defer", { conv: this.id, msg: String(e?.message || e).slice(0, 80) }); }
   }
 
-  // The own token stopped working: go back to the shared plan and say so. The next message restarts
-  // this conversation under the shared token.
+  // The selected plan's token stopped working: go back to the shared plan and say so. The next
+  // message restarts this conversation under the shared token.
   private ownPlanExpired() {
+    const name = planName(this.plan) ?? "Plan";
     setPlan("shared");
-    this.emit({ t: "error", message: "Own plan sign-in expired. Switched to Shared" });
+    this.emit({ t: "error", message: `${name} sign-in expired. Switched to Shared` });
     this.setPhase("idle");
   }
 
@@ -1389,7 +1390,7 @@ export class Conversation {
         // sentence instead of the notice. Arm from the message's own clock time.
         if (anyM.message?.model === "<synthetic>") {
           const t = textOfContent(anyM.message?.content);
-          if (this.plan === "own" && (anyM.error === "authentication_failed" || OWN_AUTH_RE.test(t))) {
+          if (this.plan !== "shared" && (anyM.error === "authentication_failed" || OWN_AUTH_RE.test(t))) {
             this.ownPlanExpired();
             break;
           }

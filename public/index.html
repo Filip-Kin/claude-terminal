@@ -9,13 +9,13 @@
   :root {
     --bg:#f4f5f7; --card:#ffffff; --ink:#14161b; --muted:#697086;
     --line:#e7e9ee; --track:#edeef2; --shadow:0 1px 3px rgba(20,22,27,.06),0 8px 24px rgba(20,22,27,.05);
-    --grad-a:#6366f1; --grad-b:#8b5cf6; --own-spark:#0d9488;
+    --grad-a:#6366f1; --grad-b:#8b5cf6; --plan-1:#0d9488; --plan-2:#d97706; --plan-3:#db2777; --plan-4:#0284c7;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg:#0c0e13; --card:#151821; --ink:#eceef3; --muted:#8b93a7;
       --line:#232734; --track:#1e222c; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
-      --grad-a:#818cf8; --grad-b:#a78bfa; --own-spark:#2dd4bf;
+      --grad-a:#818cf8; --grad-b:#a78bfa; --plan-1:#2dd4bf; --plan-2:#fbbf24; --plan-3:#f472b6; --plan-4:#38bdf8;
     }
   }
   * { box-sizing:border-box; }
@@ -205,6 +205,7 @@
 const COLORS = { filip:"#3b82f6", ian:"#f59e0b", kate:"#10b981", michel:"#ec4899" };
 const POOL = ["#8b5cf6","#ef4444","#14b8a6","#eab308","#06b6d4","#f97316","#a855f7","#84cc16"];
 function hashIdx(s, n){ let h=0; for(let i=0;i<s.length;i++) h=(h*31 + s.charCodeAt(i))>>>0; return h % n; }
+const esc = t => String(t).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const colorFor = u => COLORS[u] || POOL[hashIdx(u, POOL.length)];
 
 const fmt = n => n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
@@ -228,12 +229,13 @@ function countUp(el, to){
 }
 
 // [timestamp, value] pairs for a user's 48h sparkline from the shared hour axis.
-// Two stacked series: shared (total minus own plan) and own plan. A server without spark_own is all shared.
-const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); const own=u.spark_own||[];
-  const pair = f => u.spark.map((y,j)=>[ms[j], f(y, own[j]||0)]);
-  const shared={ name:"Shared", data:pair((y,o)=>Math.max(0,y-o)) };
-  // A person with no own-plan output gets the shared series alone.
-  return own.some(o=>o>0) ? [shared, { name:"Own plan", data:pair((y,o)=>o) }] : [shared]; };
+// Stacked series: Shared (total minus every plan's output, clamped at 0) then one per connected plan
+// in spark_plans. A person with no plan output gets the Shared series alone.
+const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); const plans=u.spark_plans||[];
+  const pair = f => u.spark.map((y,j)=>[ms[j], f(y, j)]);
+  const planSum = j => plans.reduce((a,p)=>a+(p.data[j]||0), 0);
+  return [{ name:"Shared", data:pair((y,j)=>Math.max(0,y-planSum(j))) },
+    ...plans.map(p=>({ name:esc(p.name), data:pair((y,j)=>p.data[j]||0) }))]; };
 
 function sparkOpts(user, data){
   const c = colorFor(user);
@@ -244,7 +246,7 @@ function sparkOpts(user, data){
     chart:{ type:"area", height:46, stacked:true, sparkline:{enabled:true}, animations:{enabled:false} },
     stroke:{ curve:"smooth", width:2 },
     fill:{ type:"gradient", gradient:{ shadeIntensity:1, opacityFrom:.45, opacityTo:0, stops:[0,100] } },
-    colors:[c, getComputedStyle(document.body).getPropertyValue("--own-spark").trim()],
+    colors:data.map((_,k)=>k===0 ? c : getComputedStyle(document.body).getPropertyValue("--plan-"+((k-1)%4+1)).trim()),
     series:data,
     xaxis:{ type:"datetime" },
     markers:{ size:0, hover:{size:4} },
@@ -344,7 +346,7 @@ function renderSplit(d, key){
     + `A rough gauge of the value each person got.`;
 }
 
-let DATA=null, mainChart=null, monthlyChart=null; const sparks={}; let lastSig="";
+let DATA=null, mainChart=null, monthlyChart=null; const sparks={}, sparkN={}; let lastSig="";
 const sig = d => d.users.map(u=>u.user).join(",")+"|"+d.months.map(m=>m.key).join(",");
 
 // Create each chart once, then update in place. Destroying + re-rendering on every poll/stream
@@ -389,7 +391,7 @@ function build(d){
         <span class="name">${u.name}</span>
         ${u.external ? `<span class="badge external">external</span>`
           : u.host ? '<span class="badge host">host</span>' : '<span class="badge">sandbox</span>'}
-        ${u.tag ? `<span class="badge">${u.tag}</span>` : ""}${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
+        ${u.tag ? `<span class="badge">${esc(u.tag)}</span>` : ""}${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>
       <div class="spark" id="spark-${u.user}"></div>
       <div class="big"><b class="num" id="mo-${u.user}">0</b><span>weighted output this month</span></div>
@@ -402,10 +404,11 @@ function build(d){
       </div>`;
     cards.appendChild(el);
   });
-  Object.values(sparks).forEach(s=>s.destroy()); for(const k in sparks) delete sparks[k];
+  Object.values(sparks).forEach(s=>s.destroy()); for(const k in sparks) { delete sparks[k]; delete sparkN[k]; }
   d.users.forEach(u => {
-    const s = new ApexCharts(document.getElementById("spark-"+u.user), sparkOpts(u.user, sparkData(d,u)));
-    s.render(); sparks[u.user]=s;
+    const data = sparkData(d,u);
+    const s = new ApexCharts(document.getElementById("spark-"+u.user), sparkOpts(u.user, data));
+    s.render(); sparks[u.user]=s; sparkN[u.user]=data.length;
     countUp(document.getElementById("mo-"+u.user), u.month_weighted ?? u.month_output);
     countUp(document.getElementById("fivh-"+u.user), u.output_5h);
     countUp(document.getElementById("tot-"+u.user), u.output_total);
@@ -446,7 +449,12 @@ function refresh(d){
   // entrance animation still runs in build().
   if(onChart){ pendingData = d; return; }   // don't redraw a chart the cursor is hovering — see note above
   d.users.forEach(u => {
-    if(sparks[u.user]) sparks[u.user].updateSeries(sparkData(d,u), false);
+    const data = sparkData(d,u);
+    if(sparks[u.user] && sparkN[u.user] !== data.length){ // series count changed: colours and stacking need a fresh chart
+      sparks[u.user].destroy();
+      sparks[u.user] = new ApexCharts(document.getElementById("spark-"+u.user), sparkOpts(u.user, data));
+      sparks[u.user].render(); sparkN[u.user] = data.length;
+    } else if(sparks[u.user]) sparks[u.user].updateSeries(data, false);
     const vals = { mo:u.month_weighted ?? u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total }; // weighted, to match the card label + ranking
     for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
   });
