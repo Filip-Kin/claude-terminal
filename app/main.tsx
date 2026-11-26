@@ -1043,7 +1043,7 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
   /** A plan was connected under a default name: show the name step for it. */
   const connectedNow = (d: PlanInfo & { added: string }) => {
     setInfo({ plans: d.plans, plan: d.plan, signin: d.signin });
-    setTok(""); setCode(""); setLink(null); setAdded(d.added); setName(d.plans.find((x) => x.id === d.added)?.label || "");
+    setTok(""); setCode(""); setLink(null); setAdded(d.added); setName("");
   };
   const addedLabel = info.plans.find((x) => x.id === added)?.label;
   const saveName = () => {
@@ -1067,7 +1067,7 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
       <div className="settings-row">
         <span className="settings-row-main"><span className="settings-row-title">Name</span><span className="settings-row-desc">Connected</span></span>
         <span className="settings-ctl">
-          <input className="settings-select" value={name} maxLength={40} autoComplete="off" spellCheck={false} autoFocus disabled={busy} aria-label="Plan name"
+          <input className="settings-select" value={name} maxLength={40} autoComplete="off" spellCheck={false} autoFocus disabled={busy} aria-label="Plan name" placeholder={addedLabel}
             onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") saveName(); }} />
           <button className="settings-select" disabled={busy} onClick={saveName}>Save</button>
         </span>
