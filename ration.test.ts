@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
-import { computeState, computeTrack, floorToGrid, latestReading, measureTokensPerPct, migrateActivations, nextActivation, plannedPct, type Activation, type Sample } from "./ration.ts";
+import { computeState, computeTrack, floorToGrid, lastTickMs, latestReading, measureTokensPerPct, migrateActivations, nextActivation, plannedPct, type Activation, type Sample } from "./ration.ts";
 
 const RESET = "2026-11-30T07:00:00Z";
 const T = (iso: string) => Date.parse(iso);
@@ -137,3 +137,12 @@ test("end to end: weekly turns on from shared tokens, _work excluded, Fable coun
   expect(state.tracks.fable).toMatchObject({ active: false, util: 20, planned: 50, ahead: -30, tokensPerPct: null });
 });
 // #endregion
+
+test("tokens since the last whole-percent tick are added on top of the percent figure", () => {
+  const act = { start: "2026-11-25T21:00:00-05:00", startUtil: 60, resetAt: "2026-11-30T07:00:00Z" };
+  const at = Date.parse(act.start) + 3600_000;
+  expect(computeTrack(act, { util: 61, resetAt: act.resetAt }, 500, 1000, at, 400).used).toBe(1.4);
+  expect(computeTrack(act, { util: 61, resetAt: act.resetAt }, 2000, 1000, at, 400).used).toBe(2);
+  expect(lastTickMs([{ ts: 1, util: 5, w: 0 }, { ts: 2, util: 5, w: 1 }, { ts: 3, util: 6, w: 2 }, { ts: 4, util: 6, w: 3 }])).toBe(3);
+  expect(lastTickMs([{ ts: 1, util: 5, w: 0 }])).toBeNull();
+});

@@ -81,6 +81,11 @@ export function measureTokensPerPct(samples: Sample[]): number | null {
   }
   return steps.length ? Math.round(median(steps)) : null;
 }
+/** Time of the latest sample whose utilization differs from the sample before it, or null. */
+export function lastTickMs(samples: Sample[]): number | null {
+  for (let i = samples.length - 1; i > 0; i--) if (samples[i].util !== samples[i - 1].util) return samples[i].ts;
+  return null;
+}
 // #endregion
 
 // #region database reads
@@ -187,7 +192,7 @@ export function offTrack(r: Reading | null, nowMs: number, tokensPerPct: number 
  * Allowance: (100 - startUtil) split over the 6 h periods from start to resetAt - 12 h, one share
  * added at the start of each period.
  */
-export function computeTrack(act: Activation | undefined, r: Reading | null, tokensSinceStart: number, tokensPerPct: number | null, nowMs: number): Track {
+export function computeTrack(act: Activation | undefined, r: Reading | null, tokensSinceStart: number, tokensPerPct: number | null, nowMs: number, tokensSinceTick = 0): Track {
   const base = offTrack(r, nowMs, tokensPerPct);
   if (!act || !r) return base;
   const startMs = Date.parse(act.start);
@@ -195,7 +200,8 @@ export function computeTrack(act: Activation | undefined, r: Reading | null, tok
   const periods = Math.min(nPeriods, Math.max(1, Math.floor((nowMs - startMs) / PERIOD_MS) + 1));
   const allowance = r2((Math.max(0, 100 - act.startUtil) / nPeriods) * periods);
   const pct = r.util - act.startUtil;
-  const used = r2(tokensPerPct ? Math.max(tokensSinceStart / tokensPerPct, pct) : pct);
+  // The whole-percent figure is exact at its last tick; tokens since that tick are added on top.
+  const used = r2(tokensPerPct ? Math.max(tokensSinceStart / tokensPerPct, pct + tokensSinceTick / tokensPerPct) : pct);
   const remaining = r2(allowance - used);
   const next = periods < nPeriods ? new Date(startMs + periods * PERIOD_MS) : null;
   return { ...base, active: true, spent: remaining <= 0, used, allowance, remaining, nextAt: next?.toISOString() ?? null, nextAtLabel: next ? hhmmDetroit(next) : null };
@@ -209,8 +215,12 @@ export function computeState(db: Db, prev: Activations, cfg: LegacyRationCfg | u
     const samples = loadSamples(db, nowMs - SAMPLE_LOOKBACK_MS, modelWeights, name);
     const act = nextActivation(activations[name], r, nowMs, samples);
     if (act) activations[name] = act; else delete activations[name];
-    const tokens = act ? sharedWeightedSince(db, Date.parse(act.start), modelWeights, name) : 0;
-    return computeTrack(act, r, tokens, measureTokensPerPct(samples), nowMs);
+    if (!act) return computeTrack(act, r, 0, measureTokensPerPct(samples), nowMs);
+    const startMs = Date.parse(act.start);
+    const tokens = sharedWeightedSince(db, startMs, modelWeights, name);
+    const tickMs = Math.max(startMs, lastTickMs(samples) ?? startMs);
+    const sinceTick = tickMs === startMs ? tokens : sharedWeightedSince(db, tickMs, modelWeights, name);
+    return computeTrack(act, r, tokens, measureTokensPerPct(samples), nowMs, sinceTick);
   };
   const weekly = track("weekly", weeklyReading);
   const fableReading = latestReading(db, "fable");
