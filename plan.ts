@@ -273,13 +273,13 @@ export async function startSignin(cmd: string[] = ["claude", "setup-token"], cwd
 // and stores it as a new plan under a default name. Returns the new plan's id, or an error line.
 export async function finishSignin(code: string, home = homedir(), mirrorDir: string | null = mirrorDirOf()): Promise<{ id: string } | { error: string }> {
   const s = signin;
-  if (!s) return { error: "Sign-in expired. Get a new link" };
+  if (!s) return { error: "Sign-in expired. Log in again" };
   if (!/^[A-Za-z0-9_#.~-]{8,300}$/.test(code.trim())) return { error: "Code not accepted" };
   const from = s.out.length;
   try { s.proc.terminal.write(code.trim() + "\r"); } catch { cancelSignin(); return { error: "Sign-in failed" }; }
   const got = await until(s, () => extractToken(s.out.slice(from)) ?? (codeRefused(s.out.slice(from)) ? "refused" : null), 60_000);
   cancelSignin();
-  if (got === "refused") return { error: "Code not accepted. Get a new link" };
+  if (got === "refused") return { error: "Code not accepted. Log in again" };
   if (!got || !(await validateToken(got))) return { error: "Sign-in failed" };
   return addPlan(defaultName(home), got, home, mirrorDir);
 }

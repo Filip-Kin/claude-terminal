@@ -1023,6 +1023,7 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
   const [tok, setTok] = useState("");
   const [code, setCode] = useState("");
   const [link, setLink] = useState<string | null>(null);
+  const [blocked, setBlocked] = useState(false); // the browser refused the new tab: the code row offers the link
   const [added, setAdded] = useState<string | null>(null); // id of the plan just connected, while it is being named
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1052,6 +1053,14 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
   };
   /** Sends the pasted code. A refusal ends that sign-in on the server, so the steps go back to the start. */
   const submitCode = () => void run(() => api.planPost("/signin/code", { code: code.trim() }).then((d) => { if (d?.error) { setLink(null); setCode(""); } return d; }), connectedNow);
+  /** Opens the authorization page in a new tab. The tab is opened in the click itself so the browser allows it, then pointed at the link. */
+  const login = () => {
+    const tab = window.open("", "_blank");
+    void run(() => api.planPost("/signin").then((d) => { if (d?.error) tab?.close(); return d; }), (d) => {
+      if (tab) { tab.opener = null; tab.location.href = d.url; }
+      setBlocked(!tab); setLink(d.url);
+    });
+  };
   let steps: React.ReactNode;
   if (added) {
     steps = (
@@ -1078,28 +1087,19 @@ function PlanSettings({ info, setInfo }: { info: PlanInfo | null; setInfo: (p: P
     steps = (
       <div className="settings-row">
         <span className="settings-row-main"><span className="settings-row-title">Sign in</span><span className="settings-row-desc">Claude subscription</span></span>
-        <button className="settings-select" disabled={busy} onClick={() => void run(() => api.planPost("/signin"), (d) => setLink(d.url))}>{busy ? "Starting" : "Get link"}</button>
+        <button className="settings-select" disabled={busy} onClick={login}>{busy ? "Opening" : "Log in"}</button>
       </div>
     );
   } else {
     steps = (
-      <>
-        <div className="settings-row">
-          <span className="settings-row-main"><span className="settings-row-title">Sign in</span><span className="settings-row-desc">Opens in a new tab</span></span>
-          <span className="settings-ctl">
-            <a className="settings-select" href={link} target="_blank" rel="noreferrer">Open link</a>
-            <button className="settings-select" disabled={busy} onClick={reset}>Cancel</button>
-          </span>
-        </div>
-        <div className="settings-row">
-          <span className="settings-row-main"><span className="settings-row-title">Code</span></span>
-          <span className="settings-ctl">
-            <input className="settings-select" value={code} autoComplete="off" spellCheck={false} disabled={busy} onChange={(e) => setCode(e.target.value)} aria-label="Code"
-              onKeyDown={(e) => { if (e.key === "Enter" && code.trim()) submitCode(); }} />
-            <button className="settings-select" disabled={busy || !code.trim()} onClick={() => submitCode()}>{busy ? "Checking" : "Submit"}</button>
-          </span>
-        </div>
-      </>
+      <div className="settings-row">
+        <span className="settings-row-main"><span className="settings-row-title">Code</span>{blocked && <a className="settings-row-desc" href={link} target="_blank" rel="noreferrer">Open sign-in page</a>}</span>
+        <span className="settings-ctl">
+          <input className="settings-select" value={code} autoComplete="off" spellCheck={false} autoFocus disabled={busy} onChange={(e) => setCode(e.target.value)} aria-label="Code"
+            onKeyDown={(e) => { if (e.key === "Enter" && code.trim()) submitCode(); }} />
+          <button className="settings-select" disabled={busy || !code.trim()} onClick={submitCode}>{busy ? "Checking" : "Submit"}</button>
+        </span>
+      </div>
     );
   }
   return (
