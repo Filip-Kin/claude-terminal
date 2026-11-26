@@ -1,7 +1,7 @@
 #!/bin/bash
 # UserPromptSubmit hook: block prompts while the weekly ration is spent. Reads the state file
 # written by ration-tick.ts. Fails open on a missing or stale (> 10 min) file.
-f=/var/lib/claude-terminal/ration/ration.json
+f=${RATION_FILE:-/var/lib/claude-terminal/ration/ration.json}
 [ -r "$f" ] || f=/var/lib/claude-terminal/ration.json
 [ -r "$f" ] || exit 0
 read -r spent active label at < <(jq -r '[.spent,.active,.nextAtLabel,.computedAt]|@tsv' "$f" 2>/dev/null | tr '\t' ' ')

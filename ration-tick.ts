@@ -5,7 +5,7 @@
 import { Database } from "bun:sqlite";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { computeRation, writeRation, rationLine, type RationCfg } from "./ration.ts";
+import { computeRation, estimateFraction, loadSamples, writeRation, rationLine, type RationCfg } from "./ration.ts";
 
 const dry = process.argv.includes("--dry-run");
 const force = process.argv.includes("--force-spent");
@@ -22,7 +22,8 @@ if (rc.startUtil == null && Date.now() >= startMs && !dry) {
   if (f) { rc.startUtil = f.u; rc.resetAt = f.r; writeFileSync(CONFIG, JSON.stringify(cfg, null, 2) + "\n"); }
 }
 const cur = db.query("SELECT seven_day_util u FROM subscription_samples ORDER BY ts DESC LIMIT 1").get() as { u: number } | null;
-let state = computeRation(rc, cur?.u ?? null, Date.now());
+const est = estimateFraction(loadSamples(db, Date.now() - 48 * 3600_000, cfg.modelWeights || {}), startMs);
+let state = computeRation(rc, cur?.u ?? null, Date.now(), est);
 if (force) state = { ...state, active: true, spent: true, remaining: -0.1, nextAtLabel: state.nextAtLabel ?? "00:00" };
 if (!dry) writeRation(state);
 console.log(rationLine({ spent: state.spent, remaining: state.remaining, nextAtLabel: state.nextAtLabel }), state.active ? "" : "(off)");
