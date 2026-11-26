@@ -12,6 +12,7 @@ import { readOrSeedAppSessions, startCwd, spawnName } from "./app-sessions";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
+import { readRation, rationLine } from "./ration";
 import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, runningConversations, onModelChoice, onAppSession, BUILTIN_MCP_NAMES, type AppEvent, type AskNotifier } from "./app-runner";
 import { sessionHolders, heldMessage } from "./session-lock";
 
@@ -796,6 +797,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   // Owner's rolling 5-hour output tokens + a link to the full usage page (terminal-side dashboard),
   // plus the claude.ai subscription rate-limit windows (the real "session limit" — 5-hour + weekly),
   // sourced live from the SDK /usage API. `subscription` is null until the first background fetch lands.
+  if (req.method === "GET" && path === "/app/api/ration") return jsonRes(readRation() ?? { active: false }, ctx, req);
   if (req.method === "GET" && path === "/app/api/usage") {
     const u = ctx.ownerUsage?.();
     const subscription = getSubscriptionUsage();
@@ -1028,6 +1030,8 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!conv) return jsonRes({ error: "no live conversation for id (start or resume it first)" }, ctx, req, 409);
     const rawText = String(b.text ?? "").trim();
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
+    const ration = readRation();
+    if (ration?.active && ration.spent) return jsonRes({ error: rationLine(ration) }, ctx, req, 429);
     if (dedupSeen(b.cid)) { tlog("dedup", { route: "send", conv: conv.id, cid: shortCid(b.cid) }); return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); } // redelivery -> ack, don't re-send
     tlog("accept", { route: "send", conv: conv.id, cid: shortCid(b.cid), chars: rawText.length });
     conv.setClientTz(b.tz);

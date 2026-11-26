@@ -284,6 +284,7 @@ const api = {
   context: (id: string) => withTimeout(fetch(`/app/api/context?id=${encodeURIComponent(id)}`).then(J)),
   compact: (id: string) => fetch("/app/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
   usage: () => withTimeout(fetch("/app/api/usage").then(J)),
+  ration: () => withTimeout(fetch("/app/api/ration").then(J)),
   statuses: () => withTimeout(fetch("/app/api/statuses").then(J)),
   search: (q: string) => withTimeout(fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J)),
   answerAsk: (id: string, askId: string, answer: string) =>
@@ -986,6 +987,24 @@ function fmtResetIn(iso?: string | null): string {
 
 // Subscription session-limit chip: how much of the claude.ai 5-hour rate-limit window is used, plus
 // when it resets. Colour is status-only feedback (amber ≥80%, red ≥95%). Weekly window in the tooltip.
+// #region ration bar (shared weekly-limit ration, state from /app/api/ration)
+function RationBar() {
+  const [s, setS] = useState<{ active: boolean; spent?: boolean; remaining?: number; nextAtLabel?: string } | null>(null);
+  useEffect(() => {
+    const pull = () => api.ration().then((d) => setS(d)).catch(() => {});
+    pull();
+    const t = setInterval(pull, 30000);
+    return () => clearInterval(t);
+  }, []);
+  if (!s?.active) return null;
+  return (
+    <div className={"ration-bar" + (s.spent ? " spent" : "")}>
+      {(s.spent ? "Ration spent" : `Ration ${(s.remaining ?? 0).toFixed(2)}% left`) + ` · +0.5% at ${s.nextAtLabel}`}
+    </div>
+  );
+}
+// #endregion
+
 function SubscriptionChip({ sub, url }: { sub: Subscription; url?: string }) {
   if (!sub?.available || !sub.fiveHour || sub.fiveHour.utilization == null) return null;
   const u = Math.round(sub.fiveHour.utilization);
@@ -3033,6 +3052,7 @@ function App() {
       </aside>
 
       <main className="main">
+        <RationBar />
         <div className="topbar">
           <button className="icon-btn" onClick={() => setDrawer((d) => !d)} aria-label="Menu">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>

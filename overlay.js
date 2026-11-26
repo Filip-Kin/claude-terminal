@@ -371,6 +371,8 @@
     "#claude-tabbar .ctab-btn{display:flex;align-items:center;justify-content:center;width:28px;flex:0 0 auto;margin:5px 0;border-radius:7px;background:#262626;border:1px solid #333;cursor:pointer;color:#cfcfcf}",
     "#claude-tabbar .ctab-btn:hover{background:#333;color:#fff}",
     "#claude-tabbar .ctab-new{font-size:18px;line-height:1}",
+    "#claude-tabbar .ctab-ration{flex:none;padding:3px 10px;margin:0 6px;border-radius:6px;background:#b45309;color:#fff;font:600 12px/1.4 system-ui,sans-serif;white-space:nowrap}",
+    "#claude-tabbar .ctab-ration.spent{background:#dc2626}",
     "#claude-tabbar .ctab-usage{width:auto;padding:0 9px;gap:5px}",
     "#claude-tabbar .ctab-usage .ctab-usage-fig{font-size:11px;font-variant-numeric:tabular-nums}",
     // notification bell (green glow when on)
@@ -555,6 +557,25 @@
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
+  // #region ration bar (shared weekly-limit ration; state from /_ct/ration)
+  const rationEl = document.createElement("div");
+  rationEl.className = "ctab-ration";
+  rationEl.style.display = "none";
+  bar.insertBefore(rationEl, bar.firstChild);
+  async function refreshRation() {
+    try {
+      const r = await api("ration");
+      if (!r.ok) return;
+      const s = await r.json();
+      if (!s.active) { rationEl.style.display = "none"; return; }
+      rationEl.textContent = (s.spent ? "Ration spent" : "Ration " + s.remaining.toFixed(2) + "% left") + " \u00b7 +0.5% at " + s.nextAtLabel;
+      rationEl.className = "ctab-ration" + (s.spent ? " spent" : "");
+      rationEl.style.display = "";
+    } catch (e) { /* ignore */ }
+  }
+  refreshRation();
+  setInterval(refreshRation, 30000);
+  // #endregion
 
   function mountBar() {
     // Mount the bar OUTSIDE <body>, as a direct child of <html>. This is THE fix for

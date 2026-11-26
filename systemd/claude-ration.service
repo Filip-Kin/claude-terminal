@@ -1,0 +1,6 @@
+[Unit]
+Description=Claude weekly ration: compute state, kill Claude processes while spent
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bun run /media/nas/filip/ncdata/filip/files/Projects/claude-terminal/ration-tick.ts

@@ -15,6 +15,7 @@ import { Database } from "bun:sqlite";
 import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
 import { Connections } from "./connections.ts";
+import { readRation } from "./ration.ts";
 import { appRoutes, startSpawned, type AppCtx } from "./app-server.ts";
 import { initSubscriptionResume } from "./subscription-resume.ts";
 import { installRestartWake } from "./restart-wake.ts";
@@ -860,6 +861,10 @@ const server = Bun.serve({
 
     // Deterministic live push: the collector POSTs here after it commits usage.db.
     // The server binds 127.0.0.1 only, so this is inherently localhost-only.
+    if (req.method === "GET" && path === "/ration") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      return Response.json(readRation() ?? { active: false }, { headers: cors(req) });
+    }
     // The tab bar's usage figure. Always answers; terminal-only guests get nulls.
     if (req.method === "GET" && path === "/usage") {
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });

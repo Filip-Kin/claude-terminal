@@ -75,5 +75,6 @@
   "voice": true,
   "sttUrl": "http://127.0.0.1:7801",
   "ttsUrl": "http://127.0.0.1:7802",
-  "boxLogin": { "file": "/home/you/.claude.json", "billedEmail": "you@example.com" }
+  "boxLogin": { "file": "/home/you/.claude.json", "billedEmail": "you@example.com" },
+  "ration": { "start": "2026-11-25T20:50:00-05:00", "startUtil": null, "resetAt": null, "perPeriodPct": 0.5, "periodHours": 6 }
 }
